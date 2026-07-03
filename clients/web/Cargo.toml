@@ -15,7 +15,10 @@ license.workspace = true
 name = "sm-web"
 path = "src/main.rs"
 
-[dependencies]
+# Nativ ist sm-web nur ein erklaerender Stub (src/main.rs): alle echten
+# Abhaengigkeiten gelten nur fuer wasm32, damit `cargo test --workspace`
+# den Browser-Code weder baut noch an ihm scheitern kann.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
 client-app = { path = "../../crates/client-app" }
 client-core = { path = "../../crates/client-core" }
 # CSR-Modus: die App rendert vollstaendig im Browser, kein Server-Rendering.
@@ -23,5 +26,13 @@ leptos = { version = "0.8", features = ["csr"] }
 # Panics landen in der Browser-Konsole statt als stummes "unreachable".
 console_error_panic_hook = "0.1"
 web-sys = { version = "0.3", features = ["Window", "Location"] }
+# Uhrzeit fuer die Credential-Gueltigkeit (js_sys::Date), im Browser gibt es
+# kein std::time::SystemTime.
+js-sys = "0.3"
+# Leptos' Renderer verlangt Send von reaktiven Closures; der Browser ist
+# eindraehtig, der Client-Zustand (Rc<RefCell<...>>) darum absichtlich nicht
+# Send. SendWrapper ueberbrueckt das und panict, falls doch je ein fremder
+# Thread zugreift.
+send_wrapper = "0.6"
 base64 = { workspace = true }
 rand = { workspace = true }

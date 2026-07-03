@@ -4165,8 +4165,10 @@ dependencies = [
  "client-app",
  "client-core",
  "console_error_panic_hook",
+ "js-sys",
  "leptos",
  "rand 0.9.4",
+ "send_wrapper",
  "web-sys",
 ]
 

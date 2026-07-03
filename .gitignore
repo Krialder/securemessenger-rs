@@ -2,6 +2,9 @@
 /target
 **/*.rs.bk
 
+# trunk-Build-Ausgabe des Web-Clients (erzeugt aus clients/web/src)
+clients/web/dist/
+
 # Umgebungs- und Geheimnis-Dateien (keine Secrets ins Repo, NF030)
 .env
 *.env.local
