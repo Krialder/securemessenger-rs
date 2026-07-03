@@ -16,5 +16,5 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # Das KT-Konto-Commitment (kt-Modul): identity berechnet es, Clients
-# rechnen es nach.
-sha2.workspace = true
+# rechnen es nach. Die kanonischen Bytes liegen im geteilten kt-format.
+kt-format.workspace = true

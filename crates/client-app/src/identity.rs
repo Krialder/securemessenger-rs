@@ -47,6 +47,17 @@ pub struct Account {
     pub device_id: String,
 }
 
+/// Ein Gerät der eigenen Gerätemenge (Antwort von `GET /devices`).
+/// Trägt alle Zutaten des KT-Commitments (id, public_key, not_after),
+/// damit die Selbstprüfung es direkt nachrechnen kann.
+#[derive(Deserialize, Debug, Clone)]
+pub struct DeviceView {
+    pub id: String,
+    pub name: Option<String>,
+    pub public_key: String,
+    pub not_after: u64,
+}
+
 /// Ein Token-Paar mit Laufzeit (Antwort von Login und Refresh). Feldnamen nach
 /// OAuth-2.0-Konvention, wie der Dienst sie liefert.
 #[derive(Deserialize, Debug, Clone)]
@@ -142,6 +153,20 @@ impl IdentityClient {
             .http
             .post(self.url("/sessions/refresh"))
             .json(&body)
+            .send()
+            .await
+            .map_err(transport)?;
+        parse_json(response).await
+    }
+
+    /// `GET /devices`: die gültige Gerätemenge des eigenen Kontos.
+    /// Revozierte Geräte fehlen; genau diese Menge geht ins
+    /// KT-Commitment ein (Selbstprüfung, `crate::kt`).
+    pub async fn devices(&self, access_token: &str) -> Result<Vec<DeviceView>, ClientError> {
+        let response = self
+            .http
+            .get(self.url("/devices"))
+            .bearer_auth(access_token)
             .send()
             .await
             .map_err(transport)?;

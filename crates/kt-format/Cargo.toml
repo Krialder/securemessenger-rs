@@ -1,0 +1,22 @@
+[package]
+name = "kt-format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Die kanonischen Byte-Formate der Key Transparency (Commitment smktc.v1,
+# Wurzelnachricht smkt.v1, akd-Konfiguration). Eigenes Mini-Crate, weil
+# Server (identity, kt) und Clients (client-app, auch wasm32) exakt dieselben
+# Bytes rechnen muessen, client-app aber nicht von common abhaengen darf:
+# common zieht axum und tracing-subscriber, die im Browser nichts verloren
+# haben. Eine Quelle statt zweier Kopien, die auseinanderdriften koennten.
+
+[dependencies]
+sha2.workspace = true
+# Nur fuer die geteilte Verifikations-Konfiguration (Domain-Label);
+# wer bloss das Commitment rechnet (identity via common), bleibt ohne akd.
+akd = { workspace = true, optional = true }
+
+[features]
+verify = ["dep:akd"]

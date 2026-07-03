@@ -14,9 +14,9 @@
 //!
 //! Umfang aktuell: Konto-Layer (Registrierung, Login, Session-Rotation,
 //! Logout gegen identity), Nachrichten-Layer (Prekey-Veröffentlichung und
-//! Bündel-Abruf gegen directory, Hüllen-Umlauf gegen delivery, Wire-Framing)
-//! und die persistente Protokoll-Ablage hinter dem Storage-Trait.
-//! Offen: KT-Selbstprüfung, WebSocket-Hinweiskanal.
+//! Bündel-Abruf gegen directory, Hüllen-Umlauf gegen delivery, Wire-Framing),
+//! die persistente Protokoll-Ablage hinter dem Storage-Trait und die
+//! KT-Selbstprüfung (kt-Modul). Offen: WebSocket-Hinweiskanal.
 
 pub mod account;
 pub mod delivery;
@@ -24,6 +24,7 @@ pub mod directory;
 pub mod error;
 mod http;
 pub mod identity;
+pub mod kt;
 pub mod prekeys;
 pub mod protocol_store;
 pub mod storage;

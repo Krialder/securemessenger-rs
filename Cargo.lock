@@ -501,15 +501,19 @@ dependencies = [
 name = "client-app"
 version = "0.1.0"
 dependencies = [
+ "akd",
  "async-trait",
  "axum",
  "base64",
+ "bincode",
  "client-core",
  "common",
  "delivery",
  "directory",
  "ed25519-dalek",
  "identity",
+ "kt",
+ "kt-format",
  "rand 0.9.4",
  "reqwest",
  "serde",
@@ -556,10 +560,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "kt-format",
  "reqwest",
  "serde",
  "serde_json",
- "sha2",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2014,6 +2018,7 @@ dependencies = [
  "common",
  "ed25519-dalek",
  "http-body-util",
+ "kt-format",
  "rand 0.9.4",
  "serde",
  "serde_json",
@@ -2022,6 +2027,14 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+]
+
+[[package]]
+name = "kt-format"
+version = "0.1.0"
+dependencies = [
+ "akd",
+ "sha2",
 ]
 
 [[package]]

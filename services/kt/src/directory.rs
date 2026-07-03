@@ -25,20 +25,10 @@ use tokio::sync::Mutex;
 use crate::keys::{RootSigner, SecretVrf};
 use crate::store::{EpochRecord, KtStore, StoreError};
 
-/// Die akd-Konfiguration der Plattform. [ANNAHME:
-/// ExperimentalConfiguration mit eigenem Domain-Label; sie ist die von
-/// akd empfohlene aktuelle Konfiguration. WhatsAppV1 bliebe die
-/// Alternative, wenn Interop mit deren Auditoren nötig würde.]
-#[derive(Clone)]
-pub struct SmDomainLabel;
-
-impl akd::DomainLabel for SmDomainLabel {
-    fn domain_label() -> &'static [u8] {
-        b"securemessenger-kt-v1"
-    }
-}
-
-pub type KtConfiguration = akd::ExperimentalConfiguration<SmDomainLabel>;
+/// Die akd-Konfiguration der Plattform: liegt im geteilten kt-format-Crate
+/// (Feature `verify`), weil Beweise nur mit exakt derselben Konfiguration
+/// samt Domain-Label verifizieren und die Clients sie deshalb teilen.
+pub use kt_format::{KtConfiguration, SmDomainLabel};
 
 type InMemoryDirectory = Directory<KtConfiguration, AsyncInMemoryDatabase, SecretVrf>;
 

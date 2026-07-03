@@ -9,6 +9,8 @@ Cargo.toml            Workspace-Wurzel (gepinnte Dependencies, Dev-Profil für A
 rust-toolchain.toml   gepinnte Rust-Version (1.96.1)
 crates/
   common/             gemeinsame Bausteine (Config, Telemetrie, Betriebs-Endpunkte, identity-Anbindung), ohne Krypto
+  kt-format/          kanonische KT-Byte-Formate (Commitment smktc.v1, Wurzelnachricht smkt.v1), geteilt zwischen
+                      Server und Clients (auch wasm32); Feature verify liefert die akd-Konfiguration samt Domain-Label
   client-core/        der Krypto-Kern der Clients (libsignal, OpenMLS, gepinnt); kein Dienst hängt davon ab
     src/onetoone.rs   1:1-Sitzungen: PQXDH-Aufbau und Double Ratchet (Wrapper, keine Eigenbauten)
     src/group.rs      MLS-Gruppen: Suite 0x0003, Skipped-Keys-Fenster (Wrapper)
@@ -22,8 +24,10 @@ crates/
     src/wire.rs       Hüllen-Framing smenv.v1 um den libsignal-Chiffretext
     src/storage.rs    Storage-Trait der lokalen Ablage (In-Memory, JSON-Datei; IndexedDB folgt)
     src/protocol_store.rs   libsignals fünf Store-Traits über dem Storage-Trait: Sitzungen überleben Prozessgrenzen
+    src/kt.rs         KT-Client und Selbstprüfung: Wurzelsignatur, Wurzelbindung, Inklusionsbeweis, Commitment-Vergleich
     tests/account_e2e.rs    End-to-End gegen den echten identity-Router (in-process)
     tests/messaging_e2e.rs  End-to-End über identity+directory+delivery: PQXDH, E2EE-Umlauf, Ablage ohne Klartext
+    tests/kt_e2e.rs   End-to-End über identity+kt: Selbstprüfung besteht, untergeschobener Schlüssel schlägt Alarm
 clients/
   cli/                Headless-Referenzclient `sm`: register/login/logout/whoami/publish-keys/send/recv
     tests/chat_e2e.rs Chat-Beweis: jeder Befehl ein eigener Prozess des echten Binaries, Dienste in-process

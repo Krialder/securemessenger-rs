@@ -21,16 +21,9 @@ pub struct RootSigner {
     key: SigningKey,
 }
 
-/// Kanonische Bytes, die signiert werden. [ANNAHME: eigenes, minimales
-/// STH-Format mit Domain-Präfix "smkt.v1"; die Spec legt keins fest.
-/// Es enthält genau das, was ein Prüfer braucht: Epoche und Wurzel.]
-pub fn root_message(epoch: u64, root_hash: &[u8]) -> Vec<u8> {
-    let mut message = Vec::with_capacity(7 + 8 + root_hash.len());
-    message.extend_from_slice(b"smkt.v1");
-    message.extend_from_slice(&epoch.to_be_bytes());
-    message.extend_from_slice(root_hash);
-    message
-}
+/// Kanonische Bytes, die signiert werden: Format `smkt.v1` aus dem
+/// geteilten kt-format-Crate, damit Clients exakt dieselben Bytes prüfen.
+pub use kt_format::root_message;
 
 impl RootSigner {
     /// Aus einem Base64-kodierten 32-Byte-Seed (Secret `KT_SIGNING_KEY`).

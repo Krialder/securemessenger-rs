@@ -1,38 +1,28 @@
 //! Das Schlüssel-Commitment eines Kontos: der Wert, der im
 //! KT-Verzeichnis unter dem Handle steht (specs/key-transparency.md).
 //!
-//! Liegt in common, weil identity es berechnet und meldet, kt es nur
-//! speichert und Clients es später lokal nachrechnen (Selbstprüfung).
-//! Ein SHA-256 über die kanonische Serialisierung von
-//! Identitätsschlüssel und gültiger Gerätemenge.
-//! [ANNAHME: eigenes, minimales Format "smktc.v1"; die Spec lässt das
-//! Commitment-Schema offen ("Commitment-Schema für mehrere Geräte pro
-//! Konto" steht dort als offener Punkt). Es ist bewusst nur ein Hash:
-//! die Schlüssel selbst liefert das Schlüssel-Verzeichnis (directory),
-//! KT beweist deren Unverändertheit.]
+//! Die kanonischen Bytes rechnet `kt-format` (eine Quelle für Server und
+//! Clients, auch wasm32); hier lebt nur der Adapter von der
+//! identity-Antwortform (`AccountDevices`) auf dieses Format. identity
+//! berechnet und meldet das Commitment, Clients rechnen es zur
+//! Selbstprüfung nach.
 
 use crate::identity_client::AccountDevices;
-use sha2::{Digest, Sha256};
+use kt_format::CommitmentDevice;
 
-/// Kanonisch: Domain-Präfix, Identitätsschlüssel, dann jedes gültige
-/// Gerät sortiert nach ID mit Feldtrennern. Sortierung macht das
-/// Commitment unabhängig von der Reihenfolge der identity-Antwort.
+/// SHA-256 über Identitätsschlüssel und gültige Gerätemenge, Format
+/// `smktc.v1` (Details und Begründung in `kt_format::account_commitment`).
 pub fn account_commitment(account: &AccountDevices) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"smktc.v1");
-    hasher.update(account.identity_key.as_bytes());
-    hasher.update([0x00]);
-    let mut devices: Vec<_> = account.devices.iter().collect();
-    devices.sort_by(|a, b| a.id.cmp(&b.id));
-    for device in devices {
-        hasher.update(device.id.as_bytes());
-        hasher.update([0x00]);
-        hasher.update(device.public_key.as_bytes());
-        hasher.update([0x00]);
-        hasher.update(device.not_after.to_be_bytes());
-        hasher.update([0x01]);
-    }
-    hasher.finalize().to_vec()
+    let devices: Vec<CommitmentDevice<'_>> = account
+        .devices
+        .iter()
+        .map(|d| CommitmentDevice {
+            id: &d.id,
+            public_key: &d.public_key,
+            not_after: d.not_after,
+        })
+        .collect();
+    kt_format::account_commitment(&account.identity_key, &devices)
 }
 
 #[cfg(test)]
@@ -48,8 +38,36 @@ mod tests {
         }
     }
 
+    /// Der Adapter darf die kanonischen Bytes nicht verändern: dieselben
+    /// Eingaben müssen dasselbe Commitment ergeben wie kt-format direkt.
     #[test]
-    fn commitment_is_order_independent_and_key_sensitive() {
+    fn adapter_matches_canonical_format() {
+        let account = AccountDevices {
+            id: "acc".to_string(),
+            handle: "alice".to_string(),
+            identity_key: "aWQ=".to_string(),
+            devices: vec![device("dev-1", "a2V5MQ=="), device("dev-2", "a2V5Mg==")],
+        };
+        let direct = kt_format::account_commitment(
+            "aWQ=",
+            &[
+                kt_format::CommitmentDevice {
+                    id: "dev-1",
+                    public_key: "a2V5MQ==",
+                    not_after: 4102444800,
+                },
+                kt_format::CommitmentDevice {
+                    id: "dev-2",
+                    public_key: "a2V5Mg==",
+                    not_after: 4102444800,
+                },
+            ],
+        );
+        assert_eq!(account_commitment(&account), direct);
+    }
+
+    #[test]
+    fn commitment_reacts_to_key_and_device_changes() {
         let a = AccountDevices {
             id: "acc".to_string(),
             handle: "alice".to_string(),
@@ -70,14 +88,6 @@ mod tests {
             account_commitment(&a),
             account_commitment(&c),
             "Schlüsseltausch muss das Commitment ändern"
-        );
-
-        let mut d = a.clone();
-        d.devices.push(device("dev-3", "a2V5Mw=="));
-        assert_ne!(
-            account_commitment(&a),
-            account_commitment(&d),
-            "Rogue-Gerät muss das Commitment ändern"
         );
     }
 }

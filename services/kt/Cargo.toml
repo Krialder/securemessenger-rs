@@ -27,6 +27,9 @@ async-trait.workspace = true
 # Digest-Vergleich des internen Secrets und das Konto-Commitment.
 sha2.workspace = true
 akd.workspace = true
+# Kanonische KT-Formate (Wurzelnachricht, akd-Konfiguration), geteilt mit
+# den Clients; verify liefert die Konfiguration samt Domain-Label.
+kt-format = { workspace = true, features = ["verify"] }
 # Wurzel-Signaturen (Ed25519). Der Seed kommt aus einem Secret.
 ed25519-dalek.workspace = true
 # OS-CSPRNG für flüchtige Dev-Schlüssel (produktiv kommen Seeds aus Secrets).

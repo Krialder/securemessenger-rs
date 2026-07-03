@@ -12,6 +12,7 @@ members = [
     "crates/client-app",
     "crates/client-core",
     "crates/common",
+    "crates/kt-format",
     "services/delivery",
     "services/directory",
     "services/identity",
@@ -69,6 +70,8 @@ akd = { version = "=0.12.0", features = ["serde_serialization"] }
 # OS-Zufall für Schlüsselerzeugung im kt-Dienst (Dev-Betrieb ohne Secrets).
 rand = "0.9"
 common = { path = "crates/common" }
+# Kanonische KT-Byte-Formate, geteilt zwischen Server und Clients (auch wasm32).
+kt-format = { path = "crates/kt-format" }
 
 # Argon2 ist in Debug-Builds unbrauchbar langsam (Sekunden pro Hash).
 # Die Krypto-Pakete werden deshalb auch im Dev-Profil optimiert gebaut,

@@ -25,6 +25,13 @@ base64 = { workspace = true }
 # services/identity/src/credential.rs verifiziert.
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
+# Key-Transparency-Selbstprüfung: Beweise verifizieren mit derselben
+# gepinnten akd-Version und exakt der Server-Konfiguration (kt-format,
+# Feature verify liefert Domain-Label und Konfigurations-Typ).
+akd = { workspace = true }
+kt-format = { workspace = true, features = ["verify"] }
+# Wire-Format der akd-Beweise, wie der kt-Dienst sie serialisiert.
+bincode = "1.3"
 # Die persistente Protokoll-Ablage erfuellt libsignals Store-Traits, und
 # die sind mit async_trait(?Send) definiert.
 async-trait = { workspace = true }
@@ -46,5 +53,6 @@ axum = { workspace = true }
 identity = { path = "../../services/identity" }
 directory = { path = "../../services/directory" }
 delivery = { path = "../../services/delivery" }
+kt = { path = "../../services/kt" }
 common = { workspace = true }
 uuid = { workspace = true }
