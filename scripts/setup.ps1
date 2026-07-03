@@ -2,8 +2,9 @@
   Richtet die Entwicklungsumgebung fuer den SecureMessenger ein.
 
   Was es tut:
-    1. prueft, was schon vorhanden ist (winget, Rust, protoc, Docker, WSL)
-    2. installiert Fehlendes ueber winget bzw. laedt protoc von GitHub
+    1. prueft, was schon vorhanden ist (winget, Rust, MSVC-Linker, protoc,
+       Docker, WSL, wasm32-Target, trunk)
+    2. installiert Fehlendes ueber winget bzw. laedt protoc und trunk von GitHub
     3. repariert eine beschaedigte gepinnte Rust-Toolchain (rust-toolchain.toml)
     4. startet Docker Desktop, wenn der Daemon nicht laeuft; vorher werden
        verwaiste Socket-Dateien weggeraeumt, an denen der Start sonst scheitert
@@ -134,6 +135,63 @@ if ((Have 'rustup') -or (Test-Path $rustupExe)) {
     Write-Ok "rustfmt und clippy vorhanden"
 } else {
     Write-Note "rustup nicht gefunden, Komponenten uebersprungen"
+}
+
+# 2c. MSVC Build Tools: das MSVC-Target von Rust braucht link.exe aus den
+#     C++ Build Tools ("error: linker `link.exe` not found" ohne sie).
+#     Erkennung ueber vswhere, das jede Visual-Studio-Installation mitbringt;
+#     die Workload VCTools liefert Compiler, Linker und Windows SDK.
+Write-Step "Pruefe MSVC Build Tools (link.exe)"
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$msvcOk = $false
+if (Test-Path $vswhere) {
+    $vcPath = & $vswhere -products '*' -requires Microsoft.VisualCpp.Tools.Host.x64 -format value -property installationPath 2>$null
+    if ($vcPath) { $msvcOk = $true }
+}
+if ($msvcOk) {
+    Write-Ok "C++ Build Tools vorhanden"
+} else {
+    Write-Note "C++ Build Tools fehlen, installiere sie ueber winget (mehrere GB, dauert; UAC-Abfrage bestaetigen)"
+    winget install -e --id Microsoft.VisualStudio.2022.BuildTools --accept-source-agreements --accept-package-agreements --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+    if ((Test-Path $vswhere) -and (& $vswhere -products '*' -requires Microsoft.VisualCpp.Tools.Host.x64 -format value -property installationPath 2>$null)) {
+        $msvcOk = $true
+        Write-Ok "C++ Build Tools installiert"
+    } else {
+        Write-Bad "C++ Build Tools weiterhin nicht auffindbar; ohne link.exe schlaegt jeder cargo-Build fehl"
+    }
+}
+
+# 2d. Client-Werkzeuge: der Web-Client (clients/web) baut nach
+#     wasm32-unknown-unknown und wird von trunk gebuendelt (GOAL.md,
+#     Verifikations-Loop Schritt 4). trunk kommt als vorgebautes Binary von
+#     GitHub, weil cargo install es minutenlang kompilieren wuerde.
+Write-Step "Pruefe Client-Werkzeuge (wasm32-Target, trunk)"
+if ($pinned -and ((Have 'rustup') -or (Test-Path $rustupExe))) {
+    $targets = & $rustupExe target list --installed --toolchain $pinned 2>$null
+    if ($targets -contains 'wasm32-unknown-unknown') {
+        Write-Ok "wasm32-unknown-unknown vorhanden"
+    } else {
+        Write-Note "wasm32-Target fehlt, installiere es fuer Toolchain $pinned"
+        & $rustupExe target add wasm32-unknown-unknown --toolchain $pinned
+        Write-Ok "wasm32-unknown-unknown installiert"
+    }
+} else {
+    Write-Note "rustup oder Toolchain-Pin nicht gefunden, wasm32-Target uebersprungen"
+}
+$trunkExe = Join-Path $cargoBin 'trunk.exe'
+if ((Have 'trunk') -or (Test-Path $trunkExe)) {
+    Write-Ok "trunk vorhanden"
+} else {
+    Write-Note "trunk fehlt, lade das Windows-Binary von GitHub (trunk-rs/trunk)"
+    try {
+        $rel = Invoke-RestMethod https://api.github.com/repos/trunk-rs/trunk/releases/latest
+        $asset = $rel.assets | Where-Object name -like "*x86_64-pc-windows-msvc.zip" | Select-Object -First 1
+        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "$env:TEMP\trunk.zip"
+        Expand-Archive -Path "$env:TEMP\trunk.zip" -DestinationPath $cargoBin -Force
+        Write-Ok ("trunk installiert: " + (& $trunkExe --version))
+    } catch {
+        Write-Bad "trunk-Download fehlgeschlagen. Manuell: cargo install trunk --locked"
+    }
 }
 
 # 3. protoc (Protobuf-Compiler): braucht der Krypto-Kern (crates/client-core),
@@ -273,12 +331,16 @@ if (Test-DockerDaemon) {
 # 7. Zusammenfassung
 Write-Step "Status"
 $cargoState  = if (Have 'cargo')  { 'ok' } else { 'fehlt' }
+$msvcState   = if ($msvcOk) { 'ok' } else { 'fehlt' }
 $protocState = if ((Have 'protoc') -or (Test-Path $protocExe)) { 'ok' } else { 'fehlt' }
+$trunkState  = if ((Have 'trunk') -or (Test-Path $trunkExe)) { 'ok' } else { 'fehlt' }
 $dockerState = if (Have 'docker') { 'ok' } else { 'fehlt' }
 $daemonState = if (Test-DockerDaemon) { 'laeuft' } else { 'nicht erreichbar' }
 $pgState     = if ($pgReady) { "laeuft ($($databases -join ', '))" } else { 'nicht bereit' }
 Write-Host "    cargo   : $cargoState"
+Write-Host "    msvc    : $msvcState"
 Write-Host "    protoc  : $protocState"
+Write-Host "    trunk   : $trunkState"
 Write-Host "    docker  : $dockerState (Daemon: $daemonState)"
 Write-Host "    postgres: $pgState"
 
