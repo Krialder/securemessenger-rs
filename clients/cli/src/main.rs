@@ -19,7 +19,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use client_app::account::IdentityKeypair;
-use client_app::delivery::{DeliveryClient, OutgoingEnvelope};
+use client_app::delivery::{
+    parse_ws_event, ws_auth_frame, DeliveryClient, OutgoingEnvelope, WsEvent,
+};
 use client_app::directory::DirectoryClient;
 use client_app::prekeys::{
     bundle_from_directory, device_id_from_u32, publication_from_bundle, PROTOCOL_DEVICE_ID,
@@ -29,7 +31,9 @@ use client_app::storage::{FileStorage, KeyValueStorage as _};
 use client_app::{wire, IdentityClient, NewAccount};
 use client_core::libsignal_protocol::ProtocolAddress;
 use client_core::onetoone::Device;
+use futures_util::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize};
+use tokio_tungstenite::tungstenite::Message;
 
 /// Standard-Adressen der Dienste im lokalen Betrieb (alle binden per
 /// Default auf 8080; directory und delivery laufen lokal über BIND_ADDR
@@ -86,6 +90,7 @@ async fn run() -> Result<(), String> {
         "publish-keys" => publish_keys().await,
         "send" => send(&args[1..]).await,
         "recv" => recv().await,
+        "listen" => listen(&args[1..]).await,
         "help" | "-h" | "--help" => {
             print_usage();
             Ok(())
@@ -334,12 +339,21 @@ async fn recv() -> Result<(), String> {
     let (mut device, _storage) = open_device(&profile)?;
 
     let delivery = DeliveryClient::new(delivery_url());
-    let waiting = delivery.fetch(&token).await.map_err(|e| e.to_string())?;
-    if waiting.is_empty() {
+    if drain_waiting(&delivery, &token, &mut device).await? == 0 {
         println!("Keine neuen Nachrichten.");
-        return Ok(());
     }
+    Ok(())
+}
 
+/// Der Abhol-Durchlauf von `recv` und `listen`: wartende Hüllen holen,
+/// entschlüsseln, ausgeben und bestätigen. Liefert, wie viele Hüllen
+/// verarbeitet (bestätigt) wurden.
+async fn drain_waiting(
+    delivery: &DeliveryClient,
+    token: &str,
+    device: &mut Device<PersistentProtocolStore<FileStorage>>,
+) -> Result<usize, String> {
+    let waiting = delivery.fetch(token).await.map_err(|e| e.to_string())?;
     let mut acked = Vec::with_capacity(waiting.len());
     for message in &waiting {
         let opened = match wire::open(&message.envelope) {
@@ -372,11 +386,76 @@ async fn recv() -> Result<(), String> {
     }
     if !acked.is_empty() {
         delivery
-            .ack(&token, &acked)
+            .ack(token, &acked)
             .await
             .map_err(|e| e.to_string())?;
     }
-    Ok(())
+    Ok(acked.len())
+}
+
+/// `sm listen [--once]`: hält den Hinweiskanal offen und holt nach jedem
+/// `message.waiting`-Hinweis ab wie `recv`. Direkt nach dem Verbinden wird
+/// einmal abgeholt, weil Hinweise nur künftige Einreichungen ankündigen
+/// (schnittstellen.md: nach jedem Verbinden abholen). `--once` beendet
+/// nach dem ersten Durchlauf mit Nachrichten; das macht den Befehl im
+/// Prozess-je-Befehl-Test beweisbar.
+async fn listen(args: &[String]) -> Result<(), String> {
+    let once = match args.first().map(String::as_str) {
+        Some("--once") => true,
+        Some(other) => return Err(format!("unbekanntes Argument: {other}")),
+        None => false,
+    };
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    let (mut device, _storage) = open_device(&profile)?;
+    let delivery = DeliveryClient::new(delivery_url());
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(delivery.ws_url())
+        .await
+        .map_err(|e| format!("Hinweiskanal nicht erreichbar: {e}"))?;
+    socket
+        .send(Message::Text(ws_auth_frame(&token).into()))
+        .await
+        .map_err(|e| format!("Auth-Frame nicht gesendet: {e}"))?;
+
+    // Was schon wartet, kündigt kein Hinweis mehr an.
+    if drain_waiting(&delivery, &token, &mut device).await? > 0 && once {
+        return Ok(());
+    }
+
+    eprintln!("Verbunden, warte auf Hinweise (Strg+C beendet).");
+    while let Some(frame) = socket.next().await {
+        let frame = frame.map_err(|e| format!("Hinweiskanal gestört: {e}"))?;
+        match frame {
+            Message::Text(text) => match parse_ws_event(text.as_str()) {
+                Some(WsEvent::MessageWaiting) => {
+                    if drain_waiting(&delivery, &token, &mut device).await? > 0 && once {
+                        return Ok(());
+                    }
+                }
+                Some(WsEvent::Notification { tenant, title }) => {
+                    println!("[Benachrichtigung von {tenant}] {title}");
+                }
+                Some(WsEvent::Other { event }) => {
+                    eprintln!("Unbekanntes Event ignoriert: {event}");
+                }
+                None => eprintln!("Frame ohne event-Feld ignoriert"),
+            },
+            // Close 4401 heißt: Token abgelaufen oder ungültig.
+            Message::Close(reason) => {
+                return Err(match reason {
+                    Some(frame) => {
+                        format!("Server hat geschlossen: {} {}", frame.code, frame.reason)
+                    }
+                    None => "Server hat geschlossen".to_string(),
+                });
+            }
+            // Ping/Pong beantwortet tungstenite selbst, Binärframes sendet
+            // der Kanal nicht (schnittstellen.md).
+            _ => {}
+        }
+    }
+    Err("Verbindung beendet".to_string())
 }
 
 fn print_usage() {
@@ -391,6 +470,7 @@ fn print_usage() {
          \x20 publish-keys                   Prekey-Satz im Verzeichnis veröffentlichen\n\
          \x20 send <handle> <text>           E2EE-Nachricht senden (baut Sitzung bei Bedarf auf)\n\
          \x20 recv                           wartende Nachrichten abholen und entschlüsseln\n\
+         \x20 listen [--once]                Hinweiskanal halten und bei Hinweisen abholen\n\
          \x20 help                           diese Hilfe\n\
          \n\
          Umgebung:\n\

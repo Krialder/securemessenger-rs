@@ -19,7 +19,7 @@ crates/
     src/account.rs    Konto-Wurzelschlüssel (Ed25519) und Geräte-Credential smdc.v1 (Client-Seite)
     src/identity.rs   Client des identity-Dienstes (Registrierung, Login, Rotation, Logout)
     src/directory.rs  Client des Schlüssel-Verzeichnisses (Prekeys veröffentlichen, Bündel holen)
-    src/delivery.rs   Client der Zustellung (einreichen, abholen, bestätigen)
+    src/delivery.rs   Client der Zustellung (einreichen, abholen, bestätigen) plus WS-Rahmenvertrag (ws_url, Auth-Frame, Events)
     src/prekeys.rs    Blob-Codec smpk.v1: libsignal-PreKeyBundle in Verzeichnis-Blobs und zurück
     src/wire.rs       Hüllen-Framing smenv.v1 um den libsignal-Chiffretext
     src/storage.rs    Storage-Trait der lokalen Ablage (In-Memory, JSON-Datei; IndexedDB folgt)
@@ -29,8 +29,8 @@ crates/
     tests/messaging_e2e.rs  End-to-End über identity+directory+delivery: PQXDH, E2EE-Umlauf, Ablage ohne Klartext
     tests/kt_e2e.rs   End-to-End über identity+kt: Selbstprüfung besteht, untergeschobener Schlüssel schlägt Alarm
 clients/
-  cli/                Headless-Referenzclient `sm`: register/login/logout/whoami/publish-keys/send/recv
-    tests/chat_e2e.rs Chat-Beweis: jeder Befehl ein eigener Prozess des echten Binaries, Dienste in-process
+  cli/                Headless-Referenzclient `sm`: register/login/logout/whoami/publish-keys/send/recv/listen
+    tests/chat_e2e.rs Chat-Beweis (jeder Befehl ein eigener Prozess, Dienste in-process) plus Hinweiskanal-Beweis (listen --once)
   web/                Leptos-Web-Client (WASM, CSR): nur Darstellung, Krypto und Protokoll kommen aus den Crates
     src/main.rs       Einstieg mit cfg-Weiche: nativ nur ein Stub, damit `cargo test --workspace` nicht am Browser-Code hängt
     src/app.rs        Oberfläche und Ablaufsteuerung: Konto anlegen, senden, abrufen (Ablage In-Memory, IndexedDB folgt)
