@@ -27,6 +27,9 @@ crates/
 clients/
   cli/                Headless-Referenzclient `sm`: register/login/logout/whoami/publish-keys/send/recv
     tests/chat_e2e.rs Chat-Beweis: jeder Befehl ein eigener Prozess des echten Binaries, Dienste in-process
+  web/                Leptos-Web-Client (WASM, CSR): nur Darstellung, Krypto und Protokoll kommen aus den Crates
+    src/main.rs       Einstieg mit cfg-Weiche: nativ nur ein Stub, damit `cargo test --workspace` nicht am Browser-Code hängt
+    src/app.rs        Oberfläche und Ablaufsteuerung: Konto anlegen, senden, abrufen (Ablage In-Memory, IndexedDB folgt)
 services/
   identity/           Identitäts- und Auth-Dienst (Fundament, Phase 1)
     migrations/       SQL-Migrationen, von sqlx beim Start eingebettet ausgeführt
@@ -100,6 +103,16 @@ cargo run -p identity     # Dienst starten
 Argon2 ist in Debug-Builds sonst unbrauchbar langsam, deshalb baut das Dev-Profil die Krypto-Pakete optimiert (siehe `profile.dev.package` in der Workspace-Cargo.toml).
 
 Für den Krypto-Kern (`crates/client-core`) braucht der Build zusätzlich `protoc` (libsignal kompiliert seine Protobuf-Schemas beim Bauen). `scripts/setup.ps1` installiert es nach `%LOCALAPPDATA%\protoc` und setzt `PROTOC`; die Backend-Dienste bauen auch ohne, weil kein Dienst vom Krypto-Kern abhängt (das Docker-Build baut nur `-p <dienst>`).
+
+Der Web-Client (`clients/web`) baut mit `trunk` nach wasm32 (beides installiert `scripts/setup.ps1`):
+
+```
+cd clients/web
+trunk build     # einmaliger Build nach dist/
+trunk serve     # Dev-Server; proxyt /api/* auf die lokalen Dienste (Trunk.toml)
+```
+
+Nativ kompiliert `sm-web` nur zu einem erklärenden Stub: der Browser-Code existiert ausschließlich für wasm32, damit `cargo test --workspace` weder Leptos für den Host bauen muss noch an dessen Send-Anforderungen scheitern kann (Begründung in `clients/web/src/main.rs`).
 
 Ohne lokale Toolchain baut Docker im Container:
 
