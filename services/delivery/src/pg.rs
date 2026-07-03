@@ -122,19 +122,12 @@ impl MessageStore for PgMessageStore {
     async fn store_batch(&self, messages: Vec<NewMessage>) -> Result<StoreOutcome, StoreError> {
         let received_at = now_epoch();
         self.ensure_partition(received_at).await?;
-        // Je Position eine Mikrosekunde drauf: so bleibt die Reihenfolge
-        // innerhalb des Batches erhalten (sonst entschiede die zufällige
-        // UUID). Am Monatsende könnte der Offset die Grenze queren, also
-        // auch für das Ende des Batches sichern (Cache macht das billig).
-        let micro = 0.000_001;
-        self.ensure_partition(received_at + messages.len() as f64 * micro)
-            .await?;
         // Ein Batch, eine Transaktion: entweder liegt alles Neue oder
         // nichts. Duplikate erkennt die Dedupe-Tabelle zeilenweise und
         // sind Erfolg (Idempotenz), kein Abbruch.
         let mut tx = self.pool.begin().await.map_err(backend)?;
         let mut outcome = StoreOutcome::default();
-        for (position, message) in messages.into_iter().enumerate() {
+        for message in messages {
             let id = parse_uuid(&message.id, "Hüllen-ID")?;
             let inserted = sqlx::query(
                 "INSERT INTO message_dedupe (id) VALUES ($1) ON CONFLICT (id) DO NOTHING",
@@ -156,6 +149,10 @@ impl MessageStore for PgMessageStore {
                     .map_err(|e| StoreError::Backend(format!("Franking-Tag kein Base64: {e}")))?,
                 None => Vec::new(),
             };
+            // Die Eingangsreihenfolge hält die seq-Sequenz (Migration 0002),
+            // nicht der Zeitstempel: Mikrosekunden-Offsets in Fließkomma
+            // kollidierten nach der to_timestamp-Rundung, und dann entschied
+            // die zufällige UUID die Reihenfolge.
             sqlx::query(
                 "INSERT INTO messages (id, recipient_id, device_id, envelope, franking_tag, received_at) \
                  VALUES ($1, $2, $3, $4, $5, to_timestamp($6))",
@@ -165,7 +162,7 @@ impl MessageStore for PgMessageStore {
             .bind(parse_uuid(&message.device_id, "Geräte-ID")?)
             .bind(&envelope)
             .bind(&franking)
-            .bind(received_at + position as f64 * micro)
+            .bind(received_at)
             .execute(&mut *tx)
             .await
             .map_err(backend)?;
@@ -178,13 +175,13 @@ impl MessageStore for PgMessageStore {
     async fn fetch(&self, device_id: &str, limit: u32) -> Result<Vec<WaitingMessage>, StoreError> {
         let device = parse_uuid(device_id, "Geräte-ID")?;
         let rows = sqlx::query(
-            // Alias bewusst nicht "received_at": ORDER BY bevorzugt den
-            // Ausgabe-Alias, und der ist auf Sekunden gerundet; sortiert
-            // wird nach der echten Spalte mit voller Auflösung.
+            // seq ist die Eingangsreihenfolge (Migration 0002): global
+            // monoton je Einreichung, ohne die Mikrosekunden-Kollisionen
+            // des Zeitstempels, bei denen die zufällige UUID entschied.
             "SELECT id, envelope, franking_tag, \
                     extract(epoch FROM received_at)::bigint AS received_epoch \
              FROM messages WHERE device_id = $1 \
-             ORDER BY received_at, id LIMIT $2",
+             ORDER BY seq LIMIT $2",
         )
         .bind(device)
         .bind(i64::from(limit))

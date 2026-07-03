@@ -59,10 +59,14 @@ async fn roundtrip_dedupe_and_ack() {
     assert_eq!(outcome.accepted, 1);
     assert_eq!(outcome.duplicates, 1);
 
-    // Abholen: Eingangsreihenfolge, Blob und Tag unversehrt zurück.
+    // Abholen: Eingangsreihenfolge, Blob und Tag unversehrt zurück. Die
+    // volle Reihenfolge ist Teil des Vertrags (seq, Migration 0002); vorher
+    // entschied bei Mikrosekunden-Kollisionen die zufällige UUID.
     let waiting = store.fetch(&device, 100).await.unwrap();
     assert_eq!(waiting.len(), 3);
     assert_eq!(waiting[0].id, first.id);
+    assert_eq!(waiting[1].id, second.id);
+    assert_eq!(waiting[2].id, third.id);
     assert_eq!(waiting[0].envelope, "Y2hpZmZyZXRleHQ=");
     assert_eq!(waiting[0].franking_tag.as_deref(), Some("dGFn"));
     assert!(waiting[0].received_at > 0);

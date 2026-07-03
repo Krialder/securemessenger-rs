@@ -116,11 +116,14 @@ CREATE TABLE messages (
     franking_tag  BYTEA NOT NULL,       -- Commitment fürs Abuse-Reporting
     received_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     delivered_at  TIMESTAMPTZ,
+    seq           BIGINT NOT NULL DEFAULT nextval('message_seq'),
     PRIMARY KEY (id, received_at)
 ) PARTITION BY RANGE (received_at);
 
 CREATE INDEX idx_messages_inbox ON messages (device_id, received_at);
 ```
+
+Die Eingangsreihenfolge beim Abholen hält `seq` (eine globale Sequenz, Migration 0002), nicht der Zeitstempel: `received_at` löst nur Mikrosekunden auf, und bei einer Kollision entschiede sonst die zufällige `id` die Reihenfolge. `received_at` bleibt Partitionsschlüssel und Retention-Anker.
 
 Der Primärschlüssel enthält den Partitionsschlüssel und kann die `id` deshalb nicht global eindeutig halten. Das übernimmt eine kleine Dedupe-Tabelle: ein `INSERT ... ON CONFLICT DO NOTHING` pro Hülle erkennt Wiederholungen auch dann noch, wenn die Hülle längst zugestellt und gelöscht ist - sonst würde ein später Retry sie erneut zustellen. Aufgeräumt wird sie mit der Retention zusammen mit den Partitionen.
 
