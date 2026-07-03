@@ -1,0 +1,29 @@
+# Netztrennung für die /internal-Routen (zweite Schicht neben dem
+# Shared Secret, siehe ENTWICKLUNG.md): Dienst-Pods nehmen Verkehr nur
+# aus dem eigenen Namespace und vom Ingress-Controller an. Von außen
+# führt der Weg ausschließlich über den Ingress, und der kennt die
+# /internal-Pfade nicht.
+#
+# [ANNAHME: der Ingress-Controller läuft im Namespace "ingress-nginx"
+# (Standard-Label des NGINX-Charts); die GitOps-Pipeline passt den
+# Selektor an die echte Installation an. mTLS je Aufrufer bleibt das
+# Ziel für die Service-Mesh-Etappe.]
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: services-ingress-only
+spec:
+  # Gilt für alle Dienst-Pods im Namespace.
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Untereinander: identity <- directory/delivery/integrations/media,
+    # delivery <- integrations, Keycloak <- alle.
+    - from:
+        - podSelector: {}
+    # Von außen nur über den Ingress-Controller.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx

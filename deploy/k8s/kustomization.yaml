@@ -1,0 +1,22 @@
+# Zusammenbau aller Manifeste: `kubectl apply -k deploy/k8s` bzw. das
+# GitOps-Werkzeug (ArgoCD/Flux) zeigt hierauf, damit der Cluster-Zustand
+# aus Git folgt (pflichtenheft.md 8.2). Die Operatoren für PostgreSQL,
+# Redis, NATS und MinIO sind bewusst nicht Teil dieses Verzeichnisses:
+# Zustand läuft über die jeweiligen Operator-Installationen
+# (betrieb.md), hier liegen nur die eigenen Dienste.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: securemessenger
+
+resources:
+  - namespace.yaml
+  - network-policy.yaml
+  - identity.yaml
+  - directory.yaml
+  - delivery.yaml
+  - integrations.yaml
+  - media.yaml
+  - kt.yaml
+  - keycloak.yaml
+  - ingress.yaml

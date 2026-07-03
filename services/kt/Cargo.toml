@@ -1,0 +1,40 @@
+[package]
+name = "kt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Key Transparency (F120): verifiable map + append-only Log der signierten
+# Wurzeln, Modell aus specs/key-transparency.md. Die Merkle-Konstruktion
+# kommt vollstaendig aus akd (Metas KT-Bibliothek, exakt gepinnt), hier
+# liegt nur die Orchestrierung: Update-Log, Epochen, Wurzel-Signaturen.
+#
+# Ausnahme von der "Backend verifiziert nur"-Regel, per Spec gefordert:
+# dieser Dienst haelt den privaten VRF-Schluessel (Label-Verschleierung
+# gegen Durchzaehlen) und den Signaturschluessel der Wurzeln.
+
+[dependencies]
+common.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+sqlx.workspace = true
+async-trait.workspace = true
+# Digest-Vergleich des internen Secrets und das Konto-Commitment.
+sha2.workspace = true
+akd.workspace = true
+# Wurzel-Signaturen (Ed25519). Der Seed kommt aus einem Secret.
+ed25519-dalek.workspace = true
+# OS-CSPRNG für flüchtige Dev-Schlüssel (produktiv kommen Seeds aus Secrets).
+rand.workspace = true
+# Wire-Format der akd-Beweise (kompakt, deterministisch); der Client-Core
+# deserialisiert mit derselben gepinnten akd-Version.
+bincode = "1.3"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

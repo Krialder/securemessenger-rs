@@ -1,0 +1,10 @@
+# Cargo-Konfiguration fuer den Workspace.
+#
+# Browser-Ziel (wasm32-unknown-unknown): getrandom 0.3 wird transitiv ueber
+# den Krypto-Kern (client-core) hereingezogen. Es verlangt neben dem
+# Cargo-Feature "wasm_js" zusaetzlich ein Compiler-cfg, das seinen
+# Web-Crypto-Backend auswaehlt. Fehlt das Flag, bricht der Build mit einem
+# compile_error! ab. Das Flag gilt nur fuer wasm32; native Builds
+# (Server-Dienste, CLI-Client) bleiben davon unberuehrt.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

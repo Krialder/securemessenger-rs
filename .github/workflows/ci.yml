@@ -1,0 +1,91 @@
+# CI-Pipeline: Format, Lint, Tests (inkl. PostgreSQL-Integrationstests),
+# Docker-Builds je Dienst (pflichtenheft.md 8.2). Zugleich die CI-Vorlage,
+# die Folgeprojekte übernehmen können (pflichtenheft.md 8.8).
+#
+# [ANNAHME: GitHub-Actions-Syntax als Vorlage; die Abteilung betreibt die
+# Pipeline später auf ihrem eigenen Runner (interne Registry, GitOps-Push).
+# Das Deployment übernimmt ArgoCD/Flux aus dem Git-Zustand, nicht die CI.]
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Format, Lint, Tests
+    runs-on: ubuntu-latest
+    services:
+      # Eine PG-Instanz, eine Datenbank je Dienst (die sqlx-Migrations-
+      # tabellen duerfen sich nicht in die Quere kommen, ENTWICKLUNG.md).
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Die Toolchain kommt aus rust-toolchain.toml (rustup liest sie
+      # selbst); protoc braucht der Krypto-Kern (libsignal-Protobufs).
+      - name: protoc installieren
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Cargo-Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Datenbanken anlegen
+        run: |
+          for db in identity directory delivery integrations kt; do
+            PGPASSWORD=ci psql -h localhost -U postgres -c "CREATE DATABASE $db"
+          done
+
+      - name: Format pruefen
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (Warnungen sind Fehler)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Tests (Unit, API, PostgreSQL-Integration)
+        env:
+          TEST_DATABASE_URL: postgres://postgres:ci@localhost:5432/identity
+          TEST_DATABASE_URL_DIRECTORY: postgres://postgres:ci@localhost:5432/directory
+          TEST_DATABASE_URL_DELIVERY: postgres://postgres:ci@localhost:5432/delivery
+          TEST_DATABASE_URL_INTEGRATIONS: postgres://postgres:ci@localhost:5432/integrations
+          TEST_DATABASE_URL_KT: postgres://postgres:ci@localhost:5432/kt
+        run: cargo test --workspace --locked
+
+  docker:
+    name: Docker-Image ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    needs: check
+    strategy:
+      matrix:
+        service: [identity, directory, delivery, integrations, media, kt]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Image bauen
+        run: >
+          docker build -f deploy/docker/Dockerfile
+          --build-arg SERVICE=${{ matrix.service }}
+          -t securemessenger/${{ matrix.service }}:${{ github.sha }} .
+      # [ANNAHME: Push in die interne Registry folgt, sobald sie samt
+      # Zugangsdaten existiert; bis dahin beweist der Job nur, dass jedes
+      # Image aus jedem Stand baubar ist.]

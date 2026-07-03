@@ -1,0 +1,196 @@
+//! Client des Identitäts-Dienstes (services/identity).
+//!
+//! Deckt den Konto-Layer ab: Registrierung (Konto plus erstes Gerät), Login
+//! mit Gerätebindung, Rotation des Token-Paars und Logout. Die Request- und
+//! Response-Formen spiegeln services/identity/src/api.rs; Feldnamen und
+//! Status-Codes folgen dokumentation/schnittstellen.md.
+
+use serde::{Deserialize, Serialize};
+
+use crate::account::{build_device_credential, IdentityKeypair};
+use crate::error::ClientError;
+use crate::http::{expect_success, parse_json, transport};
+
+/// Client des Identitäts-Dienstes. Hält die Basis-URL und einen
+/// wiederverwendbaren HTTP-Client (Verbindungspool, ein DNS-/TLS-Aufbau).
+#[derive(Clone)]
+pub struct IdentityClient {
+    base_url: String,
+    http: reqwest::Client,
+}
+
+/// Alles, was eine Registrierung braucht. Den öffentlichen Kontoschlüssel
+/// und das Geräte-Credential leitet `register` ab; der private
+/// Wurzelschlüssel bleibt beim Aufrufer.
+pub struct NewAccount<'a> {
+    pub handle: &'a str,
+    pub display_name: Option<&'a str>,
+    pub password: &'a str,
+    /// Konto-Wurzelschlüssel (Ed25519); signiert das Geräte-Credential.
+    pub account_key: &'a IdentityKeypair,
+    /// Öffentlicher Schlüssel des ersten Geräts als Base64. Nach ADR-0009
+    /// ist das die serialisierte libsignal-Identität des Geräts
+    /// (`client_core::onetoone::Device::identity_public`); der Server
+    /// behandelt sie als opake Bytes.
+    pub device_public_key: &'a str,
+    /// Client-erzeugte Geräte-ID, kanonische UUID.
+    pub device_id: &'a str,
+    /// Ablauf des Credentials in Unix-Sekunden; der Client wählt die Dauer.
+    pub not_after: u64,
+}
+
+/// Bestätigtes Konto nach der Registrierung (Antwort von `POST /accounts`).
+#[derive(Deserialize, Debug, Clone)]
+pub struct Account {
+    pub handle: String,
+    pub display_name: String,
+    pub device_id: String,
+}
+
+/// Ein Token-Paar mit Laufzeit (Antwort von Login und Refresh). Feldnamen nach
+/// OAuth-2.0-Konvention, wie der Dienst sie liefert.
+#[derive(Deserialize, Debug, Clone)]
+pub struct Session {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub token_type: String,
+    /// Sekunden bis zum Ablauf des Access-Tokens.
+    pub expires_in: u64,
+}
+
+impl IdentityClient {
+    /// Baut einen Client für die gegebene Basis-URL (z. B.
+    /// `http://127.0.0.1:8080`). Ein abschließender Schrägstrich wird
+    /// entfernt, damit die Pfadanhänge sauber zusammensetzen.
+    pub fn new(base_url: impl Into<String>) -> Self {
+        let base_url = base_url.into().trim_end_matches('/').to_string();
+        Self {
+            base_url,
+            http: reqwest::Client::new(),
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
+    }
+
+    /// `POST /accounts`: legt Konto und erstes Gerät an. Erzeugt die
+    /// öffentlichen Schlüssel und das signierte Geräte-Credential aus den
+    /// übergebenen Schlüsselpaaren.
+    pub async fn register(&self, account: &NewAccount<'_>) -> Result<Account, ClientError> {
+        let identity_key = account.account_key.public_b64();
+        let device_public = account.device_public_key.to_string();
+        let credential = build_device_credential(
+            account.account_key,
+            account.handle,
+            account.device_id,
+            &device_public,
+            account.not_after,
+        );
+        let body = RegisterRequest {
+            handle: account.handle,
+            display_name: account.display_name,
+            password: account.password,
+            identity_key: &identity_key,
+            device: DeviceRequest {
+                id: account.device_id,
+                name: None,
+                public_key: &device_public,
+                not_after: account.not_after,
+                credential: &credential,
+            },
+        };
+        let response = self
+            .http
+            .post(self.url("/accounts"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(transport)?;
+        parse_json(response).await
+    }
+
+    /// `POST /sessions`: meldet ein registriertes Gerät an und liefert ein
+    /// frisches Token-Paar.
+    pub async fn login(
+        &self,
+        handle: &str,
+        password: &str,
+        device_id: &str,
+    ) -> Result<Session, ClientError> {
+        let body = LoginRequest {
+            handle,
+            password,
+            device_id,
+        };
+        let response = self
+            .http
+            .post(self.url("/sessions"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(transport)?;
+        parse_json(response).await
+    }
+
+    /// `POST /sessions/refresh`: rotiert das Token-Paar. Ein erneut
+    /// vorgelegtes, bereits rotiertes Refresh-Token widerruft serverseitig die
+    /// ganze Familie und kommt hier als `401` zurück.
+    pub async fn refresh(&self, refresh_token: &str) -> Result<Session, ClientError> {
+        let body = RefreshRequest { refresh_token };
+        let response = self
+            .http
+            .post(self.url("/sessions/refresh"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(transport)?;
+        parse_json(response).await
+    }
+
+    /// `DELETE /sessions`: meldet ab und widerruft die ganze Session-Familie.
+    /// Der Dienst antwortet immer `204`, auch bei unbekanntem Token, damit die
+    /// Antwort nichts über dessen Gültigkeit verrät.
+    pub async fn logout(&self, access_token: &str) -> Result<(), ClientError> {
+        let response = self
+            .http
+            .delete(self.url("/sessions"))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(transport)?;
+        expect_success(response).await
+    }
+}
+
+#[derive(Serialize)]
+struct DeviceRequest<'a> {
+    id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    public_key: &'a str,
+    not_after: u64,
+    credential: &'a str,
+}
+
+#[derive(Serialize)]
+struct RegisterRequest<'a> {
+    handle: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<&'a str>,
+    password: &'a str,
+    identity_key: &'a str,
+    device: DeviceRequest<'a>,
+}
+
+#[derive(Serialize)]
+struct LoginRequest<'a> {
+    handle: &'a str,
+    password: &'a str,
+    device_id: &'a str,
+}
+
+#[derive(Serialize)]
+struct RefreshRequest<'a> {
+    refresh_token: &'a str,
+}

@@ -1,0 +1,37 @@
+[package]
+name = "sm-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Headless-Referenzclient: treibt die client-app-Bibliothek über die
+# Kommandozeile. Bewusst nativ und schlank (kein Argument-Parser als
+# Abhängigkeit), damit der Protokollfluss sichtbar ist, bevor der Web-Client
+# (clients/web) dieselben Bausteine nutzt.
+
+[[bin]]
+name = "sm"
+path = "src/main.rs"
+
+[dependencies]
+client-app = { path = "../../crates/client-app" }
+# Das Geraet des Clients ist ein Krypto-Kern-Device: seine libsignal-
+# Identitaet ist der Geraeteschluessel im Credential (ADR-0009).
+client-core = { path = "../../crates/client-core" }
+tokio = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+
+# Nur fuer den Chat-Integrationstest: die echten Dienst-Router laufen
+# in-process, das sm-Binary wird je Befehl als eigener Prozess gestartet
+# (CARGO_BIN_EXE_sm) und beweist so die prozessuebergreifende Persistenz.
+[dev-dependencies]
+axum = { workspace = true }
+identity = { path = "../../services/identity" }
+directory = { path = "../../services/directory" }
+delivery = { path = "../../services/delivery" }
+common = { workspace = true }

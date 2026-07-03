@@ -1,0 +1,80 @@
+# Cargo-Workspace für die SecureMessenger-Backend-Dienste.
+# Jeder Dienst ist ein eigenes Binary unter services/, gemeinsame Bausteine
+# liegen unter crates/. Die Nachrichten-Kryptografie lebt nicht in den
+# Backend-Diensten, sondern im Client-Core (libsignal, OpenMLS); das Backend
+# hält und verteilt Chiffretext (dokumentation/architektur.md).
+
+[workspace]
+resolver = "2"
+members = [
+    "clients/cli",
+    "clients/web",
+    "crates/client-app",
+    "crates/client-core",
+    "crates/common",
+    "services/delivery",
+    "services/directory",
+    "services/identity",
+    "services/integrations",
+    "services/kt",
+    "services/media",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Proprietär"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+# ws: der Zustelldienst hält WebSocket-Verbindungen für Echtzeit-Hinweise
+# (schnittstellen.md "Echtzeit-Events").
+axum = { version = "0.8", features = ["ws"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+# std schaltet über password-hash das getrandom-Feature von rand_core frei,
+# ohne das gibt es kein OsRng für Salt- und Token-Erzeugung.
+argon2 = { version = "0.5", features = ["std"] }
+# Für das Ablegen von Session-Tokens als Hash (kein Passwort-Hashing, dafür
+# ist argon2 da; Begründung in services/identity/src/auth.rs).
+sha2 = "0.10"
+# Signatur-VERIFIKATION der Geräte-Credentials (specs/geraete-identitaet.md).
+# Der Server hält keine privaten Schlüssel, er prüft nur, was Clients signieren.
+ed25519-dalek = "2"
+base64 = "0.22"
+# Persistenz: PostgreSQL ohne ORM, Migrationen eingebettet ins Binary
+# (migrate!-Makro), damit das Container-Image keine losen SQL-Dateien braucht.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros", "uuid"] }
+# async fn in Traits ist stable, macht Traits aber nicht dyn-kompatibel;
+# die Stores stecken als Arc<dyn ...> im axum-State, deshalb async-trait.
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Dienst-zu-Dienst-HTTP (directory/delivery -> identity /internal, Baustein
+# in crates/common). rustls statt nativer TLS, damit das Container-Image
+# ohne OpenSSL auskommt.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Objektspeicher-Anbindung des Medien-Dienstes: eine API für S3/MinIO
+# (Betriebsziel, NF120), lokales Dateisystem und In-Memory (Tests).
+# Apache-Projekt, kein Eigenbau der S3-Signaturen.
+object_store = { version = "0.12", features = ["aws"] }
+# Key Transparency: Metas auditable key directory, exakt das Modell aus
+# specs/key-transparency.md (verifiable map + append-only Log + VRF).
+# Exakt gepinnt; kein Eigenbau von Merkle-Bäumen. Standard-Features:
+# ohne public_auditing kompiliert 0.12.0 nicht (Feature-Gating-Fehler
+# upstream); der protobuf-Crate dahinter ist reines Rust, kein protoc.
+akd = { version = "=0.12.0", features = ["serde_serialization"] }
+# OS-Zufall für Schlüsselerzeugung im kt-Dienst (Dev-Betrieb ohne Secrets).
+rand = "0.9"
+common = { path = "crates/common" }
+
+# Argon2 ist in Debug-Builds unbrauchbar langsam (Sekunden pro Hash).
+# Die Krypto-Pakete werden deshalb auch im Dev-Profil optimiert gebaut,
+# damit Tests und lokale Läufe schnell bleiben.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

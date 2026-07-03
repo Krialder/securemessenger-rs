@@ -1,0 +1,79 @@
+# Skelett für das Schlüssel-Verzeichnis auf Kubernetes. Image-Tag und Ressourcen
+# sind Platzhalter und werden über die GitOps-Pipeline gesetzt (pflichtenheft.md 8.2).
+# Zwei Repliken: der Bündel-Abruf liegt auf dem kritischen Pfad des
+# Sitzungsaufbaus (NF060, NF160). DATABASE_URL und INTERNAL_TOKEN kommen
+# aus Secrets; die /internal-Routen von identity erreicht der Dienst nur
+# über das Cluster-Netz (Service identity, Port 80).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: directory
+  labels:
+    app: directory
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: directory
+  template:
+    metadata:
+      labels:
+        app: directory
+    spec:
+      containers:
+        - name: directory
+          image: registry.intern/securemessenger/directory:0.1.0 # Platzhalter
+          ports:
+            - containerPort: 8080
+          env:
+            - name: BIND_ADDR
+              value: "0.0.0.0:8080"
+            - name: SERVICE_NAME
+              value: "directory"
+            - name: RUST_LOG
+              value: "info"
+            - name: IDENTITY_URL
+              value: "http://identity"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: directory-db
+                  key: url
+            - name: INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: internal-token
+                  key: token
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: directory
+  labels:
+    app: directory
+spec:
+  selector:
+    app: directory
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

@@ -1,0 +1,17 @@
+# Rust-Build-Artefakte
+/target
+**/*.rs.bk
+
+# Umgebungs- und Geheimnis-Dateien (keine Secrets ins Repo, NF030)
+.env
+*.env.local
+
+# Editor- und OS-Kram
+.DS_Store
+.idea/
+.vscode/
+
+# Lokale Assistent-Sitzungsdaten, nicht Teil des Projekts
+.claude/
+
+# Cargo.lock wird bewusst NICHT ignoriert: bei Binaries gehört er ins Repo.

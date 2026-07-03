@@ -1,0 +1,8 @@
+# Eigener Namespace: die Messenger-Dienste teilen sich den Cluster später
+# mit Folgeprojekten (pflichtenheft.md 8.8), die Grenze ist der Namespace.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: securemessenger
+  labels:
+    app.kubernetes.io/part-of: securemessenger

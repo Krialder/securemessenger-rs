@@ -1,0 +1,19 @@
+# trunk-Konfiguration des Web-Clients.
+#
+# Die Proxys leiten /api/* im Dev-Server auf die lokalen Dienste um, damit
+# der Browser same-origin spricht und keine CORS-Konfiguration in den
+# Diensten noetig ist. Im Cluster uebernimmt der Ingress dieselbe
+# Pfad-Zuordnung (deploy/k8s/ingress.yaml). [ANNAHME: Ports wie in
+# ENTWICKLUNG.md, identity 8080, directory 8081, delivery 8082.]
+
+[[proxy]]
+rewrite = "/api/identity/"
+backend = "http://127.0.0.1:8080/"
+
+[[proxy]]
+rewrite = "/api/directory/"
+backend = "http://127.0.0.1:8081/"
+
+[[proxy]]
+rewrite = "/api/delivery/"
+backend = "http://127.0.0.1:8082/"

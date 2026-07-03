@@ -1,0 +1,10 @@
+# Zeilenenden deterministisch halten: LF im Repo und für Unix-nahe Dateien,
+# CRLF nur für Windows-Skripte, die per Doppelklick laufen.
+* text=auto
+*.rs text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.md text
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.pdf binary

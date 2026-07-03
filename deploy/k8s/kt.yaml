@@ -1,0 +1,92 @@
+# Key Transparency (KT, F120) auf Kubernetes. Anders als die übrigen Dienste
+# bewusst eine Replik: Der Epochen-Publisher läuft als Hintergrund-Task in
+# jeder Instanz und schreibt signierte Wurzeln; zwei Repliken würden parallel
+# Epochen veröffentlichen. Das Skalieren der Lese-Pfade (Beweis-Abruf) über
+# mehrere Repliken braucht deshalb erst einen herausgelösten, leader-gewählten
+# Publisher. [ANNAHME: Singleton bis zur Betriebs-Etappe.]
+#
+# Secrets wie bei den anderen Diensten extern bereitgestellt (GitOps): kt-db/url
+# (Datenbank), internal-token/token (Dienst-zu-Dienst) und kt-keys mit den von
+# der KT-Spec erlaubten Server-Schlüsseln, der Ed25519-Wurzelsignatur (signing)
+# und dem VRF-Schlüssel (vrf).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kt
+  labels:
+    app: kt
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kt
+  template:
+    metadata:
+      labels:
+        app: kt
+    spec:
+      containers:
+        - name: kt
+          image: registry.intern/securemessenger/kt:0.1.0 # Platzhalter
+          ports:
+            - containerPort: 8080
+          env:
+            - name: BIND_ADDR
+              value: "0.0.0.0:8080"
+            - name: SERVICE_NAME
+              value: "kt"
+            - name: RUST_LOG
+              value: "info"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: kt-db
+                  key: url
+            - name: INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: internal-token
+                  key: token
+            - name: KT_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kt-keys
+                  key: signing
+            - name: KT_VRF_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kt-keys
+                  key: vrf
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kt
+  labels:
+    app: kt
+spec:
+  selector:
+    app: kt
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

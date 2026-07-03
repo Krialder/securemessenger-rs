@@ -1,0 +1,90 @@
+# Skelett für den Medien-Dienst auf Kubernetes. Image-Tag und Ressourcen
+# sind Platzhalter und werden über die GitOps-Pipeline gesetzt
+# (pflichtenheft.md 8.2). Die Blob-Ablage ist MinIO (S3-kompatibel,
+# on-premise, NF120); der MinIO-Betrieb selbst läuft über den Operator
+# und kommt mit der Betriebs-Etappe. Zugangsdaten liest der S3-Client
+# aus den AWS_*-Standardvariablen.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: media
+  labels:
+    app: media
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: media
+  template:
+    metadata:
+      labels:
+        app: media
+    spec:
+      containers:
+        - name: media
+          image: registry.intern/securemessenger/media:0.1.0 # Platzhalter
+          ports:
+            - containerPort: 8080
+          env:
+            - name: BIND_ADDR
+              value: "0.0.0.0:8080"
+            - name: SERVICE_NAME
+              value: "media"
+            - name: RUST_LOG
+              value: "info"
+            - name: IDENTITY_URL
+              value: "http://identity"
+            - name: INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: internal-token
+                  key: token
+            - name: MEDIA_S3_BUCKET
+              value: "media"
+            - name: MEDIA_S3_ENDPOINT
+              value: "http://minio:9000" # Platzhalter, MinIO-Service
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: media-s3
+                  key: access-key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: media-s3
+                  key: secret-key
+            - name: AWS_DEFAULT_REGION
+              value: "local" # MinIO ignoriert die Region, der Client verlangt eine
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi" # Blobs laufen durch den Speicher, mehr Puffer als bei den anderen
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: media
+  labels:
+    app: media
+spec:
+  selector:
+    app: media
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

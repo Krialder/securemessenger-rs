@@ -1,0 +1,6 @@
+# Gepinnte Toolchain für reproduzierbare Builds (Grundlage für Binary Transparency, F220).
+# Exakte Version, keine schwimmende. Beim Anheben bewusst und dokumentiert vorgehen.
+# 1.96.1 ist das Stable vom Stand 02.07.2026; mindestens 1.85 ist Pflicht, weil
+# Teile des Dependency-Baums (base64ct über axum) Edition 2024 verlangen.
+[toolchain]
+channel = "1.96.1"

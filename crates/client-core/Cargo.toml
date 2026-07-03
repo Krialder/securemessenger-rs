@@ -1,0 +1,53 @@
+[package]
+name = "client-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Der gemeinsame Krypto-Kern der Clients (ADR-0005): PQXDH, Double Ratchet
+# und SPQR aus libsignal, Gruppen aus OpenMLS. Kein Backend-Dienst haengt
+# von diesem Crate ab; der Server sieht nur Chiffretext. Beide
+# Bibliotheken sind auf einen konkreten Release-Commit gepinnt (rev),
+# nicht auf eine schwimmende Version (specs/krypto-kern.md "Version-Pins").
+#
+# Achtung Build-Voraussetzung: libsignal kompiliert seine Protobuf-Schemas
+# beim Bauen, dafuer muss protoc installiert sein (siehe ENTWICKLUNG.md).
+
+[dependencies]
+# libsignal v0.96.4 (Tag-Commit 57d41c877d5a55d881fb3f52d9b16900118ee29b).
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal", rev = "57d41c877d5a55d881fb3f52d9b16900118ee29b" }
+# OpenMLS v0.8.1 (Tag-Commit 47dbedecad0c1fd8eb5368d582250ebfcc1e1ce6),
+# dazu der RustCrypto-Provider und die Basic-Credentials aus demselben Commit.
+openmls = { git = "https://github.com/openmls/openmls", rev = "47dbedecad0c1fd8eb5368d582250ebfcc1e1ce6" }
+openmls_rust_crypto = { git = "https://github.com/openmls/openmls", rev = "47dbedecad0c1fd8eb5368d582250ebfcc1e1ce6" }
+openmls_basic_credential = { git = "https://github.com/openmls/openmls", rev = "47dbedecad0c1fd8eb5368d582250ebfcc1e1ce6" }
+# Zufall fuer Schluesselerzeugung: dieselbe rand-Major wie libsignal (0.9),
+# der eigentliche Zufall kommt aus dem OS-CSPRNG.
+rand = "0.9"
+
+# Browser-Ziel (wasm32-unknown-unknown): libsignal zieht getrandom 0.2 als
+# Transitivabhaengigkeit herein. Ohne Feature bricht dessen Build mit einem
+# compile_error! ab, weil es auf wasm keine Standard-Zufallsquelle kennt.
+# Das "js"-Feature bindet die Web-Crypto-API des Browsers als CSPRNG an.
+# Nur fuer wasm32 gesetzt, damit native Builds (Server, CLI) unveraendert
+# das OS-CSPRNG nutzen. getrandom 0.3 kommt ueber einen anderen Zweig
+# (u. a. rand 0.9) herein und braucht das "wasm_js"-Feature plus das
+# Compiler-cfg aus .cargo/config.toml.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+# OpenMLS braucht fuer wasm sein "js"-Feature: es bindet Browser-APIs fuer
+# sichere Zufallszahlen und die aktuelle Uhrzeit (fluvio_wasm_timer) an.
+# Cargo vereinigt diese Features additiv mit der Basisdeklaration oben,
+# native Builds bleiben ohne "js".
+openmls = { git = "https://github.com/openmls/openmls", rev = "47dbedecad0c1fd8eb5368d582250ebfcc1e1ce6", features = ["js"] }
+# Uhrzeit im Browser: SystemTime::now() paniert auf wasm32-unknown-unknown
+# zur Laufzeit, deshalb kommt die Zeit dort aus der JavaScript-Uhr
+# (js_sys::Date), siehe onetoone::now.
+js-sys = "0.3"
+
+[dev-dependencies]
+# Die Integrations-Beweise (Roundtrips) sind async, weil die
+# libsignal-Store-Traits async sind.
+tokio = { workspace = true }

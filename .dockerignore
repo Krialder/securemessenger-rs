@@ -1,0 +1,7 @@
+# Schlanker Build-Context: nur Code in den Container, nicht Doku und Werkzeuge.
+target/
+dokumentation/
+werkzeuge/
+.git/
+.github/
+**/*.md

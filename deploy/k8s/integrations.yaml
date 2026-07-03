@@ -1,0 +1,79 @@
+# Skelett für den Integrations-Dienst auf Kubernetes. Image-Tag und
+# Ressourcen sind Platzhalter und werden über die GitOps-Pipeline gesetzt
+# (pflichtenheft.md 8.2). Zwei Repliken; das Rate-Limit je Mandant zählt
+# vorerst je Replik (In-Prozess-Zähler, siehe services/integrations/src/rate.rs).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: integrations
+  labels:
+    app: integrations
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: integrations
+  template:
+    metadata:
+      labels:
+        app: integrations
+    spec:
+      containers:
+        - name: integrations
+          image: registry.intern/securemessenger/integrations:0.1.0 # Platzhalter
+          ports:
+            - containerPort: 8080
+          env:
+            - name: BIND_ADDR
+              value: "0.0.0.0:8080"
+            - name: SERVICE_NAME
+              value: "integrations"
+            - name: RUST_LOG
+              value: "info"
+            - name: IDENTITY_URL
+              value: "http://identity"
+            - name: DELIVERY_URL
+              value: "http://delivery"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: integrations-db
+                  key: url
+            - name: INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: internal-token
+                  key: token
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: integrations
+  labels:
+    app: integrations
+spec:
+  selector:
+    app: integrations
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

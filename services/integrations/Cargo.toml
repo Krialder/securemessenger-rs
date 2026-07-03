@@ -1,0 +1,28 @@
+[package]
+name = "integrations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+common.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Mandanten-Secrets werden wie Passwörter behandelt: Argon2id-Hash in der
+# Ablage (pflichtenheft.md 7, NF040), Tokens nur als SHA-256-Digest.
+argon2.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+# Eigener HTTP-Client für die /internal-Routen von delivery (Events,
+# Präsenz); die identity-Anbindung kommt aus crates/common.
+reqwest.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

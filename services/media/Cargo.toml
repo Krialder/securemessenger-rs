@@ -1,0 +1,22 @@
+[package]
+name = "media"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+common.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+# Blob-Ablage: S3/MinIO im Betrieb, In-Memory ohne Konfiguration.
+object_store.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+async-trait.workspace = true

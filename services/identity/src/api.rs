@@ -1,0 +1,919 @@
+//! HTTP-Schicht des Identitäts-Dienstes: Zustand, Router und Handler.
+//!
+//! Fehler gehen einheitlich als JSON mit `code` und `message` raus, wie in
+//! dokumentation/schnittstellen.md festgelegt. Die Passwort-Arbeit läuft in
+//! `spawn_blocking`, weil Argon2id bewusst teuer ist und sonst die
+//! async-Worker blockieren würde.
+
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use axum::extract::{Path, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get, post};
+use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
+
+use crate::auth;
+use crate::credential;
+use crate::domain::{Account, Device};
+use crate::kt_notify::{KtNotifier, NoopKtNotifier};
+use crate::session::{
+    InMemorySessionStore, RefreshError, SessionConfig, SessionIdentity, SessionStore,
+};
+use crate::store::{AccountStore, InMemoryStore, StoreError};
+use common::rate::RateLimiter;
+
+/// Login-Versuche je Handle und Minute: bremst Credential-Stuffing gegen
+/// ein einzelnes Konto, ohne ehrliche Tipper auszusperren.
+/// [ANNAHME: 10/min; das Pflichtenheft fordert strenge Limits auf Login
+/// und Registrierung, nennt aber keine Zahlen.]
+const LOGIN_RATE_LIMIT: u32 = 10;
+/// Registrierungen je Handle und Minute. Der Schlüssel ist das Handle,
+/// nicht die IP: hinter dem Ingress ist die Quell-IP nicht belastbar,
+/// IP-Limits gehören an die Edge. [ANNAHME: 5/min.]
+const REGISTER_RATE_LIMIT: u32 = 5;
+
+/// Geteilter Zustand aller Handler.
+#[derive(Clone)]
+pub struct AppState {
+    store: Arc<dyn AccountStore>,
+    /// Session-Familien mit Access-/Refresh-Rotation (F020), siehe session.rs.
+    sessions: Arc<dyn SessionStore>,
+    session_config: SessionConfig,
+    /// Hash, gegen den bei unbekanntem Handle geprüft wird, damit die
+    /// Antwortzeit nicht verrät, ob ein Konto existiert.
+    dummy_hash: Arc<str>,
+    /// SHA-256 des Shared Secrets für /internal-Routen. Ohne Wert sind die
+    /// Routen abgeschaltet (404). Als Hash gehalten, damit der Vergleich
+    /// über Digests läuft und kein Klartext-Secret im Speicher liegt.
+    internal_token_hash: Option<Arc<str>>,
+    /// Rate-Limits der heißen Pfade (Login, Registrierung), je Handle.
+    limiter: Arc<RateLimiter>,
+    /// Meldet Schlüsseländerungen ans KT-Verzeichnis (F120); Noop, wenn
+    /// kein kt-Dienst konfiguriert ist.
+    kt: Arc<dyn KtNotifier>,
+}
+
+impl AppState {
+    /// Zustand mit In-Memory-Ablage und Standard-Laufzeiten. Rechnet einmalig
+    /// den Dummy-Hash und gehört deshalb in den Programmstart, nicht in den
+    /// Request-Pfad.
+    pub fn new_in_memory() -> Self {
+        Self::with_session_config(SessionConfig::default())
+    }
+
+    /// Wie `new_in_memory`, aber mit eigenen Token-Laufzeiten (für Tests).
+    pub fn with_session_config(session_config: SessionConfig) -> Self {
+        Self::with_stores(
+            Arc::new(InMemoryStore::default()),
+            Arc::new(InMemorySessionStore::new(session_config)),
+            session_config,
+        )
+    }
+
+    /// Zustand mit beliebigen Ablagen; der Produktionspfad reicht hier die
+    /// PostgreSQL-Stores hinein (main.rs).
+    pub fn with_stores(
+        store: Arc<dyn AccountStore>,
+        sessions: Arc<dyn SessionStore>,
+        session_config: SessionConfig,
+    ) -> Self {
+        let dummy = auth::hash_password(&auth::new_session_token())
+            .expect("Argon2id mit Default-Parametern hasht fehlerfrei");
+        Self {
+            store,
+            sessions,
+            session_config,
+            dummy_hash: Arc::from(dummy),
+            internal_token_hash: None,
+            limiter: Arc::new(RateLimiter::default()),
+            kt: Arc::new(NoopKtNotifier),
+        }
+    }
+
+    /// Hängt den KT-Melder ein (main.rs, wenn KT_URL konfiguriert ist).
+    pub fn with_kt_notifier(mut self, notifier: Arc<dyn KtNotifier>) -> Self {
+        self.kt = notifier;
+        self
+    }
+
+    /// Schaltet die /internal-Routen mit einem Shared Secret frei
+    /// (Dienst-zu-Dienst, z. B. directory).
+    pub fn with_internal_token(mut self, token: &str) -> Self {
+        self.internal_token_hash = Some(Arc::from(auth::token_hash(token)));
+        self
+    }
+}
+
+/// Baut den vollständigen Router des Dienstes.
+///
+/// `POST /accounts` legt Konto und erstes Gerät zusammen an, `/devices`
+/// verwaltet die Gerätemenge (F030/F040, schnittstellen.md).
+pub fn app(state: AppState) -> Router {
+    let mut router = Router::new()
+        .route("/", get(|| async { "SecureMessenger identity service" }))
+        .route("/accounts", post(register))
+        .route("/sessions", post(login).delete(logout))
+        .route("/sessions/refresh", post(refresh))
+        .route("/devices", get(list_devices).post(add_device))
+        .route("/devices/{id}", delete(remove_device));
+    // Dienst-zu-Dienst (nicht öffentlich, Shared Secret): Introspektion
+    // von Access-Tokens und die Gerätemenge eines Kontos. So bleibt die
+    // Session-Ablage privat beim identity-Dienst, statt dass andere
+    // Dienste in seine Datenbank greifen. Ohne konfiguriertes Secret werden
+    // die Routen gar nicht erst eingehängt: jede Anfrage darauf ist ein
+    // sauberes 404, auch für Extractor-Fehler wie kaputtes JSON.
+    if state.internal_token_hash.is_some() {
+        router = router
+            .route("/internal/introspect", post(introspect))
+            .route(
+                "/internal/accounts/{handle}/devices",
+                get(internal_account_devices),
+            );
+    }
+    router
+        .layer(axum::middleware::from_fn(common::metrics::track))
+        .merge(common::ops_router())
+        .with_state(state)
+}
+
+#[derive(Deserialize)]
+struct RegisterRequest {
+    handle: String,
+    display_name: Option<String>,
+    password: String,
+    /// Öffentlicher Konto-Identitätsschlüssel (Ed25519, Base64). Der Client
+    /// erzeugt das Schlüsselpaar, der private Teil verlässt ihn nie.
+    identity_key: String,
+    /// Das erste Gerät; ein Konto ohne Gerät gibt es nicht.
+    device: DeviceRequest,
+}
+
+/// Ein Gerät, wie der Client es anmeldet. Das Credential ist die Signatur
+/// des Konto-Identitätsschlüssels über das Format aus credential.rs.
+#[derive(Deserialize)]
+struct DeviceRequest {
+    /// Client-erzeugte ID, z. B. eine UUID. Pro Konto eindeutig, für immer.
+    id: String,
+    name: Option<String>,
+    /// Öffentlicher Geräteschlüssel (Ed25519, Base64).
+    public_key: String,
+    /// Ablauf des Credentials, Unix-Sekunden. Der Client wählt die Dauer.
+    not_after: u64,
+    /// Signatur (Base64) des Konto-Identitätsschlüssels.
+    credential: String,
+}
+
+#[derive(Serialize)]
+struct AccountResponse {
+    handle: String,
+    display_name: String,
+    /// Bestätigt die registrierte Geräte-ID; bei einem Mehr-Feld-POST soll
+    /// der Client sehen, was der Server wirklich angelegt hat.
+    device_id: String,
+}
+
+#[derive(Serialize)]
+struct DeviceResponse {
+    id: String,
+    name: String,
+    public_key: String,
+    not_after: u64,
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    handle: String,
+    password: String,
+    /// Sessions sind gerätegebunden: das Gerät muss registriert und nicht
+    /// revoziert sein.
+    device_id: String,
+}
+
+#[derive(Deserialize)]
+struct RefreshRequest {
+    refresh_token: String,
+}
+
+/// Antwort auf Login und Refresh. Feldnamen nach OAuth-2.0-Konvention
+/// (access_token, refresh_token, token_type, expires_in), damit Clients beim
+/// späteren OIDC-Anschluss (Pflichtenheft 5.2) keine zweite Form lernen.
+#[derive(Serialize)]
+struct SessionResponse {
+    access_token: String,
+    refresh_token: String,
+    token_type: &'static str,
+    /// Sekunden bis zum Ablauf des Access-Tokens.
+    expires_in: u64,
+}
+
+/// Einheitliches Fehlerformat nach schnittstellen.md.
+#[derive(Serialize)]
+struct ApiError {
+    code: &'static str,
+    message: &'static str,
+}
+
+fn api_error(status: StatusCode, code: &'static str, message: &'static str) -> Response {
+    (status, Json(ApiError { code, message })).into_response()
+}
+
+fn internal() -> Response {
+    api_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal",
+        "Interner Fehler",
+    )
+}
+
+/// Backend-Fehler der Ablage: loggen und 500. Nie in ein 401/404 übersetzen,
+/// sonst sieht ein Datenbank-Ausfall wie "gibt es nicht" aus und Clients
+/// räumen lokalen Zustand ab.
+fn store_failure(error: StoreError) -> Response {
+    tracing::error!(?error, "Ablage-Fehler");
+    internal()
+}
+
+/// Meldet die aktuelle Schlüsselmenge eines Kontos ans KT-Verzeichnis,
+/// fire-and-forget im Hintergrund: die Antwort an den Client wartet nie
+/// auf kt, und ein kt-Ausfall wird nur geloggt (kt_notify.rs).
+fn notify_kt(st: &AppState, handle: &str) {
+    let store = st.store.clone();
+    let kt = st.kt.clone();
+    let handle = handle.to_string();
+    tokio::spawn(async move {
+        let account = match store.get(&handle).await {
+            Ok(Some(account)) => account,
+            _ => return,
+        };
+        let devices = match store.devices(&handle).await {
+            Ok(devices) => devices,
+            Err(_) => return,
+        };
+        let view = common::identity_client::AccountDevices {
+            id: account.id,
+            handle: handle.clone(),
+            identity_key: account.identity_key,
+            devices: devices
+                .into_iter()
+                .filter(|d| !d.revoked)
+                .map(|d| common::identity_client::DeviceInfo {
+                    id: d.id,
+                    public_key: d.public_key,
+                    not_after: d.not_after,
+                })
+                .collect(),
+        };
+        let commitment = common::kt::account_commitment(&view);
+        kt.key_set_changed(&handle, &commitment).await;
+    });
+}
+
+async fn register(State(st): State<AppState>, Json(req): Json<RegisterRequest>) -> Response {
+    if let Err(message) = validate_handle(&req.handle) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_handle", message);
+    }
+    // Limit vor der teuren Arbeit (Argon2, Signaturprüfung); der
+    // Schlüssel trägt einen Präfix, damit Login-Versuche auf dasselbe
+    // Handle ein eigenes Fenster haben.
+    if let Err(retry_after) = st
+        .limiter
+        .check(&format!("register:{}", req.handle), REGISTER_RATE_LIMIT)
+    {
+        return common::rate::too_many_requests(retry_after);
+    }
+    if let Err(message) = validate_password(&req.password) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_password", message);
+    }
+    if let Err(message) = validate_device_id(&req.device.id) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_device", message);
+    }
+    // Früher Duplikat-Check, damit ein vergebenes Handle keinen teuren
+    // Argon2-Lauf kostet. Verbindlich bleibt der atomare create() darunter.
+    match st.store.get(&req.handle).await {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return api_error(
+                StatusCode::CONFLICT,
+                "handle_taken",
+                "Handle ist bereits vergeben",
+            )
+        }
+        Err(error) => return store_failure(error),
+    }
+    // Credential vor dem Argon2-Lauf prüfen: Signaturverifikation ist
+    // billig, und ein kaputtes Gerät soll den teuren Hash gar nicht auslösen.
+    if let Err(error) = credential::verify_device_credential(
+        &req.identity_key,
+        &req.handle,
+        &req.device.id,
+        &req.device.public_key,
+        req.device.not_after,
+        &req.device.credential,
+        now_unix(),
+    ) {
+        return credential_error_response(error);
+    }
+    let password = req.password;
+    let password_hash =
+        match tokio::task::spawn_blocking(move || auth::hash_password(&password)).await {
+            Ok(Ok(hash)) => hash,
+            Ok(Err(error)) => {
+                tracing::error!(%error, "Argon2-Hashing fehlgeschlagen");
+                return internal();
+            }
+            Err(error) => {
+                tracing::error!(%error, "spawn_blocking abgebrochen");
+                return internal();
+            }
+        };
+    let display_name = req
+        .display_name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| req.handle.clone());
+    let response = AccountResponse {
+        handle: req.handle.clone(),
+        display_name: display_name.clone(),
+        device_id: req.device.id.clone(),
+    };
+    let account = Account {
+        id: uuid::Uuid::new_v4().to_string(),
+        handle: req.handle,
+        display_name,
+        password_hash,
+        identity_key: req.identity_key,
+    };
+    match st
+        .store
+        .create(account, device_from_request(req.device))
+        .await
+    {
+        Ok(()) => {
+            // Neues Konto = neue Schlüsselmenge im Verzeichnis.
+            notify_kt(&st, &response.handle);
+            (StatusCode::CREATED, Json(response)).into_response()
+        }
+        Err(StoreError::HandleTaken) => api_error(
+            StatusCode::CONFLICT,
+            "handle_taken",
+            "Handle ist bereits vergeben",
+        ),
+        Err(StoreError::DeviceIdTaken) => api_error(
+            StatusCode::CONFLICT,
+            "device_id_taken",
+            "Geräte-ID ist bereits vergeben",
+        ),
+        Err(error) => store_failure(error),
+    }
+}
+
+fn device_from_request(req: DeviceRequest) -> Device {
+    Device {
+        id: req.id,
+        // Fallback statt Pflichtfeld: der Name ist rein informativ.
+        name: req
+            .name
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| "Gerät".to_string()),
+        public_key: req.public_key,
+        credential: req.credential,
+        not_after: req.not_after,
+        revoked: false,
+    }
+}
+
+/// Übersetzt Credential-Fehler in API-Antworten. Alle Varianten sind 400 mit
+/// demselben Code; die genaue Ursache steht nur im Log, damit die API keine
+/// Prüfreihenfolge verrät.
+fn credential_error_response(error: credential::CredentialError) -> Response {
+    tracing::debug!(?error, "Geräte-Credential abgelehnt");
+    api_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_credential",
+        "Geräte-Credential ist ungültig oder abgelaufen",
+    )
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Systemzeit liegt nach 1970")
+        .as_secs()
+}
+
+async fn login(State(st): State<AppState>, Json(req): Json<LoginRequest>) -> Response {
+    // Limit je Handle vor der Passwortarbeit: bremst Durchprobieren gegen
+    // ein Konto, bevor es Argon2-Zeit kostet.
+    if let Err(retry_after) = st
+        .limiter
+        .check(&format!("login:{}", req.handle), LOGIN_RATE_LIMIT)
+    {
+        return common::rate::too_many_requests(retry_after);
+    }
+    // Auch bei unbekanntem Handle wird gegen einen Dummy-Hash geprüft,
+    // damit die Antwortzeit keine Konto-Existenz verrät.
+    let (stored_hash, account_exists) = match st.store.get(&req.handle).await {
+        Ok(Some(account)) => (account.password_hash, true),
+        Ok(None) => (st.dummy_hash.to_string(), false),
+        Err(error) => return store_failure(error),
+    };
+    let password = req.password;
+    let password_ok =
+        tokio::task::spawn_blocking(move || auth::verify_password(&password, &stored_hash))
+            .await
+            .unwrap_or(false);
+    // Geräteprüfung nach der Passwortarbeit und mit derselben generischen
+    // Antwort: wer das Passwort nicht kennt, erfährt auch nichts über die
+    // Gerätemenge.
+    let device_ok = match st.store.get_device(&req.handle, &req.device_id).await {
+        Ok(device) => device.is_some_and(|d| !d.revoked),
+        Err(error) => return store_failure(error),
+    };
+    if !password_ok || !account_exists || !device_ok {
+        return api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "Handle, Passwort oder Gerät ist ungültig",
+        );
+    }
+    let (response, access_hash, refresh_hash) = new_token_pair(&st);
+    let created = st
+        .sessions
+        .create(
+            SessionIdentity {
+                handle: req.handle,
+                device_id: req.device_id,
+            },
+            access_hash,
+            refresh_hash,
+        )
+        .await;
+    if let Err(error) = created {
+        tracing::error!(%error, "Session anlegen fehlgeschlagen");
+        return internal();
+    }
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+/// Baut ein frisches Token-Paar samt Antwort. Der Klartext geht genau einmal
+/// an den Client, gespeichert werden nur die Hashes.
+fn new_token_pair(st: &AppState) -> (SessionResponse, String, String) {
+    let access_token = auth::new_session_token();
+    let refresh_token = auth::new_session_token();
+    let access_hash = auth::token_hash(&access_token);
+    let refresh_hash = auth::token_hash(&refresh_token);
+    let response = SessionResponse {
+        access_token,
+        refresh_token,
+        token_type: "Bearer",
+        expires_in: st.session_config.access_ttl.as_secs(),
+    };
+    (response, access_hash, refresh_hash)
+}
+
+/// `POST /sessions/refresh`: rotiert das Token-Paar. Ein wiederverwendetes
+/// (schon rotiertes) Refresh-Token widerruft die ganze Familie; nach außen
+/// bleibt die Antwort trotzdem das generische 401, damit ein Angreifer nicht
+/// erfährt, dass er aufgeflogen ist. Der Vorfall steht im Log.
+async fn refresh(State(st): State<AppState>, Json(req): Json<RefreshRequest>) -> Response {
+    let (response, access_hash, refresh_hash) = new_token_pair(&st);
+    match st
+        .sessions
+        .refresh(
+            &auth::token_hash(&req.refresh_token),
+            access_hash,
+            refresh_hash,
+        )
+        .await
+    {
+        Ok(_identity) => (StatusCode::OK, Json(response)).into_response(),
+        Err(RefreshError::Backend(error)) => {
+            tracing::error!(%error, "Refresh: Ablage-Fehler");
+            internal()
+        }
+        Err(error) => {
+            if error == RefreshError::ReuseDetected {
+                tracing::warn!(
+                    "rotiertes Refresh-Token erneut vorgelegt, Session-Familie widerrufen"
+                );
+            }
+            api_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_refresh_token",
+                "Refresh-Token ist ungültig oder abgelaufen",
+            )
+        }
+    }
+}
+
+async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(token) = bearer_token(&headers) {
+        // Widerruft die ganze Familie, auch das Refresh-Token: nach einem
+        // Logout darf sich die Session nicht wieder erneuern lassen.
+        if let Err(error) = st.sessions.revoke_by_access(&auth::token_hash(token)).await {
+            // Ein Backend-Fehler heißt: nicht widerrufen. Das darf nicht wie
+            // Erfolg aussehen, der Client würde sein Token verwerfen und die
+            // Session lebte weiter.
+            tracing::error!(%error, "Logout: Ablage-Fehler");
+            return internal();
+        }
+    }
+    // Immer 204, damit die Antwort nicht verrät, ob das Token gültig war.
+    StatusCode::NO_CONTENT.into_response()
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
+/// Auflösung des Bearer-Tokens zur Session-Identität. Als Hilfsfunktion
+/// statt Extractor: drei Aufrufer, und so bleibt sichtbar, dass die Prüfung
+/// am Handler-Anfang steht. Äußeres Result ist ein Backend-Ausfall (500),
+/// inneres None ein unbekanntes Token (401).
+async fn authenticate(
+    st: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<SessionIdentity>, String> {
+    let Some(token) = bearer_token(headers) else {
+        return Ok(None);
+    };
+    st.sessions.authenticate(&auth::token_hash(token)).await
+}
+
+fn invalid_token() -> Response {
+    api_error(
+        StatusCode::UNAUTHORIZED,
+        "invalid_token",
+        "Access-Token ist ungültig oder abgelaufen",
+    )
+}
+
+/// Entfaltet den Backend-Fehlerfall der Session-Prüfung. Kein
+/// `Result<_, Response>`-Helfer, weil die Response als Err-Variante zu groß
+/// wäre (clippy: result_large_err); die Handler matchen selbst.
+fn session_failure(error: String) -> Response {
+    tracing::error!(%error, "Session-Prüfung: Ablage-Fehler");
+    internal()
+}
+
+/// `GET /devices`: die gültige Gerätemenge des eigenen Kontos. Revozierte
+/// Geräte fehlen; ihre Historie wird erst mit Key Transparency ein
+/// API-Thema.
+async fn list_devices(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return invalid_token(),
+        Err(error) => return session_failure(error),
+    };
+    let devices = match st.store.devices(&who.handle).await {
+        Ok(devices) => devices,
+        Err(error) => return store_failure(error),
+    };
+    let devices: Vec<DeviceResponse> = devices
+        .into_iter()
+        .filter(|d| !d.revoked)
+        .map(|d| DeviceResponse {
+            id: d.id,
+            name: d.name,
+            public_key: d.public_key,
+            not_after: d.not_after,
+        })
+        .collect();
+    (StatusCode::OK, Json(devices)).into_response()
+}
+
+/// `POST /devices`: schaltet ein weiteres Gerät frei. Der Aufrufer ist ein
+/// bereits registriertes Gerät mit gültiger Session; das Credential des
+/// neuen Geräts hat der Konto-Identitätsschlüssel clientseitig signiert
+/// (QR-/Bestätigungs-Flow läuft zwischen den Geräten, ohne Server).
+async fn add_device(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<DeviceRequest>,
+) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return invalid_token(),
+        Err(error) => return session_failure(error),
+    };
+    if let Err(message) = validate_device_id(&req.id) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_device", message);
+    }
+    let account = match st.store.get(&who.handle).await {
+        Ok(Some(account)) => account,
+        Ok(None) => {
+            // Session ohne Konto kann nur durch einen Programmierfehler entstehen.
+            tracing::error!(handle = %who.handle, "Session ohne zugehöriges Konto");
+            return internal();
+        }
+        Err(error) => return store_failure(error),
+    };
+    if let Err(error) = credential::verify_device_credential(
+        &account.identity_key,
+        &who.handle,
+        &req.id,
+        &req.public_key,
+        req.not_after,
+        &req.credential,
+        now_unix(),
+    ) {
+        return credential_error_response(error);
+    }
+    match st
+        .store
+        .add_device(&who.handle, device_from_request(req))
+        .await
+    {
+        Ok(()) => {
+            // Gerät dazu = neue Schlüsselmenge im Verzeichnis.
+            notify_kt(&st, &who.handle);
+            StatusCode::CREATED.into_response()
+        }
+        Err(StoreError::DeviceIdTaken) => api_error(
+            StatusCode::CONFLICT,
+            "device_id_taken",
+            "Geräte-ID ist bereits vergeben",
+        ),
+        Err(error) => store_failure(error),
+    }
+}
+
+/// `DELETE /devices/{id}`: nimmt ein Gerät aus der gültigen Menge und
+/// widerruft dessen Sessions. Das anfragende Gerät kann sich nicht selbst
+/// entfernen, damit niemand das letzte Gerät löscht und sich aussperrt;
+/// Entfernen läuft immer über ein anderes Gerät.
+///
+/// Das Neuschlüsseln betroffener Gruppen (schnittstellen.md) folgt mit der
+/// MLS-Anbindung; serverseitig ist die Revocation der auslösende Eintrag.
+async fn remove_device(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return invalid_token(),
+        Err(error) => return session_failure(error),
+    };
+    if who.device_id == device_id {
+        return api_error(
+            StatusCode::CONFLICT,
+            "own_device",
+            "Das eigene Gerät lässt sich nicht entfernen",
+        );
+    }
+    match st.store.revoke_device(&who.handle, &device_id).await {
+        Ok(()) => {
+            // Erst die Ablage, dann die Sessions: taucht dazwischen ein
+            // Request des Geräts auf, scheitert er spätestens an der
+            // nächsten Rotation; umgekehrt könnte ein frischer Login das
+            // Fenster wieder öffnen.
+            if let Err(error) = st.sessions.revoke_device(&who.handle, &device_id).await {
+                // Gerät ist revoziert, aber alte Sessions leben noch bis zum
+                // Ablauf: dem Aufrufer als Fehler melden, damit er es erneut
+                // versucht, statt sich in Sicherheit zu wiegen.
+                tracing::error!(%error, "Sessions des Geräts nicht widerrufen");
+                return internal();
+            }
+            // Revocation = neue (kleinere) Schlüsselmenge im Verzeichnis;
+            // für Kontakte wird der stille Weiterbetrieb des Geräts damit
+            // entdeckbar.
+            notify_kt(&st, &who.handle);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(StoreError::DeviceNotFound) => api_error(
+            StatusCode::NOT_FOUND,
+            "device_not_found",
+            "Gerät ist unbekannt oder bereits entfernt",
+        ),
+        Err(error) => store_failure(error),
+    }
+}
+
+/// Vorläufige Handle-Regel: 3 bis 32 Zeichen aus a-z, 0-9 sowie `_ . -`,
+/// Beginn mit Buchstabe oder Ziffer. Die endgültige Policy hängt an Contact
+/// Discovery und Key Transparency (dokumentation/specs/) und darf diese
+/// Regel nur weiter einschränken, nicht lockern, sonst brechen Alt-Handles.
+fn validate_handle(handle: &str) -> Result<(), &'static str> {
+    let length = handle.chars().count();
+    if !(3..=32).contains(&length) {
+        return Err("Handle braucht 3 bis 32 Zeichen");
+    }
+    if !handle
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '-'))
+    {
+        return Err("erlaubt sind a-z, 0-9 sowie _ . -");
+    }
+    if !handle
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+    {
+        return Err("Handle beginnt mit Buchstabe oder Ziffer");
+    }
+    Ok(())
+}
+
+/// Längenregel statt Kompositionsregeln (NIST-Linie): mindestens 12 Zeichen,
+/// nach oben auf 128 begrenzt, damit der Argon2-Aufwand gedeckelt bleibt.
+fn validate_password(password: &str) -> Result<(), &'static str> {
+    let length = password.chars().count();
+    if length < 12 {
+        return Err("Passwort braucht mindestens 12 Zeichen");
+    }
+    if length > 128 {
+        return Err("Passwort ist auf 128 Zeichen begrenzt");
+    }
+    Ok(())
+}
+
+/// Geräte-IDs sind client-erzeugte UUIDs in kanonischer Kleinschreibung
+/// (datenmodell.md: `devices.id UUID PRIMARY KEY`). Strikt kanonisch, weil
+/// die ID Teil der signierten Credential-Nachricht ist: zwei Schreibweisen
+/// derselben UUID wären zwei verschiedene Signaturen für dieselbe Identität.
+fn validate_device_id(id: &str) -> Result<(), &'static str> {
+    match uuid::Uuid::try_parse(id) {
+        // to_string liefert die kanonische Form; Abgleich lehnt
+        // Großschreibung, urn:-Präfix und Braced-Formen ab.
+        Ok(parsed) if parsed.to_string() == id => Ok(()),
+        _ => Err("Geräte-ID muss eine UUID in kanonischer Form sein"),
+    }
+}
+
+/// Prüft das Shared Secret der /internal-Routen. Ohne konfiguriertes Token
+/// existieren die Routen nach außen nicht (404 statt 401), damit ein
+/// öffentlich erreichbarer Dienst ohne Secret keine interne Fläche zeigt.
+/// Vergleich über SHA-256-Digests: konstante Zeit, kein Klartext im State.
+/// `Some(response)` ist die Ablehnung; `None` heißt autorisiert.
+fn internal_denied(st: &AppState, headers: &HeaderMap) -> Option<Response> {
+    let Some(expected) = &st.internal_token_hash else {
+        return Some(StatusCode::NOT_FOUND.into_response());
+    };
+    let presented = headers
+        .get("x-internal-token")
+        .and_then(|v| v.to_str().ok());
+    match presented {
+        Some(token) if auth::token_hash(token) == **expected => None,
+        _ => Some(api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_internal_token",
+            "Internes Token fehlt oder ist ungültig",
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+struct IntrospectRequest {
+    token: String,
+}
+
+/// Antwort im Zuschnitt von RFC 7662: `active` plus Identität nur bei
+/// gültigem Token. Ungültig und abgelaufen sind nicht unterscheidbar.
+#[derive(Serialize)]
+struct IntrospectResponse {
+    active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_id: Option<String>,
+}
+
+/// `POST /internal/introspect`: löst ein Access-Token zur Session-Identität
+/// auf. Für Dienste wie directory, die Bearer-Tokens prüfen müssen, ohne
+/// die Session-Ablage zu kennen.
+async fn introspect(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<IntrospectRequest>,
+) -> Response {
+    if let Some(response) = internal_denied(&st, &headers) {
+        return response;
+    }
+    match st
+        .sessions
+        .authenticate(&auth::token_hash(&req.token))
+        .await
+    {
+        Ok(identity) => {
+            let (handle, device_id) = match identity {
+                Some(who) => (Some(who.handle), Some(who.device_id)),
+                None => (None, None),
+            };
+            (
+                StatusCode::OK,
+                Json(IntrospectResponse {
+                    active: handle.is_some(),
+                    handle,
+                    device_id,
+                }),
+            )
+                .into_response()
+        }
+        Err(error) => session_failure(error),
+    }
+}
+
+#[derive(Serialize)]
+struct InternalDeviceResponse {
+    id: String,
+    public_key: String,
+    not_after: u64,
+}
+
+#[derive(Serialize)]
+struct InternalAccountResponse {
+    /// Server-erzeugte Konto-UUID: interne Adresse für andere Dienste
+    /// (z. B. recipient_id in der Zustellung).
+    id: String,
+    handle: String,
+    /// Öffentlicher Konto-Identitätsschlüssel (Base64), Teil des
+    /// Prekey-Bündels beim Sitzungsaufbau.
+    identity_key: String,
+    devices: Vec<InternalDeviceResponse>,
+}
+
+/// `GET /internal/accounts/{handle}/devices`: Konto-Identitätsschlüssel und
+/// die gültige (nicht revozierte) Gerätemenge. Grundlage der Prekey-Bündel
+/// im directory-Dienst.
+async fn internal_account_devices(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+) -> Response {
+    if let Some(response) = internal_denied(&st, &headers) {
+        return response;
+    }
+    let account = match st.store.get(&handle).await {
+        Ok(Some(account)) => account,
+        Ok(None) => {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "account_not_found",
+                "Konto ist unbekannt",
+            )
+        }
+        Err(error) => return store_failure(error),
+    };
+    let devices = match st.store.devices(&handle).await {
+        Ok(devices) => devices,
+        Err(error) => return store_failure(error),
+    };
+    let devices = devices
+        .into_iter()
+        .filter(|d| !d.revoked)
+        .map(|d| InternalDeviceResponse {
+            id: d.id,
+            public_key: d.public_key,
+            not_after: d.not_after,
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(InternalAccountResponse {
+            id: account.id,
+            handle: account.handle,
+            identity_key: account.identity_key,
+            devices,
+        }),
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handle_regeln() {
+        assert!(validate_handle("alice").is_ok());
+        assert!(validate_handle("a1.b-c_d").is_ok());
+        assert!(validate_handle("ab").is_err()); // zu kurz
+        assert!(validate_handle("Alice").is_err()); // Großbuchstabe
+        assert!(validate_handle("-alice").is_err()); // falscher Beginn
+        assert!(validate_handle("al ice").is_err()); // Leerzeichen
+        assert!(validate_handle(&"x".repeat(33)).is_err()); // zu lang
+    }
+
+    #[test]
+    fn passwort_regeln() {
+        assert!(validate_password("zwölf-zeichen-lang").is_ok());
+        assert!(validate_password("elf-zeichen").is_err());
+        assert!(validate_password(&"p".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn geraete_id_regeln() {
+        assert!(validate_device_id("550e8400-e29b-41d4-a716-446655440000").is_ok());
+        assert!(validate_device_id("").is_err());
+        assert!(validate_device_id("laptop-1").is_err()); // keine UUID
+        assert!(validate_device_id("550E8400-E29B-41D4-A716-446655440000").is_err()); // nicht kanonisch
+        assert!(validate_device_id("urn:uuid:550e8400-e29b-41d4-a716-446655440000").is_err());
+    }
+}

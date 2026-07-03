@@ -1,0 +1,27 @@
+[package]
+name = "sm-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Web-Client (Leptos, CSR/WASM): nur Darstellung und Ablaufsteuerung.
+# Die Krypto lebt in client-core, die Protokoll-Logik in client-app;
+# hier wird nichts davon dupliziert (GOAL.md, dreischichtige
+# Client-Architektur). Gebaut wird mit trunk (Trunk.toml, Proxys auf die
+# lokalen Dienste).
+
+[[bin]]
+name = "sm-web"
+path = "src/main.rs"
+
+[dependencies]
+client-app = { path = "../../crates/client-app" }
+client-core = { path = "../../crates/client-core" }
+# CSR-Modus: die App rendert vollstaendig im Browser, kein Server-Rendering.
+leptos = { version = "0.8", features = ["csr"] }
+# Panics landen in der Browser-Konsole statt als stummes "unreachable".
+console_error_panic_hook = "0.1"
+web-sys = { version = "0.3", features = ["Window", "Location"] }
+base64 = { workspace = true }
+rand = { workspace = true }

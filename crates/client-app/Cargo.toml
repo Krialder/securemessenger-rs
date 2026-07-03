@@ -1,0 +1,50 @@
+[package]
+name = "client-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Protokoll-Orchestrierung der Clients (ADR-0005, dreischichtige
+# Client-Architektur): sitzt zwischen dem Krypto-Kern (client-core) und den
+# konkreten Clients (clients/cli, clients/web). Spricht die Backend-Dienste
+# ueber HTTP an, enthaelt selbst keine Nachrichten-Kryptografie. Baut nativ
+# und nach wasm32 (Browser).
+
+[dependencies]
+# Der gepinnte Krypto-Kern; client-app zieht libsignal/OpenMLS ueber diesen
+# einen Pfad in den Graph, nie direkt (verhindert doppelte Pins).
+client-core = { path = "../client-core" }
+serde = { workspace = true }
+# Wire-Framing der Hüllen und Prekey-Blobs: JSON als versioniertes,
+# debugbares Format; der Server sieht davon nur Base64.
+serde_json = { workspace = true }
+base64 = { workspace = true }
+# Konto- und Geraeteschluessel plus Geraete-Credential (Ed25519). Keine
+# Nachrichten-Kryptografie, sondern Identitaetsbindung wie in
+# services/identity/src/credential.rs verifiziert.
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+# Die persistente Protokoll-Ablage erfuellt libsignals Store-Traits, und
+# die sind mit async_trait(?Send) definiert.
+async-trait = { workspace = true }
+
+# HTTP getrennt nach Ziel: nativ mit rustls, im Browser ueber fetch (die
+# TLS-Features gaebe es dort nicht). Beide sprechen dieselbe reqwest-API.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+# Nur fuer die hermetischen End-to-End-Tests: die echten Dienst-Router
+# (identity, directory, delivery) laufen in-process auf Ephemeralports.
+# Nativ; beim wasm-Bau der Bibliothek werden Tests nicht kompiliert.
+[dev-dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }
+identity = { path = "../../services/identity" }
+directory = { path = "../../services/directory" }
+delivery = { path = "../../services/delivery" }
+common = { workspace = true }
+uuid = { workspace = true }

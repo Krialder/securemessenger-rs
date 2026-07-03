@@ -1,0 +1,20 @@
+[package]
+name = "common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# Für den identity-Gateway-Baustein (Dienst-zu-Dienst, /internal-Routen),
+# den directory und delivery teilen.
+async-trait.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Das KT-Konto-Commitment (kt-Modul): identity berechnet es, Clients
+# rechnen es nach.
+sha2.workspace = true

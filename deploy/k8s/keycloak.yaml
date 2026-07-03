@@ -1,0 +1,100 @@
+# Skelett für den OIDC-Provider (F060): Keycloak als gehärteter
+# Standard-Provider statt Eigenbau (pflichtenheft.md 5.2, "kein Eigenbau
+# bei Sicherheit"). Zwei Repliken, weil SSO der Single Point of Failure
+# für alle angebundenen Projekte ist (NF060: 99,9 Prozent).
+#
+# [ANNAHME: Das ist ein Deployment-Skelett. Realm-Konfiguration, die
+# Anbindung der identity-Konten und die Registrierung der Mandanten als
+# OAuth2-Clients folgen mit der SSO-Etappe; Werte wie Image-Tag und
+# Hostname setzt die GitOps-Pipeline. Keycloak braucht eine eigene
+# Datenbank (Secret keycloak-db), geteilt wird nichts.]
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  labels:
+    app: keycloak
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:26.2 # Platzhalter, Version pinnt die Pipeline
+          args: ["start"]
+          ports:
+            - containerPort: 8080
+            - containerPort: 9000 # Management (Health, Metrics)
+          env:
+            - name: KC_DB
+              value: "postgres"
+            - name: KC_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-db
+                  key: url
+            - name: KC_DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-db
+                  key: username
+            - name: KC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-db
+                  key: password
+            - name: KC_HOSTNAME
+              value: "https://sso.intern" # Platzhalter
+            - name: KC_PROXY_HEADERS
+              value: "xforwarded" # TLS terminiert die Edge
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-admin
+                  key: username
+            - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-admin
+                  key: password
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  labels:
+    app: keycloak
+spec:
+  selector:
+    app: keycloak
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
