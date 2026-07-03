@@ -139,22 +139,24 @@ if ((Have 'rustup') -or (Test-Path $rustupExe)) {
 
 # 2c. MSVC Build Tools: das MSVC-Target von Rust braucht link.exe aus den
 #     C++ Build Tools ("error: linker `link.exe` not found" ohne sie).
-#     Erkennung ueber vswhere, das jede Visual-Studio-Installation mitbringt;
-#     die Workload VCTools liefert Compiler, Linker und Windows SDK.
-Write-Step "Pruefe MSVC Build Tools (link.exe)"
+#     Erkennung ueber vswhere -find direkt auf link.exe: die Abfrage nach
+#     Komponenten-IDs (-requires) bleibt bei reinen Build-Tools-
+#     Installationen leer und meldete faelschlich "fehlt".
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-$msvcOk = $false
-if (Test-Path $vswhere) {
-    $vcPath = & $vswhere -products '*' -requires Microsoft.VisualCpp.Tools.Host.x64 -format value -property installationPath 2>$null
-    if ($vcPath) { $msvcOk = $true }
+function Test-MsvcLinker {
+    if (-not (Test-Path $vswhere)) { return $false }
+    $link = & $vswhere -latest -products '*' -find 'VC\Tools\MSVC\*\bin\Hostx64\x64\link.exe' 2>$null
+    return [bool]$link
 }
+Write-Step "Pruefe MSVC Build Tools (link.exe)"
+$msvcOk = Test-MsvcLinker
 if ($msvcOk) {
     Write-Ok "C++ Build Tools vorhanden"
 } else {
     Write-Note "C++ Build Tools fehlen, installiere sie ueber winget (mehrere GB, dauert; UAC-Abfrage bestaetigen)"
     winget install -e --id Microsoft.VisualStudio.2022.BuildTools --accept-source-agreements --accept-package-agreements --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
-    if ((Test-Path $vswhere) -and (& $vswhere -products '*' -requires Microsoft.VisualCpp.Tools.Host.x64 -format value -property installationPath 2>$null)) {
-        $msvcOk = $true
+    $msvcOk = Test-MsvcLinker
+    if ($msvcOk) {
         Write-Ok "C++ Build Tools installiert"
     } else {
         Write-Bad "C++ Build Tools weiterhin nicht auffindbar; ohne link.exe schlaegt jeder cargo-Build fehl"
