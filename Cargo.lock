@@ -526,6 +526,7 @@ dependencies = [
  "identity",
  "kt",
  "kt-format",
+ "oprf",
  "rand 0.9.4",
  "reqwest",
  "serde",
@@ -1932,6 +1933,7 @@ dependencies = [
  "common",
  "ed25519-dalek",
  "http-body-util",
+ "oprf",
  "reqwest",
  "serde",
  "serde_json",
@@ -3025,6 +3027,14 @@ name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
+
+[[package]]
+name = "oprf"
+version = "0.1.0"
+dependencies = [
+ "rand 0.8.6",
+ "voprf",
+]
 
 [[package]]
 name = "or_poisoned"
@@ -5280,6 +5290,25 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "voprf"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28f59c30c76e2fea54cdece6a054e2662feffa7ab19658a7887524265ee39470"
+dependencies = [
+ "curve25519-dalek",
+ "derive-where",
+ "digest",
+ "displaydoc",
+ "elliptic-curve",
+ "generic-array",
+ "rand_core 0.6.4",
+ "serde",
+ "sha2",
+ "subtle",
+ "zeroize",
+]
 
 [[package]]
 name = "walkdir"

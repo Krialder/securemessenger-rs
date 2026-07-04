@@ -11,6 +11,8 @@ crates/
   common/             gemeinsame Bausteine (Config, Telemetrie, Betriebs-Endpunkte, identity-Anbindung), ohne Krypto
   kt-format/          kanonische KT-Byte-Formate (Commitment smktc.v1, Wurzelnachricht smkt.v1), geteilt zwischen
                       Server und Clients (auch wasm32); Feature verify liefert die akd-Konfiguration samt Domain-Label
+  oprf/               OPRF-Kern für Contact Discovery (voprf, RFC 9497, Ristretto255); geteilt zwischen Client (blenden,
+                      entblenden) und Server (auswerten), kein Eigenbau
   client-core/        der Krypto-Kern der Clients (libsignal, OpenMLS, gepinnt); kein Dienst hängt davon ab
     src/onetoone.rs   1:1-Sitzungen: PQXDH-Aufbau, Double Ratchet, Safety Number (Wrapper, keine Eigenbauten)
     src/group.rs      MLS-Gruppen: Suite 0x0003, Skipped-Keys-Fenster, GroupSession (Byte-Ein-Byte-Aus für den Client)
@@ -179,6 +181,8 @@ cargo test -p kt --test pg
 | `DELETE /devices/{id}` | Gerät revozieren, widerruft dessen Sessions; das eigene Gerät nicht (409); 204, 401, 404 |
 | `POST /internal/introspect` | Dienst-zu-Dienst: Access-Token zur Identität auflösen (RFC-7662-Zuschnitt); nur mit `INTERNAL_TOKEN` |
 | `GET /internal/accounts/{handle}/devices` | Dienst-zu-Dienst: Identitätsschlüssel und gültige Gerätemenge eines Kontos |
+| `POST /discovery/evaluate` | OPRF-Runde der Contact Discovery: geblendetes Element rein, Server-Auswertung raus; nur bei gesetztem `CDS_OPRF_KEY`; rate-limitiert; 200, 400, 401, 429 |
+| `POST /discovery/lookup` | Konto über den entblendeten OPRF-Wert nachschlagen; 200 mit `handle`/`id`/`identity_key`, 401, 404, 429 |
 | `GET /live`, `/ready`, `/metrics` | Betriebs-Endpunkte für Kubernetes und Prometheus |
 
 Fehler kommen als JSON mit `code` und `message` (siehe [schnittstellen.md](dokumentation/schnittstellen.md)). Sessions: Access-Token 15 Minuten, Refresh-Token 30 Tage, jede Rotation entwertet das alte Paar, und ein wiederverwendetes Refresh-Token widerruft die ganze Familie (Diebstahl-Indiz nach OAuth 2.0 Security BCP). Die Laufzeiten sind eine Annahme, die Doku gibt keine Werte vor.

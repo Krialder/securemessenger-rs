@@ -61,6 +61,25 @@ async fn main() {
         _ => state,
     };
 
+    // Mit CDS_OPRF_KEY (Base64-Seed, 32 Byte) steht Contact Discovery
+    // bereit; ohne bleiben die /discovery-Routen 404. Ein flüchtiger
+    // Schlüssel waere nach einem Neustart nicht mehr zum vorhandenen
+    // Discovery-Index passend, deshalb hier Pflicht-Secret statt Default.
+    let state = match std::env::var("CDS_OPRF_KEY").ok().filter(|s| !s.is_empty()) {
+        Some(seed_b64) => {
+            use base64::engine::general_purpose::STANDARD as BASE64;
+            use base64::Engine as _;
+            let seed = BASE64
+                .decode(&seed_b64)
+                .expect("CDS_OPRF_KEY ist gültiges Base64");
+            let key =
+                oprf::ServerKey::from_seed(&seed).expect("CDS_OPRF_KEY ergibt OPRF-Schlüssel");
+            tracing::info!("Contact Discovery aktiv");
+            state.with_discovery_oprf(Arc::new(key))
+        }
+        None => state,
+    };
+
     let router = app(state);
 
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr)

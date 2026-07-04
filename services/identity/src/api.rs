@@ -13,6 +13,8 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::auth;
@@ -34,6 +36,12 @@ const LOGIN_RATE_LIMIT: u32 = 10;
 /// nicht die IP: hinter dem Ingress ist die Quell-IP nicht belastbar,
 /// IP-Limits gehören an die Edge. [ANNAHME: 5/min.]
 const REGISTER_RATE_LIMIT: u32 = 5;
+/// Discovery-Runden je Abrufer und Minute. Die harte Bremse gegen
+/// Enumeration: ohne Kenntnis des Handles ist jeder Wert nutzlos, und
+/// mehr als eine Handvoll Auflösungen pro Minute braucht kein ehrlicher
+/// Client. [ANNAHME: 20/min; die Spec fordert striktes Limit, nennt keine
+/// Zahl.]
+const DISCOVERY_RATE_LIMIT: u32 = 20;
 
 /// Geteilter Zustand aller Handler.
 #[derive(Clone)]
@@ -54,6 +62,9 @@ pub struct AppState {
     /// Meldet Schlüsseländerungen ans KT-Verzeichnis (F120); Noop, wenn
     /// kein kt-Dienst konfiguriert ist.
     kt: Arc<dyn KtNotifier>,
+    /// OPRF-Schlüssel für Contact Discovery (specs/contact-discovery.md);
+    /// ohne Wert sind die Discovery-Routen abgeschaltet.
+    discovery_oprf: Option<Arc<oprf::ServerKey>>,
 }
 
 impl AppState {
@@ -90,12 +101,20 @@ impl AppState {
             internal_token_hash: None,
             limiter: Arc::new(RateLimiter::default()),
             kt: Arc::new(NoopKtNotifier),
+            discovery_oprf: None,
         }
     }
 
     /// Hängt den KT-Melder ein (main.rs, wenn KT_URL konfiguriert ist).
     pub fn with_kt_notifier(mut self, notifier: Arc<dyn KtNotifier>) -> Self {
         self.kt = notifier;
+        self
+    }
+
+    /// Schaltet Contact Discovery mit dem Server-OPRF-Schlüssel frei
+    /// (main.rs, wenn CDS_OPRF_KEY konfiguriert ist).
+    pub fn with_discovery_oprf(mut self, key: Arc<oprf::ServerKey>) -> Self {
+        self.discovery_oprf = Some(key);
         self
     }
 
@@ -119,6 +138,14 @@ pub fn app(state: AppState) -> Router {
         .route("/sessions/refresh", post(refresh))
         .route("/devices", get(list_devices).post(add_device))
         .route("/devices/{id}", delete(remove_device));
+    // Contact Discovery nur bei konfiguriertem OPRF-Schlüssel: sonst
+    // existieren die Routen nicht (echtes 404 statt einer Antwort ohne
+    // Verschleierung).
+    if state.discovery_oprf.is_some() {
+        router = router
+            .route("/discovery/evaluate", post(discovery_evaluate))
+            .route("/discovery/lookup", post(discovery_lookup));
+    }
     // Dienst-zu-Dienst (nicht öffentlich, Shared Secret): Introspektion
     // von Access-Tokens und die Gerätemenge eines Kontos. So bleibt die
     // Session-Ablage privat beim identity-Dienst, statt dass andere
@@ -271,6 +298,158 @@ fn notify_kt(st: &AppState, handle: &str) {
     });
 }
 
+/// Hex-Darstellung des OPRF-Werts: der Discovery-Index-Schlüssel. Hex
+/// statt Base64, damit er unverändert als Text-Primärschlüssel taugt.
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// Trägt ein frisch angelegtes Konto in den Discovery-Index ein, wenn
+/// Discovery konfiguriert ist. Der Server rechnet `PRF_k(handle)` selbst
+/// (er kennt seine Handles ohnehin) und legt das Konto darunter ab.
+/// Fehler werden nur geloggt: ein Konto entsteht auch dann, wenn der
+/// Index-Eintrag scheitert (Discovery ist nachrangig, nicht Teil der
+/// Registrierungs-Zusage).
+async fn index_discovery(st: &AppState, record: crate::store::DiscoveryRecord) {
+    let Some(oprf) = &st.discovery_oprf else {
+        return;
+    };
+    let prf = match oprf.prf(record.handle.as_bytes()) {
+        Ok(prf) => prf,
+        Err(error) => {
+            tracing::error!(%error, "OPRF-Berechnung für Discovery fehlgeschlagen");
+            return;
+        }
+    };
+    if let Err(error) = st.store.index_discovery(&hex(&prf), record).await {
+        tracing::error!(?error, "Discovery-Index-Eintrag fehlgeschlagen");
+    }
+}
+
+#[derive(Deserialize)]
+struct DiscoveryEvaluateRequest {
+    /// Das geblendete Element (Base64), aus `oprf::blind`.
+    blinded: String,
+}
+
+#[derive(Serialize)]
+struct DiscoveryEvaluateResponse {
+    /// Die Server-Auswertung (Base64), die der Client entblendet.
+    evaluation: String,
+}
+
+/// `POST /discovery/evaluate`: die Server-Runde der OPRF. Der Server sieht
+/// nur das geblendete Element, nie den Handle. Rate-limitiert je Abrufer,
+/// weil jede Runde eine Rate-Einheit gegen Enumeration ist.
+async fn discovery_evaluate(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<DiscoveryEvaluateRequest>,
+) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return invalid_token(),
+        Err(error) => return session_failure(error),
+    };
+    if let Err(retry_after) = st
+        .limiter
+        .check(&format!("discovery:{}", who.handle), DISCOVERY_RATE_LIMIT)
+    {
+        return common::rate::too_many_requests(retry_after);
+    }
+    let Some(oprf) = &st.discovery_oprf else {
+        return internal();
+    };
+    let blinded = match BASE64.decode(&req.blinded) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_blinded",
+                "blinded ist kein gültiges Base64",
+            )
+        }
+    };
+    match oprf.evaluate(&blinded) {
+        Ok(evaluation) => (
+            StatusCode::OK,
+            Json(DiscoveryEvaluateResponse {
+                evaluation: BASE64.encode(evaluation),
+            }),
+        )
+            .into_response(),
+        Err(error) => {
+            // Ein ungültiges geblendetes Element ist ein Client-Fehler,
+            // kein Server-Fehler; die Bibliothek unterscheidet das nicht,
+            // deshalb 400 mit knapper Meldung.
+            tracing::debug!(%error, "OPRF-Auswertung abgelehnt");
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_blinded",
+                "blinded ist kein gültiges OPRF-Element",
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct DiscoveryLookupRequest {
+    /// Der entblendete OPRF-Wert `PRF_k(handle)` (Hex).
+    prf: String,
+}
+
+#[derive(Serialize)]
+struct DiscoveryLookupResponse {
+    handle: String,
+    /// Interne Konto-Adresse (recipient_id).
+    id: String,
+    /// Konto-Identitätsschlüssel, damit der Client direkt gegen KT prüfen kann.
+    identity_key: String,
+}
+
+/// `POST /discovery/lookup`: schlägt ein Konto über seinen OPRF-Wert nach.
+/// Der Client kannte den Handle (er hat ihn selbst geblendet); der Server
+/// lernt aus dem Wert nicht den Klartext. 404, wenn kein Konto darunter
+/// steht. Rate-limitiert wie die Auswertung.
+async fn discovery_lookup(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<DiscoveryLookupRequest>,
+) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return invalid_token(),
+        Err(error) => return session_failure(error),
+    };
+    if let Err(retry_after) = st
+        .limiter
+        .check(&format!("discovery:{}", who.handle), DISCOVERY_RATE_LIMIT)
+    {
+        return common::rate::too_many_requests(retry_after);
+    }
+    match st.store.discovery_lookup(&req.prf).await {
+        Ok(Some(record)) => (
+            StatusCode::OK,
+            Json(DiscoveryLookupResponse {
+                handle: record.handle,
+                id: record.id,
+                identity_key: record.identity_key,
+            }),
+        )
+            .into_response(),
+        Ok(None) => api_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Kein Konto unter diesem Wert",
+        ),
+        Err(error) => store_failure(error),
+    }
+}
+
 async fn register(State(st): State<AppState>, Json(req): Json<RegisterRequest>) -> Response {
     if let Err(message) = validate_handle(&req.handle) {
         return api_error(StatusCode::BAD_REQUEST, "invalid_handle", message);
@@ -345,6 +524,12 @@ async fn register(State(st): State<AppState>, Json(req): Json<RegisterRequest>) 
         password_hash,
         identity_key: req.identity_key,
     };
+    // Für den Discovery-Index vor dem Verschieben festhalten.
+    let discovery_record = crate::store::DiscoveryRecord {
+        handle: account.handle.clone(),
+        id: account.id.clone(),
+        identity_key: account.identity_key.clone(),
+    };
     match st
         .store
         .create(account, device_from_request(req.device))
@@ -353,6 +538,7 @@ async fn register(State(st): State<AppState>, Json(req): Json<RegisterRequest>) 
         Ok(()) => {
             // Neues Konto = neue Schlüsselmenge im Verzeichnis.
             notify_kt(&st, &response.handle);
+            index_discovery(&st, discovery_record).await;
             (StatusCode::CREATED, Json(response)).into_response()
         }
         Err(StoreError::HandleTaken) => api_error(

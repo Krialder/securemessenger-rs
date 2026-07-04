@@ -1,0 +1,24 @@
+[package]
+name = "oprf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Oblivious Pseudorandom Function fuer Contact Discovery
+# (specs/contact-discovery.md). Standardbasiert (RFC 9497), keine
+# Eigenbau-Kryptografie: die facebook/voprf-Bibliothek, dieselbe, die
+# OPAQUE nutzt. Geteilt zwischen Client (blenden, entblenden) und
+# Server (auswerten), damit beide Seiten exakt dieselbe Ciphersuite
+# rechnen. Ristretto255 mit SHA-512, die Standard-Suite der Bibliothek.
+
+[dependencies]
+# Exakt gepinnt wie die uebrige Krypto; base-mode OPRF (kein Verifikations-
+# beweis noetig, der Server ist fuer die Discovery-Auswertung vertraut).
+voprf = { version = "0.5", features = ["ristretto255"] }
+# voprf 0.5 baut auf rand_core 0.6 (rand 0.8) auf; die OsRng des Workspace
+# (rand 0.9) implementiert dessen CryptoRng nicht. Deshalb hier bewusst
+# rand 0.8, passend zur Bibliothek.
+rand = "0.8"
+
+[dev-dependencies]

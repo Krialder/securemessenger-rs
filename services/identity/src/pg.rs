@@ -244,6 +244,53 @@ impl AccountStore for PgAccountStore {
         }
         Ok(())
     }
+
+    async fn index_discovery(
+        &self,
+        prf_hex: &str,
+        record: crate::store::DiscoveryRecord,
+    ) -> Result<(), StoreError> {
+        let account_id = Uuid::try_parse(&record.id)
+            .map_err(|e| StoreError::Backend(format!("Konto-ID keine UUID: {e}")))?;
+        // Idempotent: eine erneute Registrierung desselben Handles (nach
+        // Löschung) oder ein Nachtrag überschreibt den Eintrag.
+        sqlx::query(
+            "INSERT INTO discovery (prf, account_id, handle, identity_key) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (prf) DO UPDATE SET \
+                 account_id = EXCLUDED.account_id, \
+                 handle = EXCLUDED.handle, \
+                 identity_key = EXCLUDED.identity_key",
+        )
+        .bind(prf_hex)
+        .bind(account_id)
+        .bind(&record.handle)
+        .bind(&record.identity_key)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn discovery_lookup(
+        &self,
+        prf_hex: &str,
+    ) -> Result<Option<crate::store::DiscoveryRecord>, StoreError> {
+        let row =
+            sqlx::query("SELECT account_id, handle, identity_key FROM discovery WHERE prf = $1")
+                .bind(prf_hex)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(backend)?;
+        Ok(row.map(|r| {
+            let id: Uuid = r.get("account_id");
+            crate::store::DiscoveryRecord {
+                handle: r.get("handle"),
+                id: id.to_string(),
+                identity_key: r.get("identity_key"),
+            }
+        }))
+    }
 }
 
 /// Session-Familien in PostgreSQL. Ablaufzeiten als Unix-Sekunden (BIGINT),

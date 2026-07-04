@@ -25,6 +25,9 @@ serde.workspace = true
 # Meldung der Schlüsseländerungen an den kt-Dienst (kt_notify.rs).
 serde_json.workspace = true
 reqwest.workspace = true
+# OPRF-Kern für Contact Discovery (specs/contact-discovery.md): die
+# Server-Auswertung der geblendeten Handles.
+oprf.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

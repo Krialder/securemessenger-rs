@@ -32,6 +32,9 @@ akd = { workspace = true }
 kt-format = { workspace = true, features = ["verify"] }
 # Wire-Format der akd-Beweise, wie der kt-Dienst sie serialisiert.
 bincode = "1.3"
+# Contact Discovery: Client-Seite der OPRF (blenden, entblenden), geteilt
+# mit dem Server über das oprf-Crate (specs/contact-discovery.md).
+oprf = { workspace = true }
 # Die persistente Protokoll-Ablage erfuellt libsignals Store-Traits, und
 # die sind mit async_trait(?Send) definiert.
 async-trait = { workspace = true }

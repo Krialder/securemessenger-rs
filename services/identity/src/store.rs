@@ -19,6 +19,16 @@ use async_trait::async_trait;
 
 use crate::domain::{Account, Device};
 
+/// Ein Discovery-Treffer: das Konto hinter einem gesuchten Handle, so weit
+/// der Client es fürs Weiterarbeiten braucht (interne Adresse und
+/// Konto-Identitätsschlüssel; den Handle bestätigt er, weil er ihn kannte).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryRecord {
+    pub handle: String,
+    pub id: String,
+    pub identity_key: String,
+}
+
 /// Fehler der Ablage: fachliche Konflikte und Backend-Ausfälle in einem
 /// Enum, damit Handler beides explizit behandeln müssen (Konflikt wird 4xx,
 /// Backend wird 500; ein DB-Ausfall darf nie wie "gibt es nicht" aussehen).
@@ -60,6 +70,21 @@ pub trait AccountStore: Send + Sync {
     /// Nimmt ein Gerät aus der gültigen Menge. `DeviceNotFound` auch für
     /// bereits revozierte: die sind fachlich nicht mehr entfernbar.
     async fn revoke_device(&self, handle: &str, device_id: &str) -> Result<(), StoreError>;
+
+    /// Trägt ein Konto unter seinem OPRF-Wert in den Discovery-Index ein
+    /// (Contact Discovery, specs/contact-discovery.md). `prf_hex` ist
+    /// `PRF_k(handle)` als Hex, vom API-Layer mit dem Server-OPRF-Schlüssel
+    /// berechnet; die Ablage kennt die OPRF nicht, sie hält nur den Index.
+    async fn index_discovery(
+        &self,
+        prf_hex: &str,
+        record: DiscoveryRecord,
+    ) -> Result<(), StoreError>;
+
+    /// Schlägt ein Konto über seinen OPRF-Wert nach. `None`, wenn kein
+    /// Konto unter diesem Wert steht (der Client rät nicht, er kannte den
+    /// Handle; der Server lernt aus dem Wert nicht den Klartext).
+    async fn discovery_lookup(&self, prf_hex: &str) -> Result<Option<DiscoveryRecord>, StoreError>;
 }
 
 /// Konto samt Geräten unter einem Schlüssel, damit Anlegen und Geräte-
@@ -74,6 +99,8 @@ struct InMemoryInner {
     records: HashMap<String, Record>,
     /// Global belegte Geräte-IDs, wie der Primärschlüssel in PostgreSQL.
     device_ids: HashSet<String>,
+    /// Discovery-Index: OPRF-Wert (Hex) auf Konto-Referenz.
+    discovery: HashMap<String, DiscoveryRecord>,
 }
 
 /// Prozesslokale Ablage für Entwicklung ohne Infrastruktur und für Tests.
@@ -170,6 +197,29 @@ impl AccountStore for InMemoryStore {
             .ok_or(StoreError::DeviceNotFound)?;
         device.revoked = true;
         Ok(())
+    }
+
+    async fn index_discovery(
+        &self,
+        prf_hex: &str,
+        record: DiscoveryRecord,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .write()
+            .expect("Store-Lock nicht vergiftet")
+            .discovery
+            .insert(prf_hex.to_string(), record);
+        Ok(())
+    }
+
+    async fn discovery_lookup(&self, prf_hex: &str) -> Result<Option<DiscoveryRecord>, StoreError> {
+        Ok(self
+            .inner
+            .read()
+            .expect("Store-Lock nicht vergiftet")
+            .discovery
+            .get(prf_hex)
+            .cloned())
     }
 }
 

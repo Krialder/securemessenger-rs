@@ -21,6 +21,7 @@
 pub mod account;
 pub mod delivery;
 pub mod directory;
+pub mod discovery;
 pub mod error;
 mod http;
 pub mod identity;

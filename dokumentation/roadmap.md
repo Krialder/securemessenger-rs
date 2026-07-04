@@ -48,7 +48,7 @@ Baut auf Identität und Auth auf, macht den Kern zum Fundament für die übrigen
 - [ ] Sealed Sender mit anonymen Credentials (zkgroup)
 - [ ] Key Transparency vollständig: Auditoren, Gossip, Konsistenzbeweise
 - [ ] Safety Numbers und sichtbare Warnung bei Schlüsselwechsel
-- [ ] Contact Discovery (OPRF)
+- [x] Contact Discovery (OPRF): der Client blendet den Handle, identity wertet die OPRF aus (voprf, RFC 9497), der Client entblendet und schlägt oblivious nach; rate-limitiert gegen Enumeration, Ergebnis gegen KT prüfbar
 - [ ] Abuse: Message Franking, empfängerseitige Kontrollen, Sybil-Widerstand
 - [ ] Compliance-Position festgelegt (CSAR, Online Safety Act)
 
