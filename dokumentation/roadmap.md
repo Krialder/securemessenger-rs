@@ -23,7 +23,7 @@ Sortiert nach Abhängigkeiten, ohne Termine. Zwei Dinge sind bewusst eingebaut: 
 - [x] Schlüssel-Verzeichnis mit Prekey-Pool (klassisch und post-quantum), atomare Konsumierung (directory-Dienst, F110)
 - [x] Key-Transparency-Grundgerüst serverseitig: Epochen, Merkle-Map über akd (kt-Dienst, F120); die Selbstprüfung im Client folgt mit der Client-Etappe
 - [ ] Reproducible-Build- und Release-Pipeline mit Binary-Transparency-Log (CI mit gepinnten, eingabestabilen Builds steht; das BT-Log ist offen)
-- [ ] Web-Client und ein nativer Client parallel, beide registrieren sich und veröffentlichen Schlüssel (in Arbeit: CLI-Referenzclient mit Konto-Layer steht, Prekey-Veröffentlichung und Web-Client folgen; Fahrplan in GOAL.md)
+- [x] Web-Client (Leptos/WASM) und nativer CLI-Client parallel: beide registrieren sich, veröffentlichen Schlüssel, tauschen 1:1-E2EE-Nachrichten über PQXDH und Double Ratchet, empfangen über den WebSocket-Hinweiskanal, prüfen Schlüssel über Key Transparency und Safety Number. Meilenstein 1 aus GOAL.md ist mit der Abnahme vom 04.07.2026 erreicht (live-dokument v0.24).
 
 ## Phase 1b: Basis-Dienste für andere Projekte
 
@@ -37,9 +37,9 @@ Baut auf Identität und Auth auf, macht den Kern zum Fundament für die übrigen
 
 ## Phase 2: 1:1-Nachrichten
 
-- [ ] Sitzungsaufbau über PQXDH, Double Ratchet plus SPQR
-- [ ] Senden und Empfangen, Zustellstatus, Echtzeit-Push, idempotente Zustellung
-- [ ] Multi-Device-Fanout
+- [x] Sitzungsaufbau über PQXDH, Double Ratchet plus SPQR (client-core, gepinnt libsignal; Roundtrip-Beweise)
+- [x] Senden und Empfangen, Echtzeit-Push (WebSocket-Hinweiskanal), idempotente Zustellung (Dedupe-Tabelle)
+- [x] Multi-Device-Fanout (eine Hülle je Zielgerät, delivery löst die Gerätemenge über identity auf)
 - [ ] Volles Threat Model (LINDDUN, STRIDE) und ein formales Handshake-Modell-Skelett (ProVerif oder Tamarin), parallel zum Kern
 - [ ] Erstes externes Audit des Krypto-Kerns
 
