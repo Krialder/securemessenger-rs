@@ -27,7 +27,12 @@ async fn serve(app: axum::Router) -> String {
 
 async fn start_stack() -> (String, String, String) {
     let identity_url = serve(identity::api::app(
-        identity::api::AppState::new_in_memory().with_internal_token(INTERNAL_SECRET),
+        identity::api::AppState::new_in_memory()
+            .with_internal_token(INTERNAL_SECRET)
+            // Zertifikatsausgabe für den Sealed-Sender-Teil des Tests.
+            .with_sealed_sender(Arc::new(
+                sealed_cert::Issuer::from_seed(&[6u8; 32]).expect("Aussteller"),
+            )),
     ))
     .await;
     let directory_url = serve(directory::api::app(directory::api::AppState::new(
@@ -170,6 +175,20 @@ async fn two_cli_users_chat_across_process_boundaries() {
     assert!(
         received.contains("[alice] verschwindet spaeter"),
         "die befristete Nachricht muss vor Ablauf ankommen, stdout war: {received}"
+    );
+
+    // Sealed Sender: die Hülle geht ohne Token und ohne Absender im
+    // Framing an die Zustellung; Bob liest die Nachricht trotzdem mit
+    // Absender, weil der aus der geprüften Zertifikatskette kommt.
+    let sent = alice.run(&["send", "bob", "versiegelt unterwegs", "--sealed"]);
+    assert!(
+        sent.contains("versiegelt"),
+        "send --sealed muss die Versiegelung bestätigen, stdout war: {sent}"
+    );
+    let received = bob.run(&["recv"]);
+    assert!(
+        received.contains("[alice] versiegelt unterwegs"),
+        "die versiegelte Nachricht muss mit Absender ankommen, stdout war: {received}"
     );
 
     // Aufräumen ist Komfort, kein Testinhalt.

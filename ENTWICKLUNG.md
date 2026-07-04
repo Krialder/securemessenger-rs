@@ -17,6 +17,8 @@ crates/
                       (Meldung verifizieren), kein Eigenbau
   pow/                Proof-of-Work-Sybil-Bremse (hashcash über SHA-256); geteilt zwischen Client (lösen) und Server
                       (prüfen), kein Eigenbau
+  sealed-cert/        Sealed-Sender-Zertifikate (libsignal-Format ServerCertificate/SenderCertificate): identity stellt
+                      aus, der Empfänger-Client prüft die Kette beim Entsiegeln; der Trust Root ist der eine stabile Anker
   client-core/        der Krypto-Kern der Clients (libsignal, OpenMLS, gepinnt); kein Dienst hängt davon ab
     src/onetoone.rs   1:1-Sitzungen: PQXDH-Aufbau, Double Ratchet, Safety Number, Schlüsselwechsel-Erkennung (Wrapper, keine Eigenbauten)
     src/group.rs      MLS-Gruppen: Suite 0x0003, Skipped-Keys-Fenster, GroupSession (Byte-Ein-Byte-Aus für den Client)
@@ -184,6 +186,8 @@ cargo test -p kt --test pg
 | `POST /devices` | weiteres Gerät freischalten (Credential vom Konto-Identitätsschlüssel signiert); 201, 400, 401, 409 |
 | `DELETE /devices/{id}` | Gerät revozieren, widerruft dessen Sessions; das eigene Gerät nicht (409); 204, 401, 404 |
 | `GET /pow` | aktuelle Proof-of-Work-Schwierigkeit der Registrierung (Sybil-Bremse); `{difficulty}`, 0 = aus |
+| `GET /sealed-sender` | öffentlicher Trust Root der Sealed-Sender-Zertifikatskette (Base64); nur bei gesetztem `SEALED_SENDER_TRUST_ROOT`, sonst 404 |
+| `GET /sender-certificate` | kurzlebiges Absender-Zertifikat fürs eigene Gerät (Bearer, TTL 24 h); der Identitätsschlüssel kommt aus der Registrierung, nie aus dem Request; `?device=` nennt die Protokoll-Gerätenummer; 200, 400, 401, 403 |
 | `POST /internal/introspect` | Dienst-zu-Dienst: Access-Token zur Identität auflösen (RFC-7662-Zuschnitt); nur mit `INTERNAL_TOKEN` |
 | `GET /internal/accounts/{handle}/devices` | Dienst-zu-Dienst: Identitätsschlüssel und gültige Gerätemenge eines Kontos |
 | `POST /discovery/evaluate` | OPRF-Runde der Contact Discovery: geblendetes Element rein, Server-Auswertung raus; nur bei gesetztem `CDS_OPRF_KEY`; rate-limitiert; 200, 400, 401, 429 |
@@ -213,6 +217,7 @@ Der Dienst kennt keine Passwörter und keine Sessions: Bearer-Tokens prüft er �
 | Endpunkt | Zweck |
 |----------|-------|
 | `POST /messages` | verschlüsselte Hüllen einreichen, Fan-out an alle Geräte des Empfängers; idempotent über client-erzeugte Hüllen-IDs; optional `franking_tag` (Meldbarkeit) und `expires_at` (Disappearing Messages); 200 mit `accepted`/`duplicates`, 400, 401, 404 |
+| `POST /sealed` | Sealed-Sender-Hüllen einreichen, absichtlich ohne Token (ein Bearer würde den Absender identifizieren); rate-limitiert je Empfänger (60/min); Blockliste wirkt hier client-seitig nach dem Entsiegeln; 200, 400, 404, 429 |
 | `GET /messages` | wartende Hüllen des eigenen Geräts abholen (bis 100, Eingangsreihenfolge); entfernt nichts; 200, 401 |
 | `POST /messages/ack` | abgeholte Hüllen bestätigen und löschen; idempotent; 200 mit `removed`, 400, 401 |
 | `POST /groups` | Gruppe anlegen (client-erzeugte UUID, Mitglieder als Handles, aufgelöst zu Zielgeräten); 201 mit `epoch`/`devices`, 400, 401, 409 |
@@ -225,7 +230,7 @@ Der Dienst kennt keine Passwörter und keine Sessions: Bearer-Tokens prüft er �
 | `POST /internal/presence/query` | Dienst-zu-Dienst: welche Geräte sind gerade verbunden (Grundlage von F080) |
 | `GET /live`, `/ready`, `/metrics` | Betriebs-Endpunkte |
 
-Der Dienst speichert nur opake, Ende-zu-Ende-verschlüsselte Hüllen (Base64, max. 64 KiB) bis zur Bestätigung durch das Empfängergerät - nie Klartext und keinen Absender. Empfänger werden pro Handle über die interne identity-API zu Konto-UUID und Gerätemenge aufgelöst; jede Hülle adressiert genau ein Gerät (der Client legt pro Zielgerät eine Hülle mit eigener UUID an, so funktioniert Multi-Device-Fan-out). Wiederholte Einreichungen derselben Hüllen-ID sind Erfolg, kein Fehler: die Dedupe-Tabelle erkennt sie auch nach der Zustellung noch. Der WebSocket transportiert ausschließlich Weck-Hinweise und markierte Maschinen-Benachrichtigungen, nie Chat-Inhalte; Clients holen nach jedem Hinweis (und nach jedem Verbinden) per `GET /messages` ab und bestätigen per Ack. Verbundene Sockets bilden zugleich die Präsenz: delivery führt prozesslokal Buch, welche Geräte verbunden sind, und beantwortet darüber die interne Präsenz-Abfrage. [ANNAHME: Einreichen ist bis zur Sealed-Sender-Etappe Bearer-authentifiziert; der Absender wird dabei nur geprüft, nie gespeichert. Batch max. 100 Hüllen. Hinweise laufen In-Prozess (tokio broadcast); ein Message-Bus für Multi-Replik-Betrieb folgt mit der Skalierungs-Etappe.]
+Der Dienst speichert nur opake, Ende-zu-Ende-verschlüsselte Hüllen (Base64, max. 64 KiB) bis zur Bestätigung durch das Empfängergerät - nie Klartext und keinen Absender. Empfänger werden pro Handle über die interne identity-API zu Konto-UUID und Gerätemenge aufgelöst; jede Hülle adressiert genau ein Gerät (der Client legt pro Zielgerät eine Hülle mit eigener UUID an, so funktioniert Multi-Device-Fan-out). Wiederholte Einreichungen derselben Hüllen-ID sind Erfolg, kein Fehler: die Dedupe-Tabelle erkennt sie auch nach der Zustellung noch. Der WebSocket transportiert ausschließlich Weck-Hinweise und markierte Maschinen-Benachrichtigungen, nie Chat-Inhalte; Clients holen nach jedem Hinweis (und nach jedem Verbinden) per `GET /messages` ab und bestätigen per Ack. Verbundene Sockets bilden zugleich die Präsenz: delivery führt prozesslokal Buch, welche Geräte verbunden sind, und beantwortet darüber die interne Präsenz-Abfrage. Einreichen geht auf zwei Wegen: `POST /messages` ist Bearer-authentifiziert (der Absender wird geprüft, nie gespeichert), `POST /sealed` nimmt Sealed-Sender-Hüllen ohne Token an, denn ein Token würde den Absender gegenüber dem Dienst identifizieren; die Absender-Echtheit prüft der Empfänger über die Zertifikatskette in der Hülle. [ANNAHME: Batch max. 100 Hüllen. Der anonyme Pfad ist je Empfänger rate-limitiert (60/min) statt über Signals Delivery-Tokens; die Tokens ersetzen später nur diese Bremse. Hinweise laufen In-Prozess (tokio broadcast); ein Message-Bus für Multi-Replik-Betrieb folgt mit der Skalierungs-Etappe.]
 
 ## Endpunkte des integrations-Dienstes (aktueller Stand)
 

@@ -64,3 +64,5 @@ delivery = { path = "../../services/delivery" }
 kt = { path = "../../services/kt" }
 common = { workspace = true }
 uuid = { workspace = true }
+# Der Sealed-Sender-E2E-Test stellt sein Test-Zertifikat selbst aus.
+sealed-cert = { workspace = true }

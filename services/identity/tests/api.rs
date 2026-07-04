@@ -180,6 +180,73 @@ async fn registration_requires_proof_of_work_when_configured() {
     assert_eq!(body["code"], "pow_required");
 }
 
+/// Sealed-Sender-Ausgabe: der Trust Root ist öffentlich, das Zertifikat
+/// gibt es nur mit gültiger Session, und es hängt an genau diesem Trust
+/// Root, mit dem registrierten Geräteschlüssel darin.
+#[tokio::test]
+async fn sender_certificates_are_issued_and_chain_to_trust_root() {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine as _;
+
+    let issuer = std::sync::Arc::new(sealed_cert::Issuer::from_seed(&[9u8; 32]).unwrap());
+    let app = app(AppState::new_in_memory().with_sealed_sender(issuer));
+
+    // Der Anker ist ohne Token abrufbar (er ist öffentlich).
+    let (status, info) = send(&app, "GET", "/sealed-sender", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let trust_root = info["trust_root"].as_str().unwrap().to_string();
+
+    // Ohne Session kein Zertifikat.
+    let (status, _) = send(&app, "GET", "/sender-certificate", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Registrieren mit einem echten libsignal-Identitätsschlüssel als
+    // Geräteschlüssel (wie CLI und Web es tun), dann anmelden.
+    let identity = key(21);
+    let device_key = BASE64.encode(
+        libsignal_protocol::KeyPair::generate(&mut rand::rng())
+            .public_key
+            .serialize(),
+    );
+    let register = json!({
+        "handle": "siegler",
+        "password": "korrektes-pferd-batterie",
+        "identity_key": helpers::b64_public(&identity),
+        "device": helpers::signed_device_with_key(&identity, "siegler", DEV_FIRST, &device_key),
+    });
+    let (status, _) = send(&app, "POST", "/accounts", Some(register), None).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let login = login_body("siegler", "korrektes-pferd-batterie", DEV_FIRST);
+    let (_, body) = send(&app, "POST", "/sessions", Some(login), None).await;
+    let access = body["access_token"].as_str().unwrap().to_string();
+
+    let (status, body) = send(&app, "GET", "/sender-certificate", None, Some(&access)).await;
+    assert_eq!(status, StatusCode::OK, "Antwort war: {body}");
+
+    // Kette und Inhalt: gültig gegen unseren Trust Root, Handle stimmt,
+    // und im Zertifikat steht der registrierte Schlüssel, kein eingereichter.
+    let cert = libsignal_protocol::SenderCertificate::deserialize(
+        &BASE64
+            .decode(body["certificate"].as_str().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    let root =
+        libsignal_protocol::PublicKey::deserialize(&BASE64.decode(&trust_root).unwrap()).unwrap();
+    let now_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert!(cert
+        .validate(
+            &root,
+            libsignal_protocol::Timestamp::from_epoch_millis(now_millis)
+        )
+        .unwrap());
+    assert_eq!(cert.sender_uuid().unwrap(), "siegler");
+    assert_eq!(BASE64.encode(cert.key().unwrap().serialize()), device_key);
+}
+
 #[tokio::test]
 async fn register_login_logout_flow() {
     let app = test_app();

@@ -180,6 +180,81 @@ const ENV_1: &str = "11111111-0000-4000-8000-000000000001";
 const ENV_2: &str = "11111111-0000-4000-8000-000000000002";
 const ENV_3: &str = "11111111-0000-4000-8000-000000000003";
 
+/// Sealed-Sender-Annahme: kein Token nötig (das ist der Sinn), die Hülle
+/// landet im Posteingang des Zielgeräts, und der Empfänger holt sie mit
+/// seinem eigenen Token ab. Ein unbekannter Empfänger bleibt 404, damit
+/// der anonyme Pfad kein Blindlager füllt.
+#[tokio::test]
+async fn sealed_submit_needs_no_token_and_lands_in_inbox() {
+    let app = test_app();
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/sealed",
+        Some(json!({ "envelopes": [envelope(ENV_1, "bob", DEV_BOB)] })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "Antwort war: {body}");
+    assert_eq!(body["accepted"], 1);
+
+    let (status, body) = send(&app, "GET", "/messages", None, Some("token-bob")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(body["messages"][0]["id"], ENV_1);
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/sealed",
+        Some(json!({ "envelopes": [envelope(ENV_2, "niemand", DEV_BOB)] })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Der anonyme Pfad ist je Empfänger rate-limitiert: ohne Token bremst
+/// nur der Posteingang selbst gegen Flutung.
+#[tokio::test]
+async fn sealed_submit_is_rate_limited_per_recipient() {
+    let app = test_app();
+    for i in 0..60 {
+        let id = format!("22222222-0000-4000-8000-{i:012}");
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/sealed",
+            Some(json!({ "envelopes": [envelope(&id, "bob", DEV_BOB)] })),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "Annahme {i}");
+    }
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/sealed",
+        Some(json!({ "envelopes": [envelope(ENV_3, "bob", DEV_BOB)] })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["code"], "rate_limited");
+
+    // Ein anderer Empfänger hat sein eigenes Fenster.
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/sealed",
+        Some(json!({ "envelopes": [envelope(ENV_1, "alice", DEV_ALICE)] })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
 #[tokio::test]
 async fn submit_fetch_ack_roundtrip() {
     let app = test_app();

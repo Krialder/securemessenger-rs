@@ -38,8 +38,19 @@ pub fn signed_device(
     device_id: &str,
     device_seed: u8,
 ) -> Value {
-    let device_pk = b64_public(&key(device_seed));
-    let message = credential_message(handle, device_id, &device_pk, FAR_FUTURE);
+    signed_device_with_key(identity, handle, device_id, &b64_public(&key(device_seed)))
+}
+
+/// Wie `signed_device`, aber mit vorgegebenem Geräteschlüssel (Base64):
+/// echte Clients registrieren ihren libsignal-Identitätsschlüssel, und der
+/// Sealed-Sender-Test braucht genau den im Credential.
+pub fn signed_device_with_key(
+    identity: &SigningKey,
+    handle: &str,
+    device_id: &str,
+    device_pk: &str,
+) -> Value {
+    let message = credential_message(handle, device_id, device_pk, FAR_FUTURE);
     let signature = BASE64.encode(identity.sign(message.as_bytes()).to_bytes());
     json!({
         "id": device_id,

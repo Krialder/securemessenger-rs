@@ -247,21 +247,34 @@ async fn publish_keys() -> Result<(), String> {
     Ok(())
 }
 
-/// `sm send <handle> <text> [--ttl <sekunden>]`: baut bei Bedarf die Sitzung
-/// auf (Bündel-Abruf, PQXDH) und stellt die Ende-zu-Ende verschlüsselte
-/// Nachricht über die Zustellung an alle Geräte des Kontakts zu. Mit `--ttl`
-/// verschwindet eine unabgeholte Hülle nach der Frist (Disappearing Messages).
+/// `sm send <handle> <text> [--ttl <sekunden>] [--sealed]`: baut bei Bedarf
+/// die Sitzung auf (Bündel-Abruf, PQXDH) und stellt die Ende-zu-Ende
+/// verschlüsselte Nachricht über die Zustellung an alle Geräte des Kontakts
+/// zu. Mit `--ttl` verschwindet eine unabgeholte Hülle nach der Frist
+/// (Disappearing Messages); mit `--sealed` geht sie als Sealed-Sender-Hülle
+/// ohne Absender-Klartext und ohne Token an die Zustellung.
 async fn send(args: &[String]) -> Result<(), String> {
-    let (recipient, text, ttl) = match args {
-        [recipient, text] => (recipient, text, None),
-        [recipient, text, flag, seconds] if flag == "--ttl" => {
-            let ttl: u64 = seconds
-                .parse()
-                .map_err(|_| "--ttl braucht eine Zahl in Sekunden".to_string())?;
-            (recipient, text, Some(ttl))
-        }
-        _ => return Err("Aufruf: sm send <handle> <text> [--ttl <sekunden>]".to_string()),
+    let usage = "Aufruf: sm send <handle> <text> [--ttl <sekunden>] [--sealed]";
+    let [recipient, text, flags @ ..] = args else {
+        return Err(usage.to_string());
     };
+    let mut ttl: Option<u64> = None;
+    let mut sealed = false;
+    let mut rest = flags.iter();
+    while let Some(flag) = rest.next() {
+        match flag.as_str() {
+            "--ttl" => {
+                let seconds = rest.next().ok_or("--ttl braucht eine Zahl in Sekunden")?;
+                ttl = Some(
+                    seconds
+                        .parse()
+                        .map_err(|_| "--ttl braucht eine Zahl in Sekunden".to_string())?,
+                );
+            }
+            "--sealed" => sealed = true,
+            other => return Err(format!("unbekanntes Argument: {other}\n{usage}")),
+        }
+    }
     let expires_at = ttl.map(|seconds| now_unix() + seconds);
     let profile = load_profile()?;
     let token = access_token(&profile)?;
@@ -318,21 +331,41 @@ async fn send(args: &[String]) -> Result<(), String> {
     // Einmal je Nachricht franken: derselbe Franking-Schlüssel und dasselbe
     // Commitment für alle Zielgeräte, damit der Empfänger jede Kopie melden
     // kann (specs/sealed-sender-und-abuse.md). Der Schlüssel reist im
-    // verschlüsselten Payload, das Commitment als Franking-Tag.
+    // verschlüsselten Payload, das Commitment als Franking-Tag. Das gilt
+    // auch versiegelt: das Tag identifiziert niemanden.
     let franked = client_app::franking::frank(text.as_bytes());
     let franking_tag = BASE64.encode(&franked.commitment);
+    // Für --sealed einmal das Absender-Zertifikat besorgen (gecacht).
+    let certificate = if sealed {
+        Some(sender_certificate_cached(&token, &storage).await?)
+    } else {
+        None
+    };
     let mut envelopes = Vec::with_capacity(devices.len());
     for target in &devices {
         let address = ProtocolAddress::new(
             recipient.to_string(),
             device_id_from_u32(target.protocol_device_id).map_err(|e| e.to_string())?,
         );
-        let message = device
-            .encrypt(&address, &franked.payload)
-            .await
-            .map_err(|e| format!("Verschlüsselung: {e}"))?;
-        let envelope =
-            wire::seal(&profile.handle, PROTOCOL_DEVICE_ID, &message).map_err(|e| e.to_string())?;
+        let envelope = match &certificate {
+            // Versiegelt: der Absender steht nur mitverschlüsselt in der
+            // Hülle (Zertifikat), das Framing trägt kein from-Feld.
+            Some(certificate) => {
+                let blob = device
+                    .seal_message(&address, certificate, &franked.payload)
+                    .await
+                    .map_err(|e| format!("Versiegeln: {e}"))?;
+                wire::seal_sealed(&blob).map_err(|e| e.to_string())?
+            }
+            None => {
+                let message = device
+                    .encrypt(&address, &franked.payload)
+                    .await
+                    .map_err(|e| format!("Verschlüsselung: {e}"))?;
+                wire::seal(&profile.handle, PROTOCOL_DEVICE_ID, &message)
+                    .map_err(|e| e.to_string())?
+            }
+        };
         envelopes.push(OutgoingEnvelope {
             id: uuid::Uuid::new_v4().to_string(),
             recipient: recipient.to_string(),
@@ -343,17 +376,84 @@ async fn send(args: &[String]) -> Result<(), String> {
         });
     }
 
-    let outcome = DeliveryClient::new(delivery_url())
-        .submit(&token, &envelopes)
-        .await
-        .map_err(|e| e.to_string())?;
+    let delivery = DeliveryClient::new(delivery_url());
+    let outcome = if sealed {
+        // Absichtlich ohne Token: ein Bearer würde den Absender gegenüber
+        // der Zustellung identifizieren.
+        delivery.submit_sealed(&envelopes).await
+    } else {
+        delivery.submit(&token, &envelopes).await
+    }
+    .map_err(|e| e.to_string())?;
     println!(
-        "Zugestellt an {} Gerät(e) ({} angenommen, {} Duplikate)",
+        "Zugestellt an {} Gerät(e) ({} angenommen, {} Duplikate{})",
         devices.len(),
         outcome.accepted,
-        outcome.duplicates
+        outcome.duplicates,
+        if sealed { ", versiegelt" } else { "" }
     );
     Ok(())
+}
+
+/// Holt das Sealed-Sender-Zertifikat des eigenen Geräts, mit Cache in der
+/// Ablage (`sealed/certificate`): erst wenn es fehlt oder in unter fünf
+/// Minuten abläuft, fragt der Client den identity-Dienst neu.
+async fn sender_certificate_cached(
+    token: &str,
+    storage: &SharedStorage,
+) -> Result<Vec<u8>, String> {
+    const KEY: &str = "sealed/certificate";
+    if let Some(bytes) = storage.borrow().get(KEY).map_err(|e| e.to_string())? {
+        if let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            let fresh_until = (now_unix() + 300) * 1000;
+            if record["expires_at_millis"].as_u64().unwrap_or(0) > fresh_until {
+                if let Some(cert) = record["certificate"]
+                    .as_str()
+                    .and_then(|b64| BASE64.decode(b64).ok())
+                {
+                    return Ok(cert);
+                }
+            }
+        }
+    }
+    let issued = IdentityClient::new(identity_url())
+        .sender_certificate(token, PROTOCOL_DEVICE_ID)
+        .await
+        .map_err(|e| format!("Absender-Zertifikat: {e}"))?;
+    let record = serde_json::json!({
+        "certificate": BASE64.encode(&issued.certificate),
+        "expires_at_millis": issued.expires_at_millis,
+    });
+    storage
+        .borrow_mut()
+        .put(
+            KEY,
+            &serde_json::to_vec(&record).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(issued.certificate)
+}
+
+/// Der Trust Root zum Entsiegeln, mit Cache in der Ablage
+/// (`sealed/trust_root`). Der erste Abruf vertraut dem identity-Dienst
+/// (Trust-on-first-use wie beim KT-Signaturschlüssel); danach ist der
+/// Anker lokal gepinnt, ein später ausgetauschter Root fällt auf, weil
+/// jedes Entsiegeln scheitert.
+async fn sealed_trust_root_cached(storage: &SharedStorage) -> Result<Vec<u8>, String> {
+    const KEY: &str = "sealed/trust_root";
+    if let Some(root) = storage.borrow().get(KEY).map_err(|e| e.to_string())? {
+        return Ok(root);
+    }
+    let root = IdentityClient::new(identity_url())
+        .sealed_sender_trust_root()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("der identity-Dienst stellt keine Sealed-Sender-Zertifikate aus")?;
+    storage
+        .borrow_mut()
+        .put(KEY, &root)
+        .map_err(|e| e.to_string())?;
+    Ok(root)
 }
 
 /// `sm recv`: holt wartende Hüllen ab, entschlüsselt sie und bestätigt sie
@@ -388,6 +488,35 @@ fn remember_franking(
         .map_err(|e| e.to_string())
 }
 
+/// Gibt einen entschlüsselten Payload aus und legt das Franking-Material
+/// fürs spätere Melden ab (`sm report`). Der Payload ist gefrankt (K_f
+/// vorangestellt); ältere, ungefrankte Nachrichten fallen auf die rohe
+/// Anzeige zurück.
+fn print_and_remember(
+    storage: &SharedStorage,
+    message_id: &str,
+    from: &str,
+    payload: &[u8],
+) -> Result<(), String> {
+    match client_app::franking::unfrank(payload) {
+        Ok(opened_msg) => {
+            println!(
+                "[{}] {}",
+                from,
+                String::from_utf8_lossy(&opened_msg.message)
+            );
+            // Die Melde-ID auf stderr, damit die Nachrichtenzeile (stdout)
+            // schlicht bleibt: `sm report <id>`.
+            eprintln!("  (Melde-ID: {message_id})");
+            remember_franking(storage, message_id, &opened_msg)
+        }
+        Err(_) => {
+            println!("[{}] {}", from, String::from_utf8_lossy(payload));
+            Ok(())
+        }
+    }
+}
+
 /// Der Abhol-Durchlauf von `recv` und `listen`: wartende Hüllen holen,
 /// entschlüsseln, ausgeben und bestätigen. Liefert, wie viele Hüllen
 /// verarbeitet (bestätigt) wurden.
@@ -400,6 +529,36 @@ async fn drain_waiting(
     let waiting = delivery.fetch(token).await.map_err(|e| e.to_string())?;
     let mut acked = Vec::with_capacity(waiting.len());
     for message in &waiting {
+        // Sealed-Sender-Hüllen zuerst: sie tragen keinen Absender im
+        // Framing, der kommt erst aus der geprüften Zertifikatskette.
+        if matches!(wire::classify(&message.envelope), wire::Framed::Sealed) {
+            let blob = match wire::open_sealed(&message.envelope) {
+                Ok(blob) => blob,
+                Err(error) => {
+                    eprintln!("Hülle {} übersprungen: {error}", message.id);
+                    continue;
+                }
+            };
+            let trust_root = sealed_trust_root_cached(storage).await?;
+            match device.unseal_message(&trust_root, &blob).await {
+                Ok(unsealed) => {
+                    print_and_remember(
+                        storage,
+                        &message.id,
+                        &unsealed.sender,
+                        &unsealed.plaintext,
+                    )?;
+                    acked.push(message.id.clone());
+                }
+                Err(error) => {
+                    eprintln!("Hülle {} nicht entsiegelbar: {error}", message.id);
+                    // Bestätigen wie unten: ein erneuter Abruf scheitert
+                    // am selben Fehler.
+                    acked.push(message.id.clone());
+                }
+            }
+            continue;
+        }
         let opened = match wire::open(&message.envelope) {
             Ok(opened) => opened,
             Err(error) => {
@@ -415,26 +574,7 @@ async fn drain_waiting(
         );
         match device.decrypt(&address, &opened.message).await {
             Ok(payload) => {
-                // Der Payload ist gefrankt (K_f vorangestellt); entrahmen,
-                // die eigentliche Nachricht ausgeben und das Franking-Material
-                // fürs spätere Melden ablegen (sm report). Ältere, ungefrankte
-                // Nachrichten fallen auf die rohe Anzeige zurück.
-                match client_app::franking::unfrank(&payload) {
-                    Ok(opened_msg) => {
-                        println!(
-                            "[{}] {}",
-                            opened.from,
-                            String::from_utf8_lossy(&opened_msg.message)
-                        );
-                        // Die Melde-ID auf stderr, damit die Nachrichtenzeile
-                        // (stdout) schlicht bleibt: `sm report <id>`.
-                        eprintln!("  (Melde-ID: {})", message.id);
-                        remember_franking(storage, &message.id, &opened_msg)?;
-                    }
-                    Err(_) => {
-                        println!("[{}] {}", opened.from, String::from_utf8_lossy(&payload));
-                    }
-                }
+                print_and_remember(storage, &message.id, &opened.from, &payload)?;
                 acked.push(message.id.clone());
             }
             Err(error) => {
@@ -742,7 +882,7 @@ fn print_usage() {
          \x20 logout                         Session abmelden\n\
          \x20 whoami                         Profil anzeigen\n\
          \x20 publish-keys                   Prekey-Satz im Verzeichnis veröffentlichen\n\
-         \x20 send <handle> <text> [--ttl s]  E2EE-Nachricht senden (--ttl: verschwindet nach s Sekunden)\n\
+         \x20 send <handle> <text> [--ttl s] [--sealed]  E2EE senden (--ttl: verschwindet; --sealed: ohne Absender-Klartext)\n\
          \x20 recv                           wartende Nachrichten abholen und entschlüsseln\n\
          \x20 listen [--once]                Hinweiskanal halten und bei Hinweisen abholen\n\
          \x20 verify                         eigenen KT-Eintrag pruefen (Selbstpruefung)\n\

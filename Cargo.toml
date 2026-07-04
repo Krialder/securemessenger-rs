@@ -16,6 +16,7 @@ members = [
     "crates/kt-format",
     "crates/oprf",
     "crates/pow",
+    "crates/sealed-cert",
     "services/delivery",
     "services/directory",
     "services/identity",
@@ -83,6 +84,9 @@ franking = { path = "crates/franking" }
 # Proof-of-Work-Sybil-Bremse, geteilt zwischen Client (lösen) und Server
 # (prüfen).
 pow = { path = "crates/pow" }
+# Sealed-Sender-Zertifikate: identity stellt aus, Clients prüfen beim
+# Entsiegeln (Format aus libsignal, kein Eigenbau).
+sealed-cert = { path = "crates/sealed-cert" }
 
 # Argon2 ist in Debug-Builds unbrauchbar langsam (Sekunden pro Hash).
 # Die Krypto-Pakete werden deshalb auch im Dev-Profil optimiert gebaut,

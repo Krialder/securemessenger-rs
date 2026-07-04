@@ -51,3 +51,6 @@ js-sys = "0.3"
 # Die Integrations-Beweise (Roundtrips) sind async, weil die
 # libsignal-Store-Traits async sind.
 tokio = { workspace = true }
+# Der Sealed-Sender-Roundtrip braucht einen Aussteller; produktiv stellt
+# der identity-Dienst aus, der Kern prueft nur.
+sealed-cert = { workspace = true }

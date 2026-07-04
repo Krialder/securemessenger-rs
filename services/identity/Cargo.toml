@@ -31,7 +31,14 @@ oprf.workspace = true
 # Proof-of-Work-Sybil-Bremse bei der Registrierung: der Server prüft den
 # Client-Nachweis (specs/sealed-sender-und-abuse.md).
 pow.workspace = true
+# Sealed-Sender-Zertifikate: dieser Dienst stellt sie aus, die Kette
+# (Trust Root -> Serverschlüssel -> Absender) prüft der Empfänger-Client.
+sealed-cert.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Der Sealed-Sender-Test validiert die ausgestellte Zertifikatskette so,
+# wie es der Empfänger-Client täte: mit denselben libsignal-Typen.
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal", rev = "57d41c877d5a55d881fb3f52d9b16900118ee29b" }
+rand.workspace = true

@@ -37,3 +37,5 @@ identity = { path = "../../services/identity" }
 directory = { path = "../../services/directory" }
 delivery = { path = "../../services/delivery" }
 common = { workspace = true }
+# Der Sealed-Sender-Teil des E2E-Tests braucht den Test-Aussteller.
+sealed-cert = { workspace = true }

@@ -94,6 +94,29 @@ async fn main() {
         None => state,
     };
 
+    // Mit SEALED_SENDER_TRUST_ROOT (Base64, 32 Byte) stellt der Dienst
+    // Sealed-Sender-Zertifikate aus; ohne bleiben die Routen 404. Der
+    // Serverschlüssel entsteht bei jedem Start frisch und wird vom Trust
+    // Root signiert; nur der Trust Root muss stabil bleiben, weil er der
+    // Anker in den Clients ist (crates/sealed-cert).
+    let state = match std::env::var("SEALED_SENDER_TRUST_ROOT")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        Some(seed_b64) => {
+            use base64::engine::general_purpose::STANDARD as BASE64;
+            use base64::Engine as _;
+            let seed = BASE64
+                .decode(seed_b64.trim())
+                .expect("SEALED_SENDER_TRUST_ROOT ist gültiges Base64");
+            let issuer = sealed_cert::Issuer::from_seed(&seed)
+                .expect("SEALED_SENDER_TRUST_ROOT ergibt einen 32-Byte-Schlüssel");
+            tracing::info!("Sealed-Sender-Zertifikatsausgabe aktiv");
+            state.with_sealed_sender(Arc::new(issuer))
+        }
+        None => state,
+    };
+
     let router = app(state);
 
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr)

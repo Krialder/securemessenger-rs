@@ -1,0 +1,22 @@
+[package]
+name = "sealed-cert"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Sender-Zertifikate fuer Sealed Sender (specs/sealed-sender-und-abuse.md):
+# der identity-Dienst stellt sie aus, der Empfaenger-Client prueft sie beim
+# Entsiegeln gegen den Trust Root. Das Format ist libsignals eigenes
+# (ServerCertificate/SenderCertificate-Protobuf), kein Eigenbau; dieses
+# Crate haelt nur die Ausstellung an einer Stelle. Die Kette
+# (Trust Root -> Serverschluessel -> Absender) ist absichtlich zweistufig,
+# damit der Serverschluessel rotieren oder gegen eine andere
+# Credential-Quelle (zkgroup) getauscht werden kann, ohne dass Clients
+# einen neuen Anker lernen.
+
+[dependencies]
+# Dasselbe Pin wie client-core: das Zertifikatsformat muss exakt das sein,
+# das sealed_sender_encrypt/decrypt im Client erwartet.
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal", rev = "57d41c877d5a55d881fb3f52d9b16900118ee29b" }
+rand = "0.9"

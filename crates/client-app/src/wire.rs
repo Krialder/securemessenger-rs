@@ -7,14 +7,12 @@
 //! Keine Kryptografie, nur Rahmung; der Chiffretext kommt unverändert aus
 //! dem Krypto-Kern.
 //!
-//! [ANNAHME: Bis zur Sealed-Sender-Etappe trägt das Framing Absender-Handle
-//! und -Gerätenummer im Klartext, denn der Empfänger braucht die
-//! Absenderadresse für die Session-Zuordnung (`message_decrypt`). Das ist
-//! Metadaten-Sichtbarkeit gegenüber dem Server: er könnte die Blobs parsen,
-//! und anders als beim Bearer-Token liegt der Absender damit bis zum Ack in
-//! der Ablage. Genau diese Lücke schließt Sealed Sender
-//! (specs/sealed-sender-und-abuse.md); sie ist hier bewusst und sichtbar,
-//! nicht versteckt.]
+//! Zwei 1:1-Framings existieren nebeneinander: `smenv.v1` trägt
+//! Absender-Handle und -Gerätenummer im Klartext (der Empfänger braucht die
+//! Absenderadresse für die Session-Zuordnung, `message_decrypt`), `smssl.v1`
+//! trägt nur den versiegelten Blob, in dem der Absender mitverschlüsselt
+//! steckt (Sealed Sender, specs/sealed-sender-und-abuse.md). Der Absender
+//! wählt beim Senden; der Empfänger routet über `classify`.
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -27,6 +25,7 @@ use crate::error::ClientError;
 
 const WIRE_VERSION: &str = "smenv.v1";
 const GROUP_WIRE_VERSION: &str = "smgrp.v1";
+const SEALED_WIRE_VERSION: &str = "smssl.v1";
 
 #[derive(Serialize, Deserialize)]
 struct WireEnvelope {
@@ -139,12 +138,53 @@ pub fn seal_group(group_id: &str, blob: &[u8]) -> Result<String, ClientError> {
     Ok(BASE64.encode(json))
 }
 
+/// Framing der Sealed-Sender-Hüllen (`smssl.v1`): nur Version und der
+/// versiegelte Blob. Anders als `smenv.v1` steht hier kein Absender, das
+/// ist der Punkt der Übung; er steckt mitverschlüsselt im Blob und kommt
+/// erst bei `Device::unseal_message` heraus.
+#[derive(Serialize, Deserialize)]
+struct SealedEnvelope {
+    v: String,
+    blob: String,
+}
+
+/// Rahmt einen versiegelten Blob (aus `Device::seal_message`) als Hülle.
+pub fn seal_sealed(blob: &[u8]) -> Result<String, ClientError> {
+    let envelope = SealedEnvelope {
+        v: SEALED_WIRE_VERSION.to_string(),
+        blob: BASE64.encode(blob),
+    };
+    let json =
+        serde_json::to_vec(&envelope).map_err(|error| ClientError::Protocol(error.to_string()))?;
+    Ok(BASE64.encode(json))
+}
+
+/// Öffnet das Framing einer Sealed-Sender-Hülle; zurück kommt der noch
+/// versiegelte Blob für `Device::unseal_message`.
+pub fn open_sealed(envelope_b64: &str) -> Result<Vec<u8>, ClientError> {
+    let json = BASE64
+        .decode(envelope_b64)
+        .map_err(|_| ClientError::Protocol("Sealed-Hülle ist kein Base64".to_string()))?;
+    let envelope: SealedEnvelope = serde_json::from_slice(&json)
+        .map_err(|error| ClientError::Protocol(format!("Sealed-Hülle unlesbar: {error}")))?;
+    if envelope.v != SEALED_WIRE_VERSION {
+        return Err(ClientError::Protocol(format!(
+            "unbekannte Sealed-Hüllen-Version {}",
+            envelope.v
+        )));
+    }
+    BASE64
+        .decode(&envelope.blob)
+        .map_err(|_| ClientError::Protocol("versiegelter Blob ist kein Base64".to_string()))
+}
+
 /// Welche Art Hülle im Posteingang liegt, ohne sie voll zu öffnen: der
 /// Client routet 1:1-Hüllen an den Ratchet, Gruppen-Hüllen an die
-/// passende MLS-Sitzung.
+/// passende MLS-Sitzung und Sealed-Hüllen an das Entsiegeln.
 pub enum Framed {
     OneToOne,
     Group,
+    Sealed,
     Unknown,
 }
 
@@ -159,6 +199,7 @@ pub fn classify(envelope_b64: &str) -> Framed {
     match value.get("v").and_then(|v| v.as_str()) {
         Some(WIRE_VERSION) => Framed::OneToOne,
         Some(GROUP_WIRE_VERSION) => Framed::Group,
+        Some(SEALED_WIRE_VERSION) => Framed::Sealed,
         _ => Framed::Unknown,
     }
 }

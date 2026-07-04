@@ -123,6 +123,24 @@ impl DeliveryClient {
         parse_json(response).await
     }
 
+    /// `POST /sealed`: reicht Sealed-Sender-Hüllen ein, absichtlich ohne
+    /// Token. Ein Bearer würde den Absender gegenüber dem Dienst
+    /// identifizieren und den Zweck der Versiegelung zunichtemachen; die
+    /// Echtheit des Absenders steckt in der Zertifikatskette der Hülle.
+    pub async fn submit_sealed(
+        &self,
+        envelopes: &[OutgoingEnvelope],
+    ) -> Result<SubmitOutcome, ClientError> {
+        let response = self
+            .http
+            .post(format!("{}/sealed", self.base_url))
+            .json(&SubmitRequest { envelopes })
+            .send()
+            .await
+            .map_err(transport)?;
+        parse_json(response).await
+    }
+
     /// `GET /messages`: die wartenden Hüllen des eigenen Geräts, älteste
     /// zuerst. Räumt nichts weg; das tut erst `ack`.
     pub async fn fetch(&self, access_token: &str) -> Result<Vec<WaitingEnvelope>, ClientError> {

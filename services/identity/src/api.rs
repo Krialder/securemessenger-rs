@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -68,6 +68,9 @@ pub struct AppState {
     /// Proof-of-Work-Schwierigkeit (führende Nullbits) bei der
     /// Registrierung; 0 = aus (specs/sealed-sender-und-abuse.md).
     pow_difficulty: u32,
+    /// Aussteller der Sealed-Sender-Zertifikate; ohne Wert sind die
+    /// Sealed-Sender-Routen abgeschaltet (specs/sealed-sender-und-abuse.md).
+    sealed_sender: Option<Arc<sealed_cert::Issuer>>,
 }
 
 impl AppState {
@@ -106,7 +109,15 @@ impl AppState {
             kt: Arc::new(NoopKtNotifier),
             discovery_oprf: None,
             pow_difficulty: 0,
+            sealed_sender: None,
         }
+    }
+
+    /// Schaltet die Sealed-Sender-Zertifikatsausgabe frei (main.rs, wenn
+    /// SEALED_SENDER_TRUST_ROOT konfiguriert ist).
+    pub fn with_sealed_sender(mut self, issuer: Arc<sealed_cert::Issuer>) -> Self {
+        self.sealed_sender = Some(issuer);
+        self
     }
 
     /// Setzt die Proof-of-Work-Schwierigkeit der Registrierung (führende
@@ -157,6 +168,13 @@ pub fn app(state: AppState) -> Router {
         router = router
             .route("/discovery/evaluate", post(discovery_evaluate))
             .route("/discovery/lookup", post(discovery_lookup));
+    }
+    // Sealed Sender nur bei konfiguriertem Trust Root: der Anker (GET,
+    // öffentlich) und die Zertifikatsausgabe (Bearer) hängen zusammen.
+    if state.sealed_sender.is_some() {
+        router = router
+            .route("/sealed-sender", get(sealed_sender_info))
+            .route("/sender-certificate", get(sender_certificate));
     }
     // Dienst-zu-Dienst (nicht öffentlich, Shared Secret): Introspektion
     // von Access-Tokens und die Gerätemenge eines Kontos. So bleibt die
@@ -210,6 +228,119 @@ async fn pow_info(State(st): State<AppState>) -> Response {
         }),
     )
         .into_response()
+}
+
+/// Gültigkeit eines Absender-Zertifikats: ein Tag. Kurz genug, dass ein
+/// revoziertes Gerät zeitnah herausfällt (es bekommt schlicht kein neues
+/// Zertifikat mehr), lang genug, dass Clients nicht pro Nachricht anfragen.
+/// [ANNAHME: 24 Stunden, der Startwert aus offene-fragen.md.]
+const SENDER_CERTIFICATE_TTL_MILLIS: u64 = 24 * 60 * 60 * 1000;
+
+#[derive(Serialize)]
+struct SealedSenderInfo {
+    /// Öffentlicher Trust Root (Base64, 33 Bytes), gegen den Clients die
+    /// Zertifikatskette beim Entsiegeln prüfen.
+    trust_root: String,
+}
+
+/// `GET /sealed-sender`: der öffentliche Trust Root. Unauthentifiziert,
+/// denn er ist per Definition öffentlich; ein Client, der dem Server hier
+/// nicht traut, verankert ihn stattdessen über SM_SEALED_TRUST_ROOT lokal
+/// (Bootstrapping-Problem wie beim KT-Signaturschlüssel, gleiche Antwort).
+async fn sealed_sender_info(State(st): State<AppState>) -> Response {
+    // Die Route existiert nur mit konfiguriertem Aussteller (app()).
+    let Some(issuer) = st.sealed_sender.as_ref() else {
+        return internal();
+    };
+    (
+        StatusCode::OK,
+        Json(SealedSenderInfo {
+            trust_root: BASE64.encode(issuer.trust_root_public()),
+        }),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct SenderCertificateQuery {
+    /// Protokoll-Gerätenummer des Absenders (ProtocolAddress-Teil). Der
+    /// Client nennt sie, weil nur er sie kennt; die Sicherheit hängt nicht
+    /// daran, sondern am Identitätsschlüssel, den der Dienst selbst aus
+    /// seiner Registrierung nimmt.
+    #[serde(default = "default_protocol_device")]
+    device: u32,
+}
+
+fn default_protocol_device() -> u32 {
+    1
+}
+
+#[derive(Serialize)]
+struct SenderCertificateResponse {
+    /// Serialisiertes SenderCertificate (Base64), unverändert für
+    /// `sealed_sender_encrypt` bestimmt.
+    certificate: String,
+    /// Ablauf in Unix-Millisekunden, damit der Client rechtzeitig neu holt.
+    expires_at_millis: u64,
+}
+
+/// `GET /sender-certificate`: stellt dem authentifizierten Gerät ein
+/// kurzlebiges Absender-Zertifikat aus. Der Identitätsschlüssel im
+/// Zertifikat kommt aus der eigenen Registrierung des Geräts, nie aus dem
+/// Request: ein Konto kann sich so kein Zertifikat für einen fremden
+/// Schlüssel erschleichen.
+async fn sender_certificate(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SenderCertificateQuery>,
+) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return invalid_token(),
+        Err(error) => return session_failure(error),
+    };
+    let Some(issuer) = st.sealed_sender.as_ref() else {
+        return internal();
+    };
+    let devices = match st.store.devices(&who.handle).await {
+        Ok(devices) => devices,
+        Err(error) => return store_failure(error),
+    };
+    // Revozierte Geräte fallen hier heraus: sie behalten ihr letztes
+    // Zertifikat höchstens bis zu dessen Ablauf (TTL), danach ist Schluss.
+    let Some(device) = devices.iter().find(|d| d.id == who.device_id && !d.revoked) else {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "unknown_device",
+            "Geraet ist nicht (mehr) Teil der gueltigen Geraetemenge",
+        );
+    };
+    let Ok(identity_key) = BASE64.decode(&device.public_key) else {
+        tracing::error!(handle = %who.handle, "registrierter Geraeteschluessel ist kein Base64");
+        return internal();
+    };
+    let expires_at_millis = now_unix() * 1000 + SENDER_CERTIFICATE_TTL_MILLIS;
+    match issuer.issue(&who.handle, query.device, &identity_key, expires_at_millis) {
+        Ok(certificate) => (
+            StatusCode::OK,
+            Json(SenderCertificateResponse {
+                certificate: BASE64.encode(certificate),
+                expires_at_millis,
+            }),
+        )
+            .into_response(),
+        Err(error) => {
+            // Kein Serverfehler: das Gerät hat bei der Registrierung keinen
+            // libsignal-Identitätsschlüssel hinterlegt (33 Bytes mit
+            // Typ-Präfix), damit kann kein Zertifikat entstehen.
+            tracing::warn!(%error, handle = %who.handle, "Absender-Zertifikat nicht ausstellbar");
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "device_key_unsupported",
+                "der registrierte Geraeteschluessel ist kein libsignal-Identitaetsschluessel",
+            )
+        }
+    }
 }
 
 /// Ein Gerät, wie der Client es anmeldet. Das Credential ist die Signatur

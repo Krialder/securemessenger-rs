@@ -19,12 +19,13 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use libsignal_protocol::{
-    kem, message_decrypt, message_encrypt, process_prekey_bundle, CiphertextMessage, DeviceId,
-    Fingerprint, GenericSignedPreKey as _, IdentityKeyPair, IdentityKeyStore,
-    InMemIdentityKeyStore, InMemKyberPreKeyStore, InMemPreKeyStore, InMemSessionStore,
-    InMemSignalProtocolStore, InMemSignedPreKeyStore, KeyPair, KyberPreKeyRecord, KyberPreKeyStore,
-    PreKeyBundle, PreKeyRecord, PreKeyStore, ProtocolAddress, SessionStore, SignalProtocolError,
-    SignedPreKeyRecord, SignedPreKeyStore, Timestamp,
+    kem, message_decrypt, message_encrypt, process_prekey_bundle, sealed_sender_decrypt,
+    sealed_sender_encrypt, CiphertextMessage, DeviceId, Fingerprint, GenericSignedPreKey as _,
+    IdentityKeyPair, IdentityKeyStore, InMemIdentityKeyStore, InMemKyberPreKeyStore,
+    InMemPreKeyStore, InMemSessionStore, InMemSignalProtocolStore, InMemSignedPreKeyStore, KeyPair,
+    KyberPreKeyRecord, KyberPreKeyStore, PreKeyBundle, PreKeyRecord, PreKeyStore, ProtocolAddress,
+    PublicKey, SenderCertificate, SessionStore, SignalProtocolError, SignedPreKeyRecord,
+    SignedPreKeyStore, Timestamp,
 };
 
 /// Zugriff auf die fünf Teil-Ablagen des Signal-Protokolls.
@@ -120,6 +121,17 @@ fn now_millis() -> u64 {
 fn parse_device_id(device_id: u8) -> Result<DeviceId, SignalProtocolError> {
     DeviceId::new(device_id)
         .map_err(|_| SignalProtocolError::InvalidArgument("device_id muss > 0 sein".to_string()))
+}
+
+/// Eine geöffnete Sealed-Sender-Hülle: Der Absender steht erst nach dem
+/// Entschlüsseln fest, weil sein Zertifikat mitverschlüsselt in der Hülle
+/// liegt (der Server sieht ihn nie).
+pub struct UnsealedMessage {
+    /// Absender-Handle aus dem geprüften Zertifikat.
+    pub sender: String,
+    /// Protokoll-Gerätenummer des Absenders (ProtocolAddress-Teil).
+    pub sender_device_id: u32,
+    pub plaintext: Vec<u8>,
 }
 
 impl Device {
@@ -384,6 +396,70 @@ impl<S: ProtocolStoreParts> Device<S> {
             &mut rng,
         )
         .await
+    }
+
+    /// Versiegelt eine Nachricht als Sealed-Sender-Hülle: Die Hülle trägt
+    /// keinen Absender im Klartext, das Absender-Zertifikat (vom
+    /// identity-Dienst ausgestellt, `sealed-cert`) liegt mitverschlüsselt
+    /// darin. Voraussetzung ist eine bestehende Sitzung zum Ziel
+    /// (`establish_session`); die Konstruktion selbst kommt unverändert aus
+    /// libsignal (`sealed_sender_encrypt`), kein Eigenbau.
+    pub async fn seal_message(
+        &mut self,
+        to: &ProtocolAddress,
+        sender_certificate: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, SignalProtocolError> {
+        let certificate = SenderCertificate::deserialize(sender_certificate)?;
+        let mut rng = rand::rng();
+        let (sessions, identities, _, _, _) = self.store.parts();
+        sealed_sender_encrypt(
+            to,
+            &certificate,
+            plaintext,
+            sessions,
+            identities,
+            now(),
+            &mut rng,
+        )
+        .await
+    }
+
+    /// Öffnet eine Sealed-Sender-Hülle. Erst beim Entschlüsseln stellt
+    /// sich der Absender heraus; libsignal prüft dabei die
+    /// Zertifikatskette gegen den `trust_root` (33 Bytes, öffentlicher
+    /// Teil) und den Ablauf des Zertifikats. Eine Hülle mit ungültigem
+    /// oder abgelaufenem Zertifikat scheitert hart, bevor irgendetwas
+    /// entschlüsselt wird.
+    pub async fn unseal_message(
+        &mut self,
+        trust_root: &[u8],
+        envelope: &[u8],
+    ) -> Result<UnsealedMessage, SignalProtocolError> {
+        let trust_root = PublicKey::deserialize(trust_root)?;
+        let local_uuid = self.address.name().to_string();
+        let local_device_id = self.address.device_id();
+        let timestamp = Timestamp::from_epoch_millis(now_millis());
+        let (sessions, identities, prekeys, signed_prekeys, kyber_prekeys) = self.store.parts();
+        let result = sealed_sender_decrypt(
+            envelope,
+            &trust_root,
+            timestamp,
+            None,
+            local_uuid,
+            local_device_id,
+            identities,
+            sessions,
+            prekeys,
+            signed_prekeys,
+            kyber_prekeys,
+        )
+        .await?;
+        Ok(UnsealedMessage {
+            sender: result.sender_uuid.clone(),
+            sender_device_id: result.device_id.into(),
+            plaintext: result.message,
+        })
     }
 
     /// Entschlüsselt eine eingehende Nachricht; PreKey-Nachrichten

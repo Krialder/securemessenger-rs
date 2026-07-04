@@ -18,6 +18,14 @@
 FROM rust@sha256:31ee7fc65186be7e0e0ccb3f2ca305f14e4739e7642a1ae65753aa5d7b874523 AS builder
 ARG SERVICE=identity
 WORKDIR /build
+# protoc: identity zieht ueber crates/sealed-cert libsignal herein, dessen
+# Build-Skript die Protobuf-Schemas kompiliert. [ANNAHME: Distro-protoc aus
+# bookworm; die Paketversion ist nicht gepinnt und schwaecht die
+# Eingabestabilitaet minimal, ein digest-gepinntes protoc-Binary folgt mit
+# der BT-Etappe.]
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends protobuf-compiler \
+ && rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN cargo build --release --locked -p "${SERVICE}" \
  && cp "target/release/${SERVICE}" /build/service-bin

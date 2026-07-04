@@ -98,6 +98,56 @@ impl IdentityClient {
         Ok(info.difficulty)
     }
 
+    /// `GET /sealed-sender`: der öffentliche Trust Root der
+    /// Sealed-Sender-Zertifikatskette (33 Bytes), `None` wenn der Dienst
+    /// keine Zertifikate ausstellt (Route existiert dann nicht). Wer dem
+    /// Server diesen Anker nicht abnehmen will, verankert ihn lokal; das
+    /// ist dasselbe Bootstrapping-Problem wie beim KT-Signaturschlüssel.
+    pub async fn sealed_sender_trust_root(&self) -> Result<Option<Vec<u8>>, ClientError> {
+        let response = self
+            .http
+            .get(self.url("/sealed-sender"))
+            .send()
+            .await
+            .map_err(transport)?;
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let info: SealedSenderInfo = parse_json(response).await?;
+        use base64::Engine as _;
+        let trust_root = base64::engine::general_purpose::STANDARD
+            .decode(&info.trust_root)
+            .map_err(|_| ClientError::Protocol("Trust Root ist kein Base64".to_string()))?;
+        Ok(Some(trust_root))
+    }
+
+    /// `GET /sender-certificate`: ein kurzlebiges Absender-Zertifikat für
+    /// das eigene Gerät (Bearer). Die Bytes gehen unverändert an
+    /// `Device::seal_message`; `expires_at_millis` sagt dem Client, wann
+    /// er neu holen muss.
+    pub async fn sender_certificate(
+        &self,
+        access_token: &str,
+        protocol_device_id: u32,
+    ) -> Result<SenderCertificate, ClientError> {
+        let response = self
+            .http
+            .get(self.url(&format!("/sender-certificate?device={protocol_device_id}")))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(transport)?;
+        let raw: SenderCertificateJson = parse_json(response).await?;
+        use base64::Engine as _;
+        let certificate = base64::engine::general_purpose::STANDARD
+            .decode(&raw.certificate)
+            .map_err(|_| ClientError::Protocol("Zertifikat ist kein Base64".to_string()))?;
+        Ok(SenderCertificate {
+            certificate,
+            expires_at_millis: raw.expires_at_millis,
+        })
+    }
+
     /// `POST /accounts`: legt Konto und erstes Gerät an. Erzeugt die
     /// öffentlichen Schlüssel und das signierte Geräte-Credential aus den
     /// übergebenen Schlüsselpaaren. Verlangt der Dienst einen Proof-of-Work
@@ -238,6 +288,25 @@ struct RegisterRequest<'a> {
 #[derive(Deserialize)]
 struct PowInfo {
     difficulty: u32,
+}
+
+#[derive(Deserialize)]
+struct SealedSenderInfo {
+    trust_root: String,
+}
+
+#[derive(Deserialize)]
+struct SenderCertificateJson {
+    certificate: String,
+    expires_at_millis: u64,
+}
+
+/// Ein Absender-Zertifikat samt Ablauf, wie es der Dienst ausstellt.
+/// Die Bytes sind das serialisierte libsignal-`SenderCertificate`.
+#[derive(Debug, Clone)]
+pub struct SenderCertificate {
+    pub certificate: Vec<u8>,
+    pub expires_at_millis: u64,
 }
 
 /// Löst den Proof-of-Work fürs Registrieren. Läuft inline (die Bibliothek

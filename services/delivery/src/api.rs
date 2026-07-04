@@ -55,6 +55,11 @@ const MAX_ACK_BATCH: usize = 500;
 const WS_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Obergrenze je interner Event-Zustellung (Geräte eines Kontos plus Luft).
 const MAX_INTERNAL_DEVICES: usize = 500;
+/// Sealed-Sender-Annahmen je Empfänger-Handle und Minute: die Route ist
+/// anonym, also bremst statt eines Tokens der Empfänger-Posteingang.
+/// [ANNAHME: 60/min; genug für lebhafte Chats über mehrere Geräte, zu
+/// wenig für eine Flutung.]
+const SEALED_RATE_LIMIT: u32 = 60;
 
 /// Wer ist gerade verbunden? Geräte-ID auf Anzahl offener Sockets
 /// (ein Gerät kann kurzzeitig doppelt verbunden sein, etwa beim
@@ -72,6 +77,8 @@ pub struct AppState {
     presence: PresenceRegistry,
     /// SHA-256-Digest des Shared Secrets; None = interne Routen aus.
     internal_token_hash: Option<String>,
+    /// Rate-Limits der anonymen Pfade (Sealed-Sender-Annahme).
+    limiter: Arc<common::rate::RateLimiter>,
 }
 
 impl AppState {
@@ -86,6 +93,7 @@ impl AppState {
             hub: RealtimeHub::new(),
             presence: Arc::new(Mutex::new(HashMap::new())),
             internal_token_hash: None,
+            limiter: Arc::new(common::rate::RateLimiter::default()),
         }
     }
 
@@ -116,6 +124,7 @@ pub fn app(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/", get(|| async { "SecureMessenger delivery service" }))
         .route("/messages", get(fetch).post(submit))
+        .route("/sealed", post(submit_sealed))
         .route("/messages/ack", post(acknowledge))
         .route("/reports", post(report_message))
         .route("/blocks", get(list_blocks).post(add_block))
@@ -267,6 +276,41 @@ async fn submit(
         Ok(None) => return invalid_token(),
         Err(()) => return internal(),
     };
+    accept_envelopes(&st, &req, Some(&sender)).await
+}
+
+/// `POST /sealed`: nimmt Sealed-Sender-Hüllen an, absichtlich ohne
+/// Authentifizierung. Ein Bearer-Token würde den Absender gegenüber dem
+/// Dienst identifizieren und damit genau das zerstören, was Sealed Sender
+/// herstellt; die Absender-Echtheit prüft der Empfänger über die
+/// Zertifikatskette in der Hülle (crates/sealed-cert). Gegen Flutung
+/// bremst ein Rate-Limit je Empfänger; die Blockliste kann hier nicht
+/// serverseitig greifen (der Dienst kennt den Absender nicht), sie wirkt
+/// beim Empfänger nach dem Entsiegeln.
+///
+/// [ANNAHME: Rate-Limit je Empfänger-Handle statt Signals Delivery-Tokens
+/// (aus dem Profilschlüssel abgeleitete Empfangs-Berechtigungen). Die
+/// Tokens sind die nächste Stufe und ersetzen dann nur diese Bremse,
+/// nicht den Annahme-Pfad.]
+async fn submit_sealed(State(st): State<AppState>, Json(req): Json<SubmitRequest>) -> Response {
+    let mut seen = std::collections::HashSet::new();
+    for envelope in &req.envelopes {
+        if seen.insert(envelope.recipient.clone()) {
+            if let Err(retry_after) = st
+                .limiter
+                .check(&format!("sealed:{}", envelope.recipient), SEALED_RATE_LIMIT)
+            {
+                return common::rate::too_many_requests(retry_after);
+            }
+        }
+    }
+    accept_envelopes(&st, &req, None).await
+}
+
+/// Der gemeinsame Annahme-Kern von `/messages` und `/sealed`: validieren,
+/// Zielgeräte auflösen, Blockliste anwenden (nur wenn der Absender bekannt
+/// ist), ablegen, Hinweise auslösen.
+async fn accept_envelopes(st: &AppState, req: &SubmitRequest, sender: Option<&str>) -> Response {
     if req.envelopes.is_empty() {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -315,15 +359,20 @@ async fn submit(
     // Blocklisten je Empfänger einmal abfragen: hat ein Empfänger den
     // Absender blockiert, werden seine Hüllen still verworfen. Der Absender
     // erfährt das nicht (die Hüllen zählen als angenommen), sonst wäre die
-    // Blockliste über die Antwort auslesbar.
+    // Blockliste über die Antwort auslesbar. Auf dem Sealed-Pfad gibt es
+    // keinen bekannten Absender, dort blockt der Empfänger nach dem
+    // Entsiegeln.
     let mut blocked_recipients = std::collections::HashMap::new();
     for recipient in accounts.keys() {
-        let blocked = match st.store.is_blocked(recipient, &sender).await {
-            Ok(blocked) => blocked,
-            Err(error) => {
-                tracing::error!(%error, "Blocklisten-Abfrage fehlgeschlagen");
-                return internal();
-            }
+        let blocked = match sender {
+            Some(sender) => match st.store.is_blocked(recipient, sender).await {
+                Ok(blocked) => blocked,
+                Err(error) => {
+                    tracing::error!(%error, "Blocklisten-Abfrage fehlgeschlagen");
+                    return internal();
+                }
+            },
+            None => false,
         };
         blocked_recipients.insert(recipient.clone(), blocked);
     }

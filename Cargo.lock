@@ -531,6 +531,7 @@ dependencies = [
  "pow",
  "rand 0.9.4",
  "reqwest",
+ "sealed-cert",
  "serde",
  "serde_json",
  "tokio",
@@ -549,6 +550,7 @@ dependencies = [
  "openmls_basic_credential",
  "openmls_rust_crypto",
  "rand 0.9.4",
+ "sealed-cert",
  "tokio",
 ]
 
@@ -1946,9 +1948,12 @@ dependencies = [
  "common",
  "ed25519-dalek",
  "http-body-util",
+ "libsignal-protocol",
  "oprf",
  "pow",
+ "rand 0.9.4",
  "reqwest",
+ "sealed-cert",
  "serde",
  "serde_json",
  "sha2",
@@ -4046,6 +4051,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sealed-cert"
+version = "0.1.0"
+dependencies = [
+ "libsignal-protocol",
+ "rand 0.9.4",
+]
+
+[[package]]
 name = "sec1"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4373,6 +4386,7 @@ dependencies = [
  "futures-util",
  "identity",
  "rand 0.9.4",
+ "sealed-cert",
  "serde",
  "serde_json",
  "tokio",

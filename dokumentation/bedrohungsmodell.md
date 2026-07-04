@@ -38,7 +38,7 @@ Die betrachteten Flüsse, alle über TLS und die meisten zusätzlich Ende-zu-End
 - **Spoofing:** Als fremdes Gerät zustellen lassen oder abholen. Gegenmaßnahme: Empfänger werden über identity zu Konto und Gerätemenge aufgelöst, jede Hülle adressiert genau ein gültiges Gerät; Abholen und Ack laufen über das eigene Bearer-Token.
 - **Tampering:** Hüllen verändern oder umordnen. Gegenmaßnahme: Hüllen sind opake, E2E-verschlüsselte Blobs; die Eingangsreihenfolge hält eine monotone Sequenz (nicht der rundungsanfällige Zeitstempel). Gruppen-Commits serialisiert der Dienst über eine fortlaufende Epoche, konkurrierende Commits gegen dieselbe Epoche werden abgewiesen (409).
 - **Repudiation:** Missbrauch leugnen. Gegenmaßnahme: Message Franking; der Absender committet sich (`HMAC(K_f, Nachricht)`), der Server bewahrt das Commitment auf, der Empfänger deckt es beim Melden auf, und der Server verifiziert, dass genau diese Nachricht so gesendet wurde. Eine Meldung lässt sich damit nicht fälschen.
-- **Information Disclosure:** Absender und Zeitpunkt. Restrisiko: Bis Sealed Sender ist der Absender über das Bearer-Token bekannt (flüchtig, wird nie gespeichert); der Zeitpunkt einer Zustellung ist sichtbar. Das Hüllen-Framing trägt den Absender noch im Klartext, genau diese Lücke schließt Sealed Sender. Der `expires_at`-Zeitpunkt einer Disappearing Message ist für den Server sichtbar (bewusster Tradeoff des Absenders).
+- **Information Disclosure:** Absender und Zeitpunkt. Gegenmaßnahme: Sealed Sender; die versiegelte Hülle trägt keinen Absender (er steckt mitverschlüsselt darin, geprüft über die Zertifikatskette aus `crates/sealed-cert`), und die Einreichung läuft ohne Token über `POST /sealed`. Restrisiko: Auf dem klassischen Pfad (`POST /messages`) ist der Absender über das Bearer-Token bekannt (flüchtig, nie gespeichert) und steht im `smenv.v1`-Framing; der Zeitpunkt einer Zustellung bleibt auf beiden Pfaden sichtbar, ebenso der `expires_at`-Zeitpunkt einer Disappearing Message (bewusster Tradeoff des Absenders).
 - **Denial of Service:** Posteingang fluten. Gegenmaßnahme: Batch- und Größenlimits je Aufruf; blockierte Absender werden still verworfen (empfängerseitige Kontrolle), ohne dass die Antwort die Blockliste verrät.
 - **Elevation of Privilege:** In fremde Gruppen einschreiben. Gegenmaßnahme: Gruppen-Nachrichten gehen nur an bekannte Mitglieds-Geräte; die kryptografische Mitgliedschaft prüft der Client selbst (der Server ist dafür nicht vertrauenswürdig, das ist die Haltung der MLS-DS-Spec).
 
@@ -56,7 +56,7 @@ Die betrachteten Flüsse, alle über TLS und die meisten zusätzlich Ende-zu-End
 ## LINDDUN je Datenfluss
 
 - **Linkability:** Lassen sich Aktionen desselben Nutzers verketten? Der Bündel- und Discovery-Abruf sind Bearer-authentifiziert, also serverseitig verkettbar. Discovery mildert die Handle-Preisgabe (OPRF), nicht die Verkettung des Abrufers. Restrisiko, das Sealed Sender und anonyme Credentials adressieren.
-- **Identifiability:** Wird ein Nutzer identifiziert, wo er anonym bleiben sollte? Beim Senden ja (Bearer bis Sealed Sender), beim Discovery-Ziel nein (OPRF). Der `franking_key` und der Klartext bleiben E2E; der Server lernt Inhalt erst durch eine Meldung des Empfängers.
+- **Identifiability:** Wird ein Nutzer identifiziert, wo er anonym bleiben sollte? Beim versiegelten Senden nein (`POST /sealed`, ohne Token, Absender nur in der verschlüsselten Hülle), auf dem klassischen Pfad ja (Bearer), beim Discovery-Ziel nein (OPRF). Der `franking_key` und der Klartext bleiben E2E; der Server lernt Inhalt erst durch eine Meldung des Empfängers.
 - **Non-repudiation (hier gewollt):** Message Franking schafft bewusst Nachweisbarkeit für Meldungen, ohne die E2E zu brechen; das ist die kontrollierte Ausnahme vom sonstigen Ziel der Abstreitbarkeit.
 - **Detectability:** Ist erkennbar, dass überhaupt kommuniziert wird? Der WebSocket-Hinweis trägt keinen Inhalt, aber Timing und Menge bleiben sichtbar (Verkehrsanalyse). Push-Metadaten sind bei Apple und Google sichtbar.
 - **Disclosure of Information:** Inhalts-Preisgabe. Verhindert durch E2E; der Server hält nur Chiffretext, bewiesen im Abnahmetest (Klartext-Suche in der Zustell-Datenbank liefert null Treffer).
@@ -67,7 +67,7 @@ Die betrachteten Flüsse, alle über TLS und die meisten zusätzlich Ende-zu-End
 
 | Risiko | Status | Adressiert durch |
 |--------|--------|------------------|
-| Absender-Metadaten beim Senden | offen | Sealed Sender (zkgroup), markierte Lücke |
+| Absender-Metadaten beim Senden | teilweise | Sealed Sender gebaut (Zertifikatskette, `POST /sealed` ohne Token); offen bleiben anonyme zkgroup-Credentials, Delivery-Tokens und der Web-Client-Pfad |
 | Split-View im KT | teilweise | Konsistenzprüfung lokal da; unabhängige Auditoren + Gossip offen (Betreiber) |
 | Verkehrsanalyse (Timing, Menge) | offen | Bewusst nicht gelöst; Padding/Cover-Traffic wäre eine eigene Etappe |
 | Push-Metadaten bei Apple/Google | offen | Push-Provider werden nicht vertraut; nur Inhalt bleibt draußen |

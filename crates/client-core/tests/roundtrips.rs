@@ -123,6 +123,80 @@ async fn pqxdh_session_and_double_ratchet_roundtrip() {
     );
 }
 
+/// Sealed Sender über die selbst ausgestellte Zertifikatskette: Alice
+/// versiegelt mit einem Zertifikat aus `sealed-cert`, Bob entsiegelt gegen
+/// den Trust Root und erfährt den Absender erst aus der geprüften Hülle.
+#[tokio::test]
+async fn sealed_sender_roundtrip_with_issued_certificate() {
+    let mut alice = Device::new("alice", 1, 31).unwrap();
+    let mut bob = Device::new("bob", 1, 32).unwrap();
+    let bundle = bob.publish_prekey_bundle().await.unwrap();
+    let bob_address = bob.address().clone();
+    alice
+        .establish_session(&bob_address, &bundle)
+        .await
+        .unwrap();
+
+    // Der "identity-Dienst" stellt Alices Zertifikat aus: gebunden an
+    // Handle, Gerätenummer und ihren registrierten Identitätsschlüssel.
+    let issuer = sealed_cert::Issuer::from_seed(&[42u8; 32]).unwrap();
+    let alice_identity = alice.identity_public().await.unwrap();
+    let far_future = 4_102_444_800_000u64; // Unix-Millisekunden, Jahr 2100
+    let certificate = issuer
+        .issue("alice", 1, &alice_identity, far_future)
+        .unwrap();
+
+    // Versiegeln und entsiegeln: der Absender steckt in der Hülle, nicht
+    // daneben; die Kette wird gegen den Trust Root geprüft.
+    let sealed = alice
+        .seal_message(&bob_address, &certificate, b"kein absender im klartext")
+        .await
+        .unwrap();
+    let unsealed = bob
+        .unseal_message(&issuer.trust_root_public(), &sealed)
+        .await
+        .unwrap();
+    assert_eq!(unsealed.sender, "alice");
+    assert_eq!(unsealed.sender_device_id, 1);
+    assert_eq!(unsealed.plaintext, b"kein absender im klartext");
+
+    // Die Hülle selbst enthält das Handle nirgends im Klartext: der
+    // Zustelldienst könnte den Absender nicht herauslesen.
+    let haystack = String::from_utf8_lossy(&sealed).into_owned();
+    assert!(
+        !haystack.contains("alice"),
+        "der Absender darf in der versiegelten Hülle nicht lesbar sein"
+    );
+
+    // Ein fremder Trust Root lehnt die Hülle ab: genau die Stelle, an der
+    // ein untergeschobener Aussteller auffliegt.
+    let foreign = sealed_cert::Issuer::from_seed(&[43u8; 32]).unwrap();
+    let sealed_again = alice
+        .seal_message(&bob_address, &certificate, b"zweiter versuch")
+        .await
+        .unwrap();
+    assert!(
+        bob.unseal_message(&foreign.trust_root_public(), &sealed_again)
+            .await
+            .is_err(),
+        "eine Hülle mit fremder Zertifikatskette muss scheitern"
+    );
+
+    // Ein abgelaufenes Zertifikat scheitert ebenfalls, noch vor der
+    // Entschlüsselung.
+    let expired = issuer.issue("alice", 1, &alice_identity, 1_000).unwrap();
+    let sealed_expired = alice
+        .seal_message(&bob_address, &expired, b"zu spaet")
+        .await
+        .unwrap();
+    assert!(
+        bob.unseal_message(&issuer.trust_root_public(), &sealed_expired)
+            .await
+            .is_err(),
+        "ein abgelaufenes Zertifikat darf nicht mehr entsiegeln"
+    );
+}
+
 #[test]
 fn mls_group_roundtrip_with_pinned_ciphersuite() {
     // Die Festlegung aus der Spec, als Zahl nachgeprüft.
