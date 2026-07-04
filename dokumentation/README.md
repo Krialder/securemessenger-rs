@@ -41,7 +41,7 @@ Diese Doku ist eine Übersicht plus die Specs, an denen so ein System steht oder
 | [offene-fragen.md](offene-fragen.md) | Was noch nicht entschieden ist |
 | [specs/](specs/) | Die ausgearbeiteten Specs |
 | [entscheidungen/](entscheidungen/) | Die ADRs |
-| [referenz/](referenz/) | Stil-Vorlage der anderen Projekte (AzubiOS-Lastenheft als PDF) |
+| [referenz/](referenz/) | Stil-Vorlage der anderen Projekte (AzubiOS-Lastenheft als PDF) und die [übertragbare Projekt-Guideline](referenz/claude-projekt-guideline.md) für neue Projekte mit Claude |
 
 ## Stand
 
