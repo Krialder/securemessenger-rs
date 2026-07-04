@@ -18,6 +18,10 @@ Richtet die Umgebung ein, idempotent (schon Vorhandenes wird übersprungen):
 
 Am Ende steht eine Statusübersicht und die nächsten Build-Befehle. Die Installationen können einen UAC-Dialog auslösen, das ist beim ersten Lauf normal. Falls Rust frisch installiert wurde, ist `cargo` erst in einem neuen Terminal im PATH; die `PROTOC`-Variable gilt nur für die Setup-Sitzung, dauerhaft setzt sie `setx PROTOC "%LOCALAPPDATA%\protoc\bin\protoc.exe"`.
 
+## demo.ps1 und demo-stop.ps1
+
+Die Vorführ-Umgebung mit einem Befehl: `demo.ps1` startet die vier Kern-Dienste (identity 8080, directory 8081, delivery 8082, kt 8083) mit eigenen `demo_*`-Datenbanken und deterministischen Demo-Schlüsseln, dazu zwei Web-Clients über trunk (Alice http://localhost:3000, Bob http://localhost:3001). Jeder Prozess bekommt ein eigenes Fenster, weil die Logs Teil der Vorführung sind. `-Reset` löscht die Demo-Datenbanken vorher (frische Vorführung), `-NoWeb` lässt die Web-Clients weg. `demo-stop.ps1` beendet alles wieder: erst über die festgehaltenen Prozess-IDs, dann über die Fenstertitel (`sm-demo-*`), damit auch von Hand nachgestartete Prozesse fallen. Das Drehbuch der Vorführung steht in [DEMO.md](../DEMO.md).
+
 ## Danach bauen
 
 ```
