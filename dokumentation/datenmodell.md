@@ -152,14 +152,19 @@ CREATE TABLE franking_log (
 Der Server kann Gruppennachrichten nicht lesen, muss sie aber zustellen, und kennt dafür die Geräte einer Gruppe. Das ist der Metadaten-Punkt aus der [sicherheit.md](sicherheit.md).
 
 ```sql
+CREATE TABLE groups (
+    id    UUID PRIMARY KEY,          -- client-erzeugt
+    epoch BIGINT NOT NULL DEFAULT 0  -- fortlaufend, jeder Commit erhöht um 1
+);
+
 CREATE TABLE group_devices (
-    group_id  UUID NOT NULL,
-    device_id UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    group_id  UUID NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    device_id UUID NOT NULL,         -- logische Referenz auf identity, kein Fremdschlüssel
     PRIMARY KEY (group_id, device_id)
 );
 ```
 
-Der kryptografische Gruppenzustand lebt als TreeKEM-Zustand in den Clients. Der Server hält ihn nicht.
+Der kryptografische Gruppenzustand lebt als TreeKEM-Zustand in den Clients. Der Server hält ihn nicht. Er hält nur die fortlaufende `epoch` je Gruppe und die Mitglieds-Geräteliste. Die Epoche ist der Serialisierungspunkt für konkurrierende Commits (specs/mls-delivery-service.md): `POST /groups/{id}/commit` trägt die Epoche, gegen die der Client committet; passt sie nicht zur gespeicherten, gewinnt der first-wins-Commit und der Verlierer bekommt `409 stale_epoch` samt aktueller Epoche. Über echtes PostgreSQL läuft der Vergleich in einer Transaktion mit Zeilensperre (`SELECT ... FOR UPDATE`), damit zwei gleichzeitige Commits nicht beide gewinnen. `device_id` ist wie `recipient_id` eine logische Referenz auf den identity-Dienst ohne Fremdschlüssel (eigene Datenbank je Dienst); die Bindung zwischen dieser Liste und der kryptografischen MLS-Mitgliedschaft prüft der Client, nicht der Server (der ist dafür nicht vertrauenswürdig).
 
 ## Mandanten der Integrations-API
 

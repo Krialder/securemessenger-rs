@@ -8,7 +8,8 @@
 use std::sync::Arc;
 
 use delivery::domain::NewMessage;
-use delivery::pg::{connect_and_migrate, PgMessageStore};
+use delivery::groups::{GroupError, GroupStore};
+use delivery::pg::{connect_and_migrate, PgGroupStore, PgMessageStore};
 use delivery::store::MessageStore;
 use uuid::Uuid;
 
@@ -18,6 +19,15 @@ async fn store() -> Option<PgMessageStore> {
         return None;
     };
     Some(PgMessageStore::new(
+        connect_and_migrate(&url)
+            .await
+            .expect("Test-Datenbank erreichbar"),
+    ))
+}
+
+async fn group_store() -> Option<PgGroupStore> {
+    let url = std::env::var("TEST_DATABASE_URL_DELIVERY").ok()?;
+    Some(PgGroupStore::new(
         connect_and_migrate(&url)
             .await
             .expect("Test-Datenbank erreichbar"),
@@ -123,4 +133,58 @@ async fn franking_tag_roundtrips_as_absent_when_empty() {
     store.store_batch(vec![msg]).await.unwrap();
     let waiting = store.fetch(&device, 10).await.unwrap();
     assert_eq!(waiting[0].franking_tag, None);
+}
+
+/// Konkurrierende Commits gegen dieselbe Epoche über echtes PostgreSQL:
+/// die Zeilensperre serialisiert sie, genau einer gewinnt und erhöht die
+/// Epoche, alle anderen bekommen StaleEpoch. Das ist die Auflösungsregel
+/// aus specs/mls-delivery-service.md, gegen die echte Datenbank geprüft
+/// (In-Memory kann die Transaktions-Serialisierung nicht beweisen).
+#[tokio::test]
+async fn concurrent_commits_serialize_over_postgres() {
+    let Some(store) = group_store().await else {
+        return;
+    };
+    let store = Arc::new(store);
+    let group = Uuid::new_v4().to_string();
+    let a = Uuid::new_v4().to_string();
+    let b = Uuid::new_v4().to_string();
+    store
+        .create_group(&group, &[a.clone(), b.clone()])
+        .await
+        .unwrap();
+
+    // Vier Mitglieder committen gleichzeitig gegen Epoche 0.
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        let store = store.clone();
+        let group = group.clone();
+        let newcomer = Uuid::new_v4().to_string();
+        let members = vec![a.clone(), b.clone(), newcomer];
+        tasks.push(tokio::spawn(async move {
+            store.commit(&group, 0, &members).await
+        }));
+    }
+    let mut winners = 0;
+    let mut stale = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok(epoch) => {
+                winners += 1;
+                assert_eq!(epoch, 1, "der Gewinner hebt auf Epoche 1");
+            }
+            Err(GroupError::StaleEpoch { current }) => {
+                stale += 1;
+                assert_eq!(current, 1, "die Verlierer sehen die schon erhöhte Epoche");
+            }
+            Err(other) => panic!("unerwarteter Fehler: {other}"),
+        }
+    }
+    assert_eq!(winners, 1, "genau ein Commit gewinnt");
+    assert_eq!(stale, 3, "die übrigen drei sind veraltet");
+
+    // Die Gruppe steht auf Epoche 1 mit den drei Geräten des Gewinners.
+    let state = store.state(&group).await.unwrap();
+    assert_eq!(state.epoch, 1);
+    assert_eq!(state.devices.len(), 3);
 }

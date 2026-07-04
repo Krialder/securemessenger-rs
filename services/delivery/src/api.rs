@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::domain::NewMessage;
+use crate::groups::{GroupError, GroupStore, InMemoryGroupStore};
 use crate::hub::{HubEvent, RealtimeHub};
 use crate::store::MessageStore;
 use common::identity_client::{CallerIdentity, IdentityGateway};
@@ -65,6 +66,7 @@ type PresenceRegistry = Arc<Mutex<HashMap<String, u32>>>;
 #[derive(Clone)]
 pub struct AppState {
     store: Arc<dyn MessageStore>,
+    groups: Arc<dyn GroupStore>,
     identity: Arc<dyn IdentityGateway>,
     hub: RealtimeHub,
     presence: PresenceRegistry,
@@ -76,11 +78,21 @@ impl AppState {
     pub fn new(store: Arc<dyn MessageStore>, identity: Arc<dyn IdentityGateway>) -> Self {
         Self {
             store,
+            // Prozesslokale Gruppen-Ablage als Default (Tests, In-Memory-
+            // Betrieb); der PG-Betrieb steckt über with_group_store die
+            // persistente Umsetzung hinein.
+            groups: Arc::new(InMemoryGroupStore::default()),
             identity,
             hub: RealtimeHub::new(),
             presence: Arc::new(Mutex::new(HashMap::new())),
             internal_token_hash: None,
         }
+    }
+
+    /// Setzt die persistente Gruppen-Ablage (PG-Betrieb).
+    pub fn with_group_store(mut self, groups: Arc<dyn GroupStore>) -> Self {
+        self.groups = groups;
+        self
     }
 
     /// Schaltet die /internal-Routen frei (Shared Secret wie bei identity).
@@ -105,6 +117,9 @@ pub fn app(state: AppState) -> Router {
         .route("/", get(|| async { "SecureMessenger delivery service" }))
         .route("/messages", get(fetch).post(submit))
         .route("/messages/ack", post(acknowledge))
+        .route("/groups", post(create_group))
+        .route("/groups/{group_id}/commit", post(group_commit))
+        .route("/groups/{group_id}/messages", post(group_messages))
         .route("/ws", get(websocket));
     // Wie bei identity: ohne konfiguriertes Secret existieren die
     // internen Routen nicht (echtes 404 statt 401-Raterei).
@@ -430,6 +445,362 @@ async fn acknowledge(
             tracing::error!(%error, "Ack fehlgeschlagen");
             internal()
         }
+    }
+}
+
+// ---- Gruppen-Zustellung (MLS Delivery Service) --------------------------
+
+/// Eine Hülle im Gruppen-Fan-out: adressiert genau ein Mitglieds-Gerät.
+/// Kein `recipient`-Handle wie bei 1:1, die Zielgeräte kommen aus der
+/// Gruppen-Mitgliederliste.
+#[derive(Deserialize)]
+struct GroupEnvelopeJson {
+    id: String,
+    device_id: String,
+    envelope: String,
+}
+
+fn validate_group_envelope(e: &GroupEnvelopeJson) -> Result<(), String> {
+    if !canonical_uuid(&e.id) {
+        return Err("id muss eine UUID in kanonischer Form sein".to_string());
+    }
+    if !canonical_uuid(&e.device_id) {
+        return Err("device_id muss eine UUID in kanonischer Form sein".to_string());
+    }
+    match BASE64.decode(&e.envelope) {
+        Ok(raw) if raw.is_empty() => Err("envelope ist leer".to_string()),
+        Ok(raw) if raw.len() > MAX_ENVELOPE_BYTES => {
+            Err(format!("envelope überschreitet {MAX_ENVELOPE_BYTES} Bytes"))
+        }
+        Ok(_) => Ok(()),
+        Err(_) => Err("envelope ist kein gültiges Base64".to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateGroupRequest {
+    group_id: String,
+    /// Handles der Mitglieder; der Dienst löst sie über identity zu den
+    /// Zielgeräten auf (wie beim 1:1-Fan-out).
+    members: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct GroupStateResponse {
+    epoch: u64,
+    devices: usize,
+}
+
+/// Löst eine Handle-Liste zu den gültigen Geräte-IDs auf (ein
+/// identity-Aufruf je Handle). Fehler kommen als fertige Antwort zurück.
+async fn resolve_member_devices(
+    st: &AppState,
+    handles: &[String],
+) -> Result<Vec<String>, Response> {
+    let mut devices = Vec::new();
+    let mut seen_handle = std::collections::HashSet::new();
+    for handle in handles {
+        if !seen_handle.insert(handle.clone()) {
+            continue;
+        }
+        match st.identity.account_devices(handle).await {
+            Ok(Some(account)) => {
+                for device in account.devices {
+                    devices.push(device.id);
+                }
+            }
+            Ok(None) => {
+                return Err(api_error(
+                    StatusCode::NOT_FOUND,
+                    "unknown_member",
+                    format!("Konto '{handle}' ist unbekannt"),
+                ))
+            }
+            Err(error) => {
+                tracing::error!(%error, "Mitglieder-Auflösung fehlgeschlagen");
+                return Err(internal());
+            }
+        }
+    }
+    Ok(devices)
+}
+
+/// Legt die Hüllen ab und weckt die Zielgeräte; die gemeinsame
+/// Fan-out-Logik von Gruppen-Commit und -Nachrichten. `recipient_id` ist
+/// die Gruppen-ID: eine Gruppen-Hülle gehört der Gruppe, nicht einem
+/// Konto (fetch und ack laufen ohnehin nur über die Geräte-ID). Liefert
+/// das Ablage-Ergebnis oder eine fertige Fehlerantwort.
+async fn fanout(
+    st: &AppState,
+    group_id: &str,
+    envelopes: &[GroupEnvelopeJson],
+) -> Result<crate::domain::StoreOutcome, Response> {
+    let messages: Vec<NewMessage> = envelopes
+        .iter()
+        .map(|e| NewMessage {
+            id: e.id.clone(),
+            recipient_id: group_id.to_string(),
+            device_id: e.device_id.clone(),
+            envelope: e.envelope.clone(),
+            franking_tag: None,
+        })
+        .collect();
+    let devices: Vec<String> = messages.iter().map(|m| m.device_id.clone()).collect();
+    match st.store.store_batch(messages).await {
+        Ok(outcome) => {
+            let mut seen = std::collections::HashSet::new();
+            for device in devices {
+                if seen.insert(device.clone()) {
+                    st.hub.notify(&device);
+                }
+            }
+            Ok(outcome)
+        }
+        Err(error) => {
+            tracing::error!(%error, "Gruppen-Fan-out fehlgeschlagen");
+            Err(internal())
+        }
+    }
+}
+
+/// `POST /groups`: legt eine Gruppe an (client-erzeugte ID, Epoche 0) und
+/// löst die Mitglieder-Handles zu den Zielgeräten auf.
+async fn create_group(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateGroupRequest>,
+) -> Response {
+    match authenticate(&st, &headers).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return invalid_token(),
+        Err(()) => return internal(),
+    }
+    if !canonical_uuid(&req.group_id) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_group",
+            "group_id muss eine UUID in kanonischer Form sein",
+        );
+    }
+    if req.members.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "empty_group",
+            "Eine Gruppe braucht mindestens ein Mitglied",
+        );
+    }
+    let devices = match resolve_member_devices(&st, &req.members).await {
+        Ok(devices) => devices,
+        Err(response) => return response,
+    };
+    match st.groups.create_group(&req.group_id, &devices).await {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(GroupStateResponse {
+                epoch: 0,
+                devices: devices.len(),
+            }),
+        )
+            .into_response(),
+        Err(GroupError::GroupExists) => api_error(
+            StatusCode::CONFLICT,
+            "group_exists",
+            "Eine Gruppe mit dieser ID existiert bereits",
+        ),
+        Err(error) => {
+            tracing::error!(%error, "Gruppe anlegen fehlgeschlagen");
+            internal()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct CommitRequest {
+    /// Die Epoche, gegen die der Client committet; passt sie nicht zur
+    /// aktuellen, ist der Commit veraltet (409).
+    from_epoch: u64,
+    /// Die Mitglieder nach dem Commit (Beitritt/Austritt), als Handles.
+    members: Vec<String>,
+    /// Commit- und Welcome-Hüllen, eine je Zielgerät.
+    fanout: Vec<GroupEnvelopeJson>,
+}
+
+#[derive(Serialize)]
+struct CommitResponse {
+    epoch: u64,
+    accepted: u64,
+    duplicates: u64,
+}
+
+#[derive(Serialize)]
+struct StaleEpochResponse {
+    code: &'static str,
+    message: String,
+    current_epoch: u64,
+}
+
+/// `POST /groups/{id}/commit`: serialisiert einen Commit. Passt die
+/// Epoche, wird sie erhöht, die Mitgliederliste ersetzt und der Commit an
+/// die Geräte verteilt; sonst 409 mit der aktuellen Epoche (der Verlierer
+/// wendet neu an). Das ist die Auflösungsregel für konkurrierende Commits.
+async fn group_commit(
+    State(st): State<AppState>,
+    axum::extract::Path(group_id): axum::extract::Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<CommitRequest>,
+) -> Response {
+    match authenticate(&st, &headers).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return invalid_token(),
+        Err(()) => return internal(),
+    }
+    if !canonical_uuid(&group_id) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_group",
+            "group_id muss eine UUID in kanonischer Form sein",
+        );
+    }
+    if req.members.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "empty_group",
+            "Eine Gruppe braucht mindestens ein Mitglied",
+        );
+    }
+    if req.fanout.len() > MAX_BATCH {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "batch_too_large",
+            format!("Höchstens {MAX_BATCH} Hüllen je Commit"),
+        );
+    }
+    for envelope in &req.fanout {
+        if let Err(reason) = validate_group_envelope(envelope) {
+            return api_error(StatusCode::BAD_REQUEST, "invalid_envelope", reason);
+        }
+    }
+    let devices = match resolve_member_devices(&st, &req.members).await {
+        Ok(devices) => devices,
+        Err(response) => return response,
+    };
+    match st.groups.commit(&group_id, req.from_epoch, &devices).await {
+        Ok(epoch) => {
+            // Erst nach dem erfolgreichen Epochenwechsel verteilen: der
+            // Commit ist damit die serialisierende Instanz.
+            match fanout(&st, &group_id, &req.fanout).await {
+                Ok(outcome) => (
+                    StatusCode::OK,
+                    Json(CommitResponse {
+                        epoch,
+                        accepted: outcome.accepted,
+                        duplicates: outcome.duplicates,
+                    }),
+                )
+                    .into_response(),
+                Err(response) => response,
+            }
+        }
+        Err(GroupError::StaleEpoch { current }) => (
+            StatusCode::CONFLICT,
+            Json(StaleEpochResponse {
+                code: "stale_epoch",
+                message: format!("Commit veraltet, aktuelle Epoche {current}"),
+                current_epoch: current,
+            }),
+        )
+            .into_response(),
+        Err(GroupError::UnknownGroup) => api_error(
+            StatusCode::NOT_FOUND,
+            "unknown_group",
+            "Gruppe ist unbekannt",
+        ),
+        Err(error) => {
+            tracing::error!(%error, "Gruppen-Commit fehlgeschlagen");
+            internal()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct GroupMessagesRequest {
+    envelopes: Vec<GroupEnvelopeJson>,
+}
+
+/// `POST /groups/{id}/messages`: verteilt Anwendungsnachrichten an die
+/// Mitglieds-Geräte. Jede Ziel-Geräte-ID muss zur aktuellen Mitgliederliste
+/// gehören, sonst würde die Gruppe zum offenen Relais.
+async fn group_messages(
+    State(st): State<AppState>,
+    axum::extract::Path(group_id): axum::extract::Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<GroupMessagesRequest>,
+) -> Response {
+    match authenticate(&st, &headers).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return invalid_token(),
+        Err(()) => return internal(),
+    }
+    if !canonical_uuid(&group_id) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_group",
+            "group_id muss eine UUID in kanonischer Form sein",
+        );
+    }
+    if req.envelopes.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "empty_batch",
+            "Der Stapel enthält keine Hüllen",
+        );
+    }
+    if req.envelopes.len() > MAX_BATCH {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "batch_too_large",
+            format!("Höchstens {MAX_BATCH} Hüllen je Aufruf"),
+        );
+    }
+    for envelope in &req.envelopes {
+        if let Err(reason) = validate_group_envelope(envelope) {
+            return api_error(StatusCode::BAD_REQUEST, "invalid_envelope", reason);
+        }
+    }
+    let state = match st.groups.state(&group_id).await {
+        Ok(state) => state,
+        Err(GroupError::UnknownGroup) => {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "unknown_group",
+                "Gruppe ist unbekannt",
+            )
+        }
+        Err(error) => {
+            tracing::error!(%error, "Gruppenzustand nicht lesbar");
+            return internal();
+        }
+    };
+    let members: std::collections::HashSet<&String> = state.devices.iter().collect();
+    for envelope in &req.envelopes {
+        if !members.contains(&envelope.device_id) {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "unknown_device",
+                format!("Gerät {} ist kein Mitglied der Gruppe", envelope.device_id),
+            );
+        }
+    }
+    match fanout(&st, &group_id, &req.envelopes).await {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(SubmitResponse {
+                accepted: outcome.accepted,
+                duplicates: outcome.duplicates,
+            }),
+        )
+            .into_response(),
+        Err(response) => response,
     }
 }
 

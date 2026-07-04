@@ -18,6 +18,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::domain::{NewMessage, StoreOutcome, WaitingMessage};
+use crate::groups::{GroupError, GroupState, GroupStore};
 use crate::store::{MessageStore, StoreError};
 
 /// Verbindet und führt die eingebetteten Migrationen aus. Scheitert das,
@@ -249,5 +250,141 @@ impl MessageStore for PgMessageStore {
                 .await
                 .map_err(backend)?;
         Ok(row.get("waiting"))
+    }
+}
+
+/// PostgreSQL-Umsetzung der Gruppen-Ablage (groups.rs). Teilt den Pool mit
+/// der Nachrichten-Ablage; die Commit-Serialisierung läuft über eine
+/// Transaktion mit Zeilensperre (`FOR UPDATE`), was der In-Memory-Mutex
+/// prozesslokal leistet.
+pub struct PgGroupStore {
+    pool: PgPool,
+}
+
+impl PgGroupStore {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+fn group_backend(error: sqlx::Error) -> GroupError {
+    GroupError::Backend(error.to_string())
+}
+
+fn parse_group_uuid(value: &str) -> Result<Uuid, GroupError> {
+    Uuid::try_parse(value).map_err(|e| GroupError::Backend(format!("keine UUID: {e}")))
+}
+
+#[async_trait]
+impl GroupStore for PgGroupStore {
+    async fn create_group(&self, group_id: &str, devices: &[String]) -> Result<(), GroupError> {
+        let gid = parse_group_uuid(group_id)?;
+        let mut device_uuids = Vec::with_capacity(devices.len());
+        for d in devices {
+            device_uuids.push(parse_group_uuid(d)?);
+        }
+        let mut tx = self.pool.begin().await.map_err(group_backend)?;
+        let inserted = sqlx::query(
+            "INSERT INTO groups (id, epoch) VALUES ($1, 0) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(gid)
+        .execute(&mut *tx)
+        .await
+        .map_err(group_backend)?;
+        if inserted.rows_affected() == 0 {
+            return Err(GroupError::GroupExists);
+        }
+        // Duplikate in der Eingabe fängt der Primärschlüssel; explizit
+        // deduplizieren erspart den ON-CONFLICT-Lärm.
+        let mut seen = std::collections::HashSet::new();
+        for device in device_uuids {
+            if seen.insert(device) {
+                sqlx::query("INSERT INTO group_devices (group_id, device_id) VALUES ($1, $2)")
+                    .bind(gid)
+                    .bind(device)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(group_backend)?;
+            }
+        }
+        tx.commit().await.map_err(group_backend)?;
+        Ok(())
+    }
+
+    async fn state(&self, group_id: &str) -> Result<GroupState, GroupError> {
+        let gid = parse_group_uuid(group_id)?;
+        let epoch: Option<i64> = sqlx::query_scalar("SELECT epoch FROM groups WHERE id = $1")
+            .bind(gid)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(group_backend)?;
+        let Some(epoch) = epoch else {
+            return Err(GroupError::UnknownGroup);
+        };
+        let devices: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT device_id FROM group_devices WHERE group_id = $1 ORDER BY device_id",
+        )
+        .bind(gid)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(group_backend)?;
+        Ok(GroupState {
+            epoch: u64::try_from(epoch).unwrap_or(0),
+            devices: devices.into_iter().map(|d| d.to_string()).collect(),
+        })
+    }
+
+    async fn commit(
+        &self,
+        group_id: &str,
+        expected_epoch: u64,
+        new_devices: &[String],
+    ) -> Result<u64, GroupError> {
+        let gid = parse_group_uuid(group_id)?;
+        let mut device_uuids = Vec::with_capacity(new_devices.len());
+        for d in new_devices {
+            device_uuids.push(parse_group_uuid(d)?);
+        }
+        let mut tx = self.pool.begin().await.map_err(group_backend)?;
+        // Zeilensperre: konkurrierende Commits derselben Gruppe werden
+        // serialisiert, der zweite sieht die schon erhöhte Epoche.
+        let current: Option<i64> =
+            sqlx::query_scalar("SELECT epoch FROM groups WHERE id = $1 FOR UPDATE")
+                .bind(gid)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(group_backend)?;
+        let Some(current) = current else {
+            return Err(GroupError::UnknownGroup);
+        };
+        let current = u64::try_from(current).unwrap_or(0);
+        if current != expected_epoch {
+            return Err(GroupError::StaleEpoch { current });
+        }
+        let next = current + 1;
+        sqlx::query("UPDATE groups SET epoch = $2 WHERE id = $1")
+            .bind(gid)
+            .bind(i64::try_from(next).unwrap_or(i64::MAX))
+            .execute(&mut *tx)
+            .await
+            .map_err(group_backend)?;
+        sqlx::query("DELETE FROM group_devices WHERE group_id = $1")
+            .bind(gid)
+            .execute(&mut *tx)
+            .await
+            .map_err(group_backend)?;
+        let mut seen = std::collections::HashSet::new();
+        for device in device_uuids {
+            if seen.insert(device) {
+                sqlx::query("INSERT INTO group_devices (group_id, device_id) VALUES ($1, $2)")
+                    .bind(gid)
+                    .bind(device)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(group_backend)?;
+            }
+        }
+        tx.commit().await.map_err(group_backend)?;
+        Ok(next)
     }
 }

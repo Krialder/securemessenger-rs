@@ -32,7 +32,8 @@ async fn main() {
                 .await
                 .expect("PostgreSQL erreichbar und migrierbar");
             tracing::info!("Persistenz: PostgreSQL");
-            AppState::new(Arc::new(pg::PgMessageStore::new(pool)), identity)
+            AppState::new(Arc::new(pg::PgMessageStore::new(pool.clone())), identity)
+                .with_group_store(Arc::new(pg::PgGroupStore::new(pool)))
         }
         None => {
             tracing::warn!("DATABASE_URL nicht gesetzt, Nachrichten nur im Prozessspeicher");

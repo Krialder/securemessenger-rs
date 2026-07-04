@@ -599,3 +599,152 @@ async fn internal_routes_deliver_events_and_track_presence() {
     drop(socket);
     wait_for_presence(&app, DEV_BOB, false).await;
 }
+
+// ---- Gruppen-Zustellung -------------------------------------------------
+
+const GROUP_1: &str = "22222222-0000-4000-8000-000000000001";
+
+fn group_envelope(id: &str, device_id: &str) -> Value {
+    json!({ "id": id, "device_id": device_id, "envelope": "Y29tbWl0" })
+}
+
+#[tokio::test]
+async fn create_group_resolves_members_to_devices() {
+    let app = test_app();
+    // alice (1 Gerät) und bob (2 Geräte) ergeben drei Zielgeräte.
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/groups",
+        Some(json!({ "group_id": GROUP_1, "members": ["alice", "bob"] })),
+        Some("token-alice"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["epoch"], 0);
+    assert_eq!(body["devices"], 3);
+
+    // Dieselbe ID zweimal ist ein erkennbarer Konflikt, kein Überschreiber.
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/groups",
+        Some(json!({ "group_id": GROUP_1, "members": ["alice"] })),
+        Some("token-alice"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["code"], "group_exists");
+}
+
+#[tokio::test]
+async fn group_message_reaches_only_members() {
+    let app = test_app();
+    send(
+        &app,
+        "POST",
+        "/groups",
+        Some(json!({ "group_id": GROUP_1, "members": ["alice", "bob"] })),
+        Some("token-alice"),
+    )
+    .await;
+
+    // Nachricht an ein Mitglieds-Gerät: angenommen, danach abholbar.
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/groups/{GROUP_1}/messages"),
+        Some(json!({ "envelopes": [group_envelope(ENV_1, DEV_BOB)] })),
+        Some("token-alice"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["accepted"], 1);
+    let (_, fetched) = send(&app, "GET", "/messages", None, Some("token-bob")).await;
+    assert_eq!(fetched["messages"].as_array().unwrap().len(), 1);
+
+    // Ein fremdes Gerät ist kein Mitglied: die Gruppe wird nicht zum Relais.
+    let outsider = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/groups/{GROUP_1}/messages"),
+        Some(json!({ "envelopes": [group_envelope(ENV_2, outsider)] })),
+        Some("token-alice"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "unknown_device");
+}
+
+#[tokio::test]
+async fn commit_serializes_and_rejects_stale_epoch() {
+    let app = test_app();
+    send(
+        &app,
+        "POST",
+        "/groups",
+        Some(json!({ "group_id": GROUP_1, "members": ["alice", "bob"] })),
+        Some("token-alice"),
+    )
+    .await;
+
+    // Erster Commit gegen Epoche 0 gewinnt und verteilt die Commit-Hülle.
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/groups/{GROUP_1}/commit"),
+        Some(json!({
+            "from_epoch": 0,
+            "members": ["alice", "bob"],
+            "fanout": [group_envelope(ENV_1, DEV_BOB), group_envelope(ENV_2, DEV_BOB_2)],
+        })),
+        Some("token-alice"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["epoch"], 1);
+    assert_eq!(body["accepted"], 2);
+
+    // Zweiter Commit gegen dieselbe (jetzt veraltete) Epoche 0: 409 mit
+    // der aktuellen Epoche, damit der Verlierer neu aufsetzen kann.
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/groups/{GROUP_1}/commit"),
+        Some(json!({
+            "from_epoch": 0,
+            "members": ["alice"],
+            "fanout": [group_envelope(ENV_3, DEV_ALICE)],
+        })),
+        Some("token-alice"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["code"], "stale_epoch");
+    assert_eq!(body["current_epoch"], 1);
+}
+
+#[tokio::test]
+async fn group_routes_require_authentication() {
+    let app = test_app();
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/groups",
+        Some(json!({ "group_id": GROUP_1, "members": ["alice"] })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/groups/{GROUP_1}/messages"),
+        Some(json!({ "envelopes": [group_envelope(ENV_1, DEV_BOB)] })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}

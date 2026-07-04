@@ -205,6 +205,9 @@ Der Dienst kennt keine Passwörter und keine Sessions: Bearer-Tokens prüft er �
 | `POST /messages` | verschlüsselte Hüllen einreichen, Fan-out an alle Geräte des Empfängers; idempotent über client-erzeugte Hüllen-IDs; 200 mit `accepted`/`duplicates`, 400, 401, 404 |
 | `GET /messages` | wartende Hüllen des eigenen Geräts abholen (bis 100, Eingangsreihenfolge); entfernt nichts; 200, 401 |
 | `POST /messages/ack` | abgeholte Hüllen bestätigen und löschen; idempotent; 200 mit `removed`, 400, 401 |
+| `POST /groups` | Gruppe anlegen (client-erzeugte UUID, Mitglieder als Handles, aufgelöst zu Zielgeräten); 201 mit `epoch`/`devices`, 400, 401, 409 |
+| `POST /groups/{id}/commit` | Commit serialisieren: passt `from_epoch`, Epoche +1, Mitgliederliste ersetzt, Fan-out; 200 mit `epoch`, 409 `stale_epoch` mit `current_epoch`, 400, 401, 404 |
+| `POST /groups/{id}/messages` | Anwendungsnachricht an die Mitglieds-Geräte fächern; nur bekannte Mitglieder; 200 mit `accepted`/`duplicates`, 400, 401, 404 |
 | `GET /ws` | WebSocket für Echtzeit-Hinweise; erster Frame `{"token":"..."}` binnen 10 s, danach `{"event":"message.waiting"}`-Hinweise und `integration.notification`-Events; Close 4401 bei Auth-Fehlern, 1011 bei internen Fehlern |
 | `POST /internal/events` | Dienst-zu-Dienst (integrations): Event an verbundene Geräte verteilen; nur mit `INTERNAL_TOKEN` |
 | `POST /internal/presence/query` | Dienst-zu-Dienst: welche Geräte sind gerade verbunden (Grundlage von F080) |

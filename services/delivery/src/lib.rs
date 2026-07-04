@@ -10,6 +10,7 @@
 
 pub mod api;
 pub mod domain;
+pub mod groups;
 pub mod hub;
 pub mod pg;
 pub mod store;
