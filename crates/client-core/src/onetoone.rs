@@ -325,6 +325,23 @@ impl<S: ProtocolStoreParts> Device<S> {
         )
     }
 
+    /// Der gespeicherte Identitätsschlüssel eines Kontakt-Geräts (serialisiert,
+    /// 33 Byte mit Typ-Präfix), falls schon eine Sitzung damit bestand.
+    /// `None` bei Erstkontakt (Trust-on-first-use). Grundlage der Warnung
+    /// bei Schlüsselwechsel: ändert ein Kontakt seinen Geräteschlüssel,
+    /// unterscheidet sich der Wert aus dem frisch geholten Bündel vom hier
+    /// gespeicherten (specs/key-transparency.md, sichtbare Warnung).
+    pub async fn stored_identity(
+        &mut self,
+        remote: &ProtocolAddress,
+    ) -> Result<Option<Vec<u8>>, SignalProtocolError> {
+        let (_, identities, _, _, _) = self.store.parts();
+        Ok(identities
+            .get_identity(remote)
+            .await?
+            .map(|key| key.serialize().into_vec()))
+    }
+
     /// Baut die ausgehende Sitzung zu einem fremden Gerät aus dessen
     /// Prekey-Bündel auf (PQXDH; libsignal verifiziert die Signaturen
     /// und lehnt reine X3DH-Bündel ab).

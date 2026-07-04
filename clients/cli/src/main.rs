@@ -94,6 +94,7 @@ async fn run() -> Result<(), String> {
         "listen" => listen(&args[1..]).await,
         "verify" => verify().await,
         "audit" => audit(&args[1..]).await,
+        "keycheck" => keycheck(&args[1..]).await,
         "report" => report(&args[1..]).await,
         "block" => block(&args[1..]).await,
         "unblock" => unblock(&args[1..]).await,
@@ -510,6 +511,66 @@ async fn listen(args: &[String]) -> Result<(), String> {
     Err("Verbindung beendet".to_string())
 }
 
+/// `sm keycheck <handle>`: holt die Bündel eines Kontakts frisch und
+/// vergleicht deren Geräteschlüssel mit den lokal gespeicherten. Ein
+/// geänderter Schlüssel wird deutlich gemeldet (specs/key-transparency.md,
+/// sichtbare Warnung bei Schlüsselwechsel); vorher unbekannte Geräte sind
+/// Erstkontakt (Trust-on-first-use).
+async fn keycheck(args: &[String]) -> Result<(), String> {
+    let [handle] = args else {
+        return Err("Aufruf: sm keycheck <handle>".to_string());
+    };
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    let (mut device, _storage) = open_device(&profile)?;
+
+    let bundles = DirectoryClient::new(directory_url())
+        .bundles(&token, handle)
+        .await
+        .map_err(|e| e.to_string())?;
+    if bundles.devices.is_empty() {
+        println!("'{handle}' hat keine gültigen Geräte.");
+        return Ok(());
+    }
+
+    let mut changed = false;
+    for bundle_json in &bundles.devices {
+        let (_bundle, protocol_device_id) =
+            bundle_from_directory(bundle_json).map_err(|e| e.to_string())?;
+        let address = ProtocolAddress::new(
+            handle.to_string(),
+            device_id_from_u32(protocol_device_id).map_err(|e| e.to_string())?,
+        );
+        let incoming = BASE64
+            .decode(&bundle_json.identity_key)
+            .map_err(|e| format!("Bündel-Schlüssel kein Base64: {e}"))?;
+        match device
+            .stored_identity(&address)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            None => println!(
+                "Gerät {}: Erstkontakt (noch keine Sitzung).",
+                bundle_json.device_id
+            ),
+            Some(stored) if stored == incoming => {
+                println!("Gerät {}: Schlüssel unverändert.", bundle_json.device_id)
+            }
+            Some(_) => {
+                changed = true;
+                println!(
+                    "Gerät {}: SCHLÜSSEL GEÄNDERT. Vor dem Weiterschreiben die Sicherheitsnummer neu abgleichen.",
+                    bundle_json.device_id
+                );
+            }
+        }
+    }
+    if changed {
+        return Err("Mindestens ein Geräteschlüssel hat sich geändert.".to_string());
+    }
+    Ok(())
+}
+
 /// `sm audit <from> <to>`: prüft als Gelegenheits-Auditor, ob das
 /// KT-Log zwischen zwei Epochen append-only ist (specs/key-transparency.md,
 /// Konsistenzbeweis). Braucht keine Anmeldung; die signierten Wurzeln und
@@ -676,6 +737,7 @@ fn print_usage() {
          \x20 listen [--once]                Hinweiskanal halten und bei Hinweisen abholen\n\
          \x20 verify                         eigenen KT-Eintrag pruefen (Selbstpruefung)\n\
          \x20 audit <von> <bis>              KT-Log-Konsistenz zwischen zwei Epochen pruefen\n\
+         \x20 keycheck <handle>              Geraeteschluessel eines Kontakts auf Aenderung pruefen\n\
          \x20 report <message_id>            empfangene Nachricht melden (Franking aufdecken)\n\
          \x20 block <handle>                 Absender blockieren\n\
          \x20 unblock <handle>               Blockierung aufheben\n\

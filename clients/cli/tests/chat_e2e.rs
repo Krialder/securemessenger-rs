@@ -154,6 +154,14 @@ async fn two_cli_users_chat_across_process_boundaries() {
         "Bob muss auch die Folge-Nachricht entschlüsseln, stdout war: {received}"
     );
 
+    // Schlüsselwechsel-Prüfung: Alice kennt Bobs Geräteschlüssel aus der
+    // Sitzung; ein frischer Bündel-Abruf ergibt denselben, also keine Warnung.
+    let keycheck = alice.run(&["keycheck", "bob"]);
+    assert!(
+        keycheck.contains("Schlüssel unverändert"),
+        "Bobs Schlüssel darf sich nicht geändert haben, stdout war: {keycheck}"
+    );
+
     // Aufräumen ist Komfort, kein Testinhalt.
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -104,6 +104,23 @@ async fn pqxdh_session_and_double_ratchet_roundtrip() {
         libsignal_protocol::DeviceId::new(1).unwrap(),
     );
     assert!(alice.safety_number(&stranger).await.unwrap().is_none());
+
+    // Schlüsselwechsel-Erkennung: der gespeicherte Identitätsschlüssel des
+    // Kontakts ist der aus der Sitzung; ein Erstkontakt hat keinen.
+    let stored = alice
+        .stored_identity(&bob_address)
+        .await
+        .unwrap()
+        .expect("Bobs Schlüssel liegt nach der Sitzung");
+    assert_eq!(
+        stored,
+        bob.identity_public().await.unwrap(),
+        "gespeichert ist genau Bobs Geräteschlüssel"
+    );
+    assert!(
+        alice.stored_identity(&stranger).await.unwrap().is_none(),
+        "ein unbekannter Kontakt hat keinen gespeicherten Schlüssel"
+    );
 }
 
 #[test]
