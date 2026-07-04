@@ -212,7 +212,7 @@ Der Dienst kennt keine Passwörter und keine Sessions: Bearer-Tokens prüft er �
 
 | Endpunkt | Zweck |
 |----------|-------|
-| `POST /messages` | verschlüsselte Hüllen einreichen, Fan-out an alle Geräte des Empfängers; idempotent über client-erzeugte Hüllen-IDs; 200 mit `accepted`/`duplicates`, 400, 401, 404 |
+| `POST /messages` | verschlüsselte Hüllen einreichen, Fan-out an alle Geräte des Empfängers; idempotent über client-erzeugte Hüllen-IDs; optional `franking_tag` (Meldbarkeit) und `expires_at` (Disappearing Messages); 200 mit `accepted`/`duplicates`, 400, 401, 404 |
 | `GET /messages` | wartende Hüllen des eigenen Geräts abholen (bis 100, Eingangsreihenfolge); entfernt nichts; 200, 401 |
 | `POST /messages/ack` | abgeholte Hüllen bestätigen und löschen; idempotent; 200 mit `removed`, 400, 401 |
 | `POST /groups` | Gruppe anlegen (client-erzeugte UUID, Mitglieder als Handles, aufgelöst zu Zielgeräten); 201 mit `epoch`/`devices`, 400, 401, 409 |

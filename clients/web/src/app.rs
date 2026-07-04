@@ -327,6 +327,8 @@ async fn send_message(core: &mut Core, peer: &str, text: &str) -> Result<(), Str
             device_id: target.server_device_id.clone(),
             envelope,
             franking_tag: Some(franking_tag.clone()),
+            // Disappearing-Messages-TTL folgt mit einem eigenen UI-Schnitt.
+            expires_at: None,
         });
     }
     DeliveryClient::new(delivery_url())

@@ -176,6 +176,7 @@ async fn two_users_exchange_e2ee_messages_over_real_services() {
                 device_id: alice.server_device_id.clone(),
                 envelope,
                 franking_tag: None,
+                expires_at: None,
             }],
         )
         .await
@@ -243,6 +244,7 @@ async fn two_users_exchange_e2ee_messages_over_real_services() {
                 device_id: bob.server_device_id.clone(),
                 envelope: reply_envelope,
                 franking_tag: None,
+                expires_at: None,
             }],
         )
         .await

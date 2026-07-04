@@ -35,6 +35,9 @@ pub struct OutgoingEnvelope {
     pub envelope: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub franking_tag: Option<String>,
+    /// Ablauf als Unix-Sekunden (Disappearing Messages); optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
 }
 
 /// Ergebnis der Annahme: angenommen plus als Duplikat erkannt (Retries

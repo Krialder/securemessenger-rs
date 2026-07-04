@@ -60,7 +60,7 @@ Baut auf Identität und Auth auf, macht den Kern zum Fundament für die übrigen
 ## Phase 5: Medien und Anrufe
 
 - [ ] Verschlüsselter Dateiversand über den Medien-Dienst
-- [ ] Disappearing Messages, Edits und Reactions, mit ihrer Wirkung auf Franking und Ratchet bedacht
+- [x] Disappearing Messages: server-seitiges Ablaufen unabgeholter Hüllen (`expires_at`, `sm send --ttl`); die client-seitige Löschung-nach-Lesen und Edits/Reactions (mit ihrer Wirkung auf Franking) bleiben offen
 - [ ] Anrufe als eigenes Subprojekt: SFrame, MLS-basiertes Group-Calling, DTLS-SRTP. Der MLS-Exporter ist im Krypto-Kern dafür reserviert.
 
 ## Phase 6: Härtung

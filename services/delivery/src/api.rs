@@ -205,6 +205,8 @@ struct EnvelopeJson {
     device_id: String,
     envelope: String,
     franking_tag: Option<String>,
+    /// Ablauf als Unix-Sekunden (Disappearing Messages); optional.
+    expires_at: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -351,6 +353,7 @@ async fn submit(
             device_id: envelope.device_id.clone(),
             envelope: envelope.envelope.clone(),
             franking_tag: envelope.franking_tag.clone(),
+            expires_at: envelope.expires_at,
         });
     }
 
@@ -750,6 +753,7 @@ async fn fanout(
             device_id: e.device_id.clone(),
             envelope: e.envelope.clone(),
             franking_tag: None,
+            expires_at: None,
         })
         .collect();
     let devices: Vec<String> = messages.iter().map(|m| m.device_id.clone()).collect();

@@ -247,13 +247,22 @@ async fn publish_keys() -> Result<(), String> {
     Ok(())
 }
 
-/// `sm send <handle> <text>`: baut bei Bedarf die Sitzung auf (Bündel-Abruf,
-/// PQXDH) und stellt die Ende-zu-Ende verschlüsselte Nachricht über die
-/// Zustellung an alle Geräte des Kontakts zu.
+/// `sm send <handle> <text> [--ttl <sekunden>]`: baut bei Bedarf die Sitzung
+/// auf (Bündel-Abruf, PQXDH) und stellt die Ende-zu-Ende verschlüsselte
+/// Nachricht über die Zustellung an alle Geräte des Kontakts zu. Mit `--ttl`
+/// verschwindet eine unabgeholte Hülle nach der Frist (Disappearing Messages).
 async fn send(args: &[String]) -> Result<(), String> {
-    let [recipient, text] = args else {
-        return Err("Aufruf: sm send <handle> <text>".to_string());
+    let (recipient, text, ttl) = match args {
+        [recipient, text] => (recipient, text, None),
+        [recipient, text, flag, seconds] if flag == "--ttl" => {
+            let ttl: u64 = seconds
+                .parse()
+                .map_err(|_| "--ttl braucht eine Zahl in Sekunden".to_string())?;
+            (recipient, text, Some(ttl))
+        }
+        _ => return Err("Aufruf: sm send <handle> <text> [--ttl <sekunden>]".to_string()),
     };
+    let expires_at = ttl.map(|seconds| now_unix() + seconds);
     let profile = load_profile()?;
     let token = access_token(&profile)?;
     let (mut device, storage) = open_device(&profile)?;
@@ -330,6 +339,7 @@ async fn send(args: &[String]) -> Result<(), String> {
             device_id: target.server_device_id.clone(),
             envelope,
             franking_tag: Some(franking_tag.clone()),
+            expires_at,
         });
     }
 
@@ -732,7 +742,7 @@ fn print_usage() {
          \x20 logout                         Session abmelden\n\
          \x20 whoami                         Profil anzeigen\n\
          \x20 publish-keys                   Prekey-Satz im Verzeichnis veröffentlichen\n\
-         \x20 send <handle> <text>           E2EE-Nachricht senden (baut Sitzung bei Bedarf auf)\n\
+         \x20 send <handle> <text> [--ttl s]  E2EE-Nachricht senden (--ttl: verschwindet nach s Sekunden)\n\
          \x20 recv                           wartende Nachrichten abholen und entschlüsseln\n\
          \x20 listen [--once]                Hinweiskanal halten und bei Hinweisen abholen\n\
          \x20 verify                         eigenen KT-Eintrag pruefen (Selbstpruefung)\n\

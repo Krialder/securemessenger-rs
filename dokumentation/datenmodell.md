@@ -117,6 +117,7 @@ CREATE TABLE messages (
     received_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     delivered_at  TIMESTAMPTZ,
     seq           BIGINT NOT NULL DEFAULT nextval('message_seq'),
+    expires_at    BIGINT,                -- Unix-Sekunden, NULL = kein Ablauf (Disappearing Messages)
     PRIMARY KEY (id, received_at)
 ) PARTITION BY RANGE (received_at);
 

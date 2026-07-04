@@ -154,9 +154,10 @@ impl MessageStore for PgMessageStore {
             // nicht der Zeitstempel: Mikrosekunden-Offsets in Fließkomma
             // kollidierten nach der to_timestamp-Rundung, und dann entschied
             // die zufällige UUID die Reihenfolge.
+            let expires_at = message.expires_at.and_then(|s| i64::try_from(s).ok());
             sqlx::query(
-                "INSERT INTO messages (id, recipient_id, device_id, envelope, franking_tag, received_at) \
-                 VALUES ($1, $2, $3, $4, $5, to_timestamp($6))",
+                "INSERT INTO messages (id, recipient_id, device_id, envelope, franking_tag, received_at, expires_at) \
+                 VALUES ($1, $2, $3, $4, $5, to_timestamp($6), $7)",
             )
             .bind(id)
             .bind(parse_uuid(&message.recipient_id, "Empfänger-ID")?)
@@ -164,6 +165,7 @@ impl MessageStore for PgMessageStore {
             .bind(&envelope)
             .bind(&franking)
             .bind(received_at)
+            .bind(expires_at)
             .execute(&mut *tx)
             .await
             .map_err(backend)?;
@@ -179,9 +181,13 @@ impl MessageStore for PgMessageStore {
             // seq ist die Eingangsreihenfolge (Migration 0002): global
             // monoton je Einreichung, ohne die Mikrosekunden-Kollisionen
             // des Zeitstempels, bei denen die zufällige UUID entschied.
+            // Abgelaufene Hüllen (expires_at in der Vergangenheit) sind
+            // verschwunden und werden nicht mehr ausgeliefert
+            // (Disappearing Messages).
             "SELECT id, envelope, franking_tag, \
                     extract(epoch FROM received_at)::bigint AS received_epoch \
              FROM messages WHERE device_id = $1 \
+               AND (expires_at IS NULL OR expires_at > extract(epoch FROM now())::bigint) \
              ORDER BY seq LIMIT $2",
         )
         .bind(device)
@@ -243,12 +249,14 @@ impl MessageStore for PgMessageStore {
 
     async fn has_waiting(&self, device_id: &str) -> Result<bool, StoreError> {
         let device = parse_uuid(device_id, "Geräte-ID")?;
-        let row =
-            sqlx::query("SELECT EXISTS(SELECT 1 FROM messages WHERE device_id = $1) AS waiting")
-                .bind(device)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(backend)?;
+        let row = sqlx::query(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE device_id = $1 \
+                AND (expires_at IS NULL OR expires_at > extract(epoch FROM now())::bigint)) AS waiting",
+        )
+        .bind(device)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(backend)?;
         Ok(row.get("waiting"))
     }
 

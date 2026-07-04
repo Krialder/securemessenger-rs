@@ -71,6 +71,7 @@ struct StoredEntry {
     envelope: String,
     franking_tag: Option<String>,
     received_at: u64,
+    expires_at: Option<u64>,
 }
 
 #[derive(Default)]
@@ -119,12 +120,14 @@ impl MessageStore for InMemoryMessageStore {
                     envelope: message.envelope,
                     franking_tag: message.franking_tag,
                     received_at,
+                    expires_at: message.expires_at,
                 });
         }
         Ok(outcome)
     }
 
     async fn fetch(&self, device_id: &str, limit: u32) -> Result<Vec<WaitingMessage>, StoreError> {
+        let now = now_unix();
         let inner = self.inner.lock().expect("Lock nicht vergiftet");
         Ok(inner
             .by_device
@@ -132,6 +135,9 @@ impl MessageStore for InMemoryMessageStore {
             .map(|entries| {
                 entries
                     .iter()
+                    // Abgelaufene Hüllen sind verschwunden: nicht mehr
+                    // ausliefern (Disappearing Messages).
+                    .filter(|e| e.expires_at.is_none_or(|exp| exp > now))
                     .take(limit as usize)
                     .map(|e| WaitingMessage {
                         id: e.id.clone(),
@@ -155,11 +161,13 @@ impl MessageStore for InMemoryMessageStore {
     }
 
     async fn has_waiting(&self, device_id: &str) -> Result<bool, StoreError> {
+        let now = now_unix();
         let inner = self.inner.lock().expect("Lock nicht vergiftet");
-        Ok(inner
-            .by_device
-            .get(device_id)
-            .is_some_and(|entries| !entries.is_empty()))
+        Ok(inner.by_device.get(device_id).is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|e| e.expires_at.is_none_or(|exp| exp > now))
+        }))
     }
 
     async fn store_franking(&self, message_id: &str, commitment: &[u8]) -> Result<(), StoreError> {
@@ -222,13 +230,53 @@ mod tests {
     use super::*;
 
     fn message(id: &str, device: &str) -> NewMessage {
+        message_expiring(id, device, None)
+    }
+
+    fn message_expiring(id: &str, device: &str, expires_at: Option<u64>) -> NewMessage {
+        NewMessage {
+            expires_at,
+            ..base_message(id, device)
+        }
+    }
+
+    fn base_message(id: &str, device: &str) -> NewMessage {
         NewMessage {
             id: id.to_string(),
             recipient_id: "00000000-0000-4000-8000-000000000001".to_string(),
             device_id: device.to_string(),
             envelope: "aHVlbGxl".to_string(),
             franking_tag: None,
+            expires_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn expired_messages_disappear() {
+        let store = InMemoryMessageStore::default();
+        store
+            .store_batch(vec![
+                message_expiring("past", "dev-1", Some(1)),
+                message_expiring("future", "dev-1", Some(4_102_444_800)),
+                message("permanent", "dev-1"),
+            ])
+            .await
+            .unwrap();
+
+        // Die abgelaufene Hülle wird nicht ausgeliefert, die anderen schon.
+        let waiting = store.fetch("dev-1", 100).await.unwrap();
+        let ids: Vec<&str> = waiting.iter().map(|m| m.id.as_str()).collect();
+        assert!(!ids.contains(&"past"), "abgelaufen = verschwunden");
+        assert!(ids.contains(&"future"));
+        assert!(ids.contains(&"permanent"));
+
+        // has_waiting zählt eine nur-abgelaufene Inbox als leer.
+        let store2 = InMemoryMessageStore::default();
+        store2
+            .store_batch(vec![message_expiring("past", "dev-2", Some(1))])
+            .await
+            .unwrap();
+        assert!(!store2.has_waiting("dev-2").await.unwrap());
     }
 
     #[tokio::test]

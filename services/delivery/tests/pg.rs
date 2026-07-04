@@ -41,6 +41,7 @@ fn message(device: &str) -> NewMessage {
         device_id: device.to_string(),
         envelope: "Y2hpZmZyZXRleHQ=".to_string(),
         franking_tag: Some("dGFn".to_string()),
+        expires_at: None,
     }
 }
 
@@ -133,6 +134,36 @@ async fn franking_tag_roundtrips_as_absent_when_empty() {
     store.store_batch(vec![msg]).await.unwrap();
     let waiting = store.fetch(&device, 10).await.unwrap();
     assert_eq!(waiting[0].franking_tag, None);
+}
+
+/// Disappearing Messages über echtes PostgreSQL: eine abgelaufene Hülle
+/// wird nicht mehr ausgeliefert, eine noch gültige schon.
+#[tokio::test]
+async fn expired_messages_disappear_over_postgres() {
+    let Some(store) = store().await else { return };
+    let device = Uuid::new_v4().to_string();
+    let mut past = message(&device);
+    past.expires_at = Some(1); // 1970, längst abgelaufen
+    let mut future = message(&device);
+    future.expires_at = Some(4_102_444_800); // ferne Zukunft
+    let permanent = message(&device);
+    let permanent_id = permanent.id.clone();
+    let future_id = future.id.clone();
+    let past_id = past.id.clone();
+    store
+        .store_batch(vec![past, future, permanent])
+        .await
+        .unwrap();
+
+    let waiting = store.fetch(&device, 100).await.unwrap();
+    let ids: Vec<&str> = waiting.iter().map(|m| m.id.as_str()).collect();
+    assert!(
+        !ids.contains(&past_id.as_str()),
+        "abgelaufen = verschwunden"
+    );
+    assert!(ids.contains(&future_id.as_str()));
+    assert!(ids.contains(&permanent_id.as_str()));
+    assert!(store.has_waiting(&device).await.unwrap());
 }
 
 /// Franking-Commitments und Blocklisten über echtes PostgreSQL: das

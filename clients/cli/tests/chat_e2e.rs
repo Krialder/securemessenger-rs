@@ -162,6 +162,16 @@ async fn two_cli_users_chat_across_process_boundaries() {
         "Bobs Schlüssel darf sich nicht geändert haben, stdout war: {keycheck}"
     );
 
+    // Disappearing Message mit großzügiger Frist: sie wird noch zugestellt
+    // (das Verschwinden nach Ablauf prüfen die Store-Tests). Der --ttl-Pfad
+    // fliesst also bis zur Zustellung durch.
+    alice.run(&["send", "bob", "verschwindet spaeter", "--ttl", "3600"]);
+    let received = bob.run(&["recv"]);
+    assert!(
+        received.contains("[alice] verschwindet spaeter"),
+        "die befristete Nachricht muss vor Ablauf ankommen, stdout war: {received}"
+    );
+
     // Aufräumen ist Komfort, kein Testinhalt.
     let _ = std::fs::remove_dir_all(&dir);
 }

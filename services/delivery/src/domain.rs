@@ -14,6 +14,13 @@ pub struct NewMessage {
     pub envelope: String,
     /// Franking-Commitment, Base64. Leer bis zur Sealed-Sender-Etappe.
     pub franking_tag: Option<String>,
+    /// Ablauf als Unix-Sekunden (Disappearing Messages): Der Absender legt
+    /// fest, dass eine unabgeholte Hülle nach diesem Zeitpunkt verschwindet;
+    /// abgeholt wird sie dann nicht mehr. `None` = kein Ablauf. Der Server
+    /// sieht nur den Zeitpunkt, nie den Inhalt; die eigentliche
+    /// Vergänglichkeit auf dem Empfängergerät regelt der Client
+    /// (specs/sealed-sender-und-abuse.md "Disappearing Messages").
+    pub expires_at: Option<u64>,
 }
 
 /// Eine wartende Hülle beim Abholen. `received_at` in Unix-Sekunden.
