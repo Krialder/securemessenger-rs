@@ -4,7 +4,7 @@
 //! dass Sitzungsaufbau, Nachrichtenumlauf, Out-of-Order und Gruppen
 //! über unsere Wrapper funktionieren.
 
-use client_core::group::{GroupMember, CIPHERSUITE};
+use client_core::group::{GroupMember, GroupSession, CIPHERSUITE};
 use client_core::libsignal_protocol::{CiphertextMessage, SignalProtocolError};
 use client_core::onetoone::Device;
 use client_core::openmls::prelude::tls_codec::*;
@@ -183,4 +183,39 @@ fn mls_group_roundtrip_with_pinned_ciphersuite() {
         }
         _ => panic!("Anwendungsnachricht erwartet"),
     }
+}
+
+/// Die Byte-Ein-Byte-Aus-Schnittstelle `GroupSession`, wie sie der Client
+/// über den Zustelldienst nutzt: alle Blobs sind opak, nichts an der
+/// Schnittstelle setzt libsignal/OpenMLS-Typen voraus. Beweist einen
+/// Beitritt über KeyPackage plus Welcome und den Nachrichtenumlauf.
+#[test]
+fn group_session_byte_interface_roundtrip() {
+    // Bob erzeugt sein KeyPackage (die privaten Anteile bleiben in seiner
+    // Ablage); als Blob geht es später über das Verzeichnis.
+    let bob_member = GroupMember::new(b"bob").unwrap();
+    let bob_key_package = bob_member.key_package_blob().unwrap();
+
+    // Alice gründet die Gruppe und lädt Bob über den KeyPackage-Blob ein.
+    let mut alice = GroupSession::create(b"alice").unwrap();
+    assert_eq!(alice.member_count(), 1);
+    let outcome = alice.add_members(&[bob_key_package]).unwrap();
+    assert_eq!(alice.member_count(), 2);
+
+    // Bob tritt über den Welcome-Blob mit derselben Ablage bei.
+    let mut bob = GroupSession::join_group(bob_member, &outcome.welcome).unwrap();
+    assert_eq!(bob.member_count(), 2);
+    assert_eq!(alice.epoch(), bob.epoch(), "beide auf derselben Epoche");
+
+    // Anwendungsnachricht hin und zurück, nur über Blobs.
+    let ciphertext = alice.create_message(b"hallo gruppe").unwrap();
+    assert_eq!(
+        bob.process(&ciphertext).unwrap().as_deref(),
+        Some(b"hallo gruppe".as_slice())
+    );
+    let reply = bob.create_message(b"hallo zurueck").unwrap();
+    assert_eq!(
+        alice.process(&reply).unwrap().as_deref(),
+        Some(b"hallo zurueck".as_slice())
+    );
 }

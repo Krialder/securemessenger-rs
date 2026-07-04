@@ -62,7 +62,8 @@ async fn roundtrip_rotation_and_conflicts() {
         store.counts(&device).await.unwrap(),
         PoolCounts {
             one_time: 1,
-            pq_one_time: 1
+            pq_one_time: 1,
+            mls_key_package: 0,
         }
     );
 
@@ -129,4 +130,35 @@ async fn concurrent_bundle_calls_never_share_a_one_time_prekey() {
         PoolCounts::default(),
         "Pool ist leer"
     );
+}
+
+/// MLS-KeyPackages über echtes PostgreSQL: einzeln konsumiert (jedes nur
+/// einmal), getrennt vom PQXDH-Bündel und separat gezählt.
+#[tokio::test]
+async fn mls_key_packages_claim_over_postgres() {
+    let Some(store) = store().await else { return };
+    let device = Uuid::new_v4().to_string();
+    store
+        .upload(
+            &device,
+            vec![
+                upload(PrekeyKind::MlsKeyPackage),
+                upload(PrekeyKind::MlsKeyPackage),
+                upload(PrekeyKind::OneTime),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.counts(&device).await.unwrap().mls_key_package, 2);
+
+    // Der Bündel-Abruf lässt die KeyPackages unangetastet.
+    store.take_bundle(&device).await.unwrap();
+    assert_eq!(store.counts(&device).await.unwrap().mls_key_package, 2);
+
+    // Zwei Claims liefern zwei verschiedene Pakete, der dritte nichts.
+    let first = store.take_mls_key_package(&device).await.unwrap().unwrap();
+    let second = store.take_mls_key_package(&device).await.unwrap().unwrap();
+    assert_ne!(first.id, second.id);
+    assert!(store.take_mls_key_package(&device).await.unwrap().is_none());
+    assert_eq!(store.counts(&device).await.unwrap().mls_key_package, 0);
 }

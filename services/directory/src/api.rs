@@ -60,6 +60,7 @@ pub fn app(state: AppState) -> Router {
         .route("/", get(|| async { "SecureMessenger directory service" }))
         .route("/keys/prekeys", get(counts).post(upload))
         .route("/keys/{handle}", get(bundles))
+        .route("/keys/{handle}/mls", get(mls_key_packages))
         .layer(axum::middleware::from_fn(common::metrics::track))
         .merge(common::ops_router())
         .with_state(state)
@@ -145,12 +146,16 @@ struct UploadRequest {
     one_time_prekeys: Vec<PrekeyJson>,
     #[serde(default)]
     pq_one_time_prekeys: Vec<PrekeyJson>,
+    /// Nachschub für den MLS-KeyPackage-Pool (Gruppen-Beitritte).
+    #[serde(default)]
+    mls_key_packages: Vec<PrekeyJson>,
 }
 
 #[derive(Serialize)]
 struct CountsResponse {
     one_time: u64,
     pq_one_time: u64,
+    mls_key_package: u64,
 }
 
 /// Prüft einen Prekey aus dem Request: ID muss kanonische UUID sein
@@ -218,6 +223,15 @@ async fn upload(
             },
         });
     }
+    for p in req.mls_key_packages {
+        uploads.push(PrekeyUpload {
+            kind: PrekeyKind::MlsKeyPackage,
+            prekey: Prekey {
+                id: p.id,
+                key: p.key,
+            },
+        });
+    }
 
     if uploads.is_empty() {
         return api_error(
@@ -263,6 +277,7 @@ async fn upload(
             Json(CountsResponse {
                 one_time: counts.one_time,
                 pq_one_time: counts.pq_one_time,
+                mls_key_package: counts.mls_key_package,
             }),
         )
             .into_response(),
@@ -288,6 +303,7 @@ async fn counts(State(st): State<AppState>, headers: HeaderMap) -> Response {
             Json(CountsResponse {
                 one_time: counts.one_time,
                 pq_one_time: counts.pq_one_time,
+                mls_key_package: counts.mls_key_package,
             }),
         )
             .into_response(),
@@ -398,6 +414,81 @@ async fn bundles(
         Json(BundlesResponse {
             handle: account.handle,
             identity_key: account.identity_key,
+            devices,
+        }),
+    )
+        .into_response()
+}
+
+#[derive(Serialize)]
+struct MlsKeyPackageEntry {
+    device_id: String,
+    key_package: String,
+}
+
+#[derive(Serialize)]
+struct MlsKeyPackagesResponse {
+    handle: String,
+    devices: Vec<MlsKeyPackageEntry>,
+}
+
+/// `GET /keys/{handle}/mls`: konsumiert je gültigem Gerät ein
+/// MLS-KeyPackage, damit der Abrufer die Geräte in eine Gruppe einladen
+/// kann. Getrennt vom PQXDH-Bündel-Abruf, weil KeyPackages nur beim
+/// Gruppenbeitritt gebraucht werden. Geräte ohne freies KeyPackage
+/// fehlen in der Antwort (der Client lädt sie in dieser Runde nicht ein).
+/// Wie der Bündel-Abruf konsumiert er fremden Vorrat und ist deshalb
+/// pro Abrufer limitiert.
+async fn mls_key_packages(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+) -> Response {
+    let caller = match authenticate(&st, &headers).await {
+        Ok(Some(caller)) => caller,
+        Ok(None) => return invalid_token(),
+        Err(()) => return internal(),
+    };
+    if let Err(retry_after) = st.limiter.check(&caller.handle, BUNDLE_RATE_LIMIT) {
+        return common::rate::too_many_requests(retry_after);
+    }
+
+    let account = match st.identity.account_devices(&handle).await {
+        Ok(Some(account)) => account,
+        Ok(None) => {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "account_not_found",
+                "Konto ist unbekannt",
+            )
+        }
+        Err(error) => {
+            tracing::error!(%error, "Geräteabruf bei identity fehlgeschlagen");
+            return internal();
+        }
+    };
+
+    let mut devices = Vec::new();
+    for device in account.devices {
+        match st.store.take_mls_key_package(&device.id).await {
+            Ok(Some(prekey)) => devices.push(MlsKeyPackageEntry {
+                device_id: device.id,
+                key_package: prekey.key,
+            }),
+            // Kein freies Paket: das Gerät wird in dieser Runde nicht
+            // eingeladen, kein Fehler.
+            Ok(None) => {}
+            Err(StoreError::Backend(error)) => {
+                tracing::error!(%error, "KeyPackage-Abruf fehlgeschlagen");
+                return internal();
+            }
+            Err(_) => return internal(),
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(MlsKeyPackagesResponse {
+            handle: account.handle,
             devices,
         }),
     )

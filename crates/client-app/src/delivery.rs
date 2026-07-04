@@ -127,6 +127,112 @@ impl DeliveryClient {
     pub fn ws_url(&self) -> String {
         ws_url(&self.base_url)
     }
+
+    /// `POST /groups`: legt eine Gruppe an (Mitglieder als Handles, vom
+    /// Dienst zu Zielgeräten aufgelöst). Liefert die Anfangsepoche.
+    pub async fn create_group(
+        &self,
+        access_token: &str,
+        group_id: &str,
+        members: &[String],
+    ) -> Result<GroupCreated, ClientError> {
+        let response = self
+            .http
+            .post(format!("{}/groups", self.base_url))
+            .bearer_auth(access_token)
+            .json(&CreateGroupRequest { group_id, members })
+            .send()
+            .await
+            .map_err(transport)?;
+        parse_json(response).await
+    }
+
+    /// `POST /groups/{id}/commit`: reicht einen Commit gegen `from_epoch`
+    /// ein und verteilt die Commit-/Welcome-Hüllen. Ein veralteter Commit
+    /// kommt als `ClientError::Api` mit Status 409 und Code `stale_epoch`
+    /// zurück; der Aufrufer wendet dann gegen die neue Epoche neu an.
+    pub async fn group_commit(
+        &self,
+        access_token: &str,
+        group_id: &str,
+        from_epoch: u64,
+        members: &[String],
+        fanout: &[GroupOutgoing],
+    ) -> Result<GroupCommitOutcome, ClientError> {
+        let response = self
+            .http
+            .post(format!("{}/groups/{group_id}/commit", self.base_url))
+            .bearer_auth(access_token)
+            .json(&CommitRequest {
+                from_epoch,
+                members,
+                fanout,
+            })
+            .send()
+            .await
+            .map_err(transport)?;
+        parse_json(response).await
+    }
+
+    /// `POST /groups/{id}/messages`: fächert eine Anwendungsnachricht an
+    /// die Mitglieds-Geräte.
+    pub async fn group_messages(
+        &self,
+        access_token: &str,
+        group_id: &str,
+        envelopes: &[GroupOutgoing],
+    ) -> Result<SubmitOutcome, ClientError> {
+        let response = self
+            .http
+            .post(format!("{}/groups/{group_id}/messages", self.base_url))
+            .bearer_auth(access_token)
+            .json(&GroupMessagesRequest { envelopes })
+            .send()
+            .await
+            .map_err(transport)?;
+        parse_json(response).await
+    }
+}
+
+/// Eine ausgehende Gruppen-Hülle: adressiert genau ein Mitglieds-Gerät.
+#[derive(Serialize, Debug, Clone)]
+pub struct GroupOutgoing {
+    pub id: String,
+    pub device_id: String,
+    pub envelope: String,
+}
+
+/// Antwort von `POST /groups`.
+#[derive(Deserialize, Debug, Clone)]
+pub struct GroupCreated {
+    pub epoch: u64,
+    pub devices: usize,
+}
+
+/// Antwort von `POST /groups/{id}/commit` bei Erfolg.
+#[derive(Deserialize, Debug, Clone)]
+pub struct GroupCommitOutcome {
+    pub epoch: u64,
+    pub accepted: u64,
+    pub duplicates: u64,
+}
+
+#[derive(Serialize)]
+struct CreateGroupRequest<'a> {
+    group_id: &'a str,
+    members: &'a [String],
+}
+
+#[derive(Serialize)]
+struct CommitRequest<'a> {
+    from_epoch: u64,
+    members: &'a [String],
+    fanout: &'a [GroupOutgoing],
+}
+
+#[derive(Serialize)]
+struct GroupMessagesRequest<'a> {
+    envelopes: &'a [GroupOutgoing],
 }
 
 /// `GET /ws` als WebSocket-URL: `http` wird `ws`, `https` wird `wss`.

@@ -40,6 +40,13 @@ pub trait PrekeyStore: Send + Sync {
     /// Baut das Bündel eines Geräts: signierte Prekeys lesen, je einen
     /// Einmal-Prekey pro Typ atomar konsumieren.
     async fn take_bundle(&self, device_id: &str) -> Result<DeviceBundle, StoreError>;
+
+    /// Konsumiert ein MLS-KeyPackage eines Geräts (für einen
+    /// Gruppenbeitritt). `None`, wenn der Pool leer ist; dann kann das
+    /// Gerät gerade nicht in eine Gruppe eingeladen werden, bis es
+    /// nachfüllt. Getrennt von take_bundle, weil KeyPackages nicht zu
+    /// den 1:1-PQXDH-Bündeln gehören.
+    async fn take_mls_key_package(&self, device_id: &str) -> Result<Option<Prekey>, StoreError>;
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +112,7 @@ impl PrekeyStore for InMemoryPrekeyStore {
                 match p.kind {
                     PrekeyKind::OneTime => counts.one_time += 1,
                     PrekeyKind::PqOneTime => counts.pq_one_time += 1,
+                    PrekeyKind::MlsKeyPackage => counts.mls_key_package += 1,
                     _ => {}
                 }
             }
@@ -127,6 +135,9 @@ impl PrekeyStore for InMemoryPrekeyStore {
                 PrekeyKind::PqSigned => &mut bundle.pq_signed,
                 PrekeyKind::OneTime => &mut bundle.one_time,
                 PrekeyKind::PqOneTime => &mut bundle.pq_one_time,
+                // KeyPackages gehören nicht ins PQXDH-Bündel und werden
+                // hier nie angefasst (eigener Claim-Pfad).
+                PrekeyKind::MlsKeyPackage => continue,
             };
             if slot.is_some() {
                 continue;
@@ -142,6 +153,24 @@ impl PrekeyStore for InMemoryPrekeyStore {
             }
         }
         Ok(bundle)
+    }
+
+    async fn take_mls_key_package(&self, device_id: &str) -> Result<Option<Prekey>, StoreError> {
+        let mut pools = self.lock();
+        let Some(pool) = pools.get_mut(device_id) else {
+            return Ok(None);
+        };
+        for p in pool.iter_mut() {
+            if p.used || p.kind != PrekeyKind::MlsKeyPackage {
+                continue;
+            }
+            p.used = true;
+            return Ok(Some(Prekey {
+                id: p.id.clone(),
+                key: p.key.clone(),
+            }));
+        }
+        Ok(None)
     }
 }
 
@@ -236,7 +265,8 @@ mod tests {
             store.counts("d1").await.unwrap(),
             PoolCounts {
                 one_time: 2,
-                pq_one_time: 1
+                pq_one_time: 1,
+                mls_key_package: 0,
             }
         );
         store.take_bundle("d1").await.unwrap();
@@ -244,8 +274,42 @@ mod tests {
             store.counts("d1").await.unwrap(),
             PoolCounts {
                 one_time: 1,
-                pq_one_time: 0
+                pq_one_time: 0,
+                mls_key_package: 0,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn mls_key_packages_are_claimed_once_and_apart_from_bundles() {
+        let store = InMemoryPrekeyStore::default();
+        store
+            .upload(
+                "d1",
+                vec![
+                    upload(PrekeyKind::MlsKeyPackage, "kp1"),
+                    upload(PrekeyKind::MlsKeyPackage, "kp2"),
+                    upload(PrekeyKind::OneTime, "o1"),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.counts("d1").await.unwrap().mls_key_package, 2);
+
+        // Ein Bündel-Abruf fasst KeyPackages nicht an.
+        let bundle = store.take_bundle("d1").await.unwrap();
+        assert!(bundle.one_time.is_some());
+        assert_eq!(store.counts("d1").await.unwrap().mls_key_package, 2);
+
+        // KeyPackages werden einzeln konsumiert, jedes nur einmal.
+        assert_eq!(
+            store.take_mls_key_package("d1").await.unwrap().unwrap().id,
+            "kp1"
+        );
+        assert_eq!(
+            store.take_mls_key_package("d1").await.unwrap().unwrap().id,
+            "kp2"
+        );
+        assert!(store.take_mls_key_package("d1").await.unwrap().is_none());
     }
 }

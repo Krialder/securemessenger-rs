@@ -115,7 +115,8 @@ impl PrekeyStore for PgPrekeyStore {
         let device_id = parse_uuid(device_id, "Geräte-ID")?;
         let rows = sqlx::query(
             "SELECT kind, count(*) AS n FROM prekeys \
-             WHERE device_id = $1 AND used = FALSE AND kind IN ('one_time', 'pq_one_time') \
+             WHERE device_id = $1 AND used = FALSE \
+               AND kind IN ('one_time', 'pq_one_time', 'mls_key_package') \
              GROUP BY kind",
         )
         .bind(device_id)
@@ -130,6 +131,7 @@ impl PrekeyStore for PgPrekeyStore {
             match kind.as_str() {
                 "one_time" => counts.one_time = n,
                 "pq_one_time" => counts.pq_one_time = n,
+                "mls_key_package" => counts.mls_key_package = n,
                 _ => {}
             }
         }
@@ -183,5 +185,25 @@ impl PrekeyStore for PgPrekeyStore {
             *slot = row.as_ref().map(row_to_prekey);
         }
         Ok(bundle)
+    }
+
+    async fn take_mls_key_package(&self, device_id: &str) -> Result<Option<Prekey>, StoreError> {
+        let device_id = parse_uuid(device_id, "Geräte-ID")?;
+        // Wie ein Einmal-Prekey: ältestes freies KeyPackage sperren und
+        // markieren, SKIP LOCKED lässt parallele Beitritte an gesperrten
+        // Zeilen vorbei, keiner bekommt dasselbe Paket.
+        let row = sqlx::query(
+            "UPDATE prekeys SET used = TRUE WHERE id = ( \
+                 SELECT id FROM prekeys \
+                 WHERE device_id = $1 AND kind = 'mls_key_package' AND used = FALSE \
+                 ORDER BY created_at LIMIT 1 \
+                 FOR UPDATE SKIP LOCKED \
+             ) RETURNING id, key",
+        )
+        .bind(device_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(row.as_ref().map(row_to_prekey))
     }
 }

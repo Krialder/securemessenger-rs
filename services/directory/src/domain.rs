@@ -7,21 +7,29 @@
 
 use std::fmt;
 
-/// Die vier Pool-Typen aus dem Datenmodell: klassisch und post-quantum,
+/// Die Pool-Typen aus dem Datenmodell: klassisch und post-quantum,
 /// jeweils signiert (rotierend, mehrfach lesbar) und einmalig (konsumiert).
+/// Dazu das MLS-KeyPackage: wie ein Einmal-Prekey einmal nutzbar (es
+/// gehört zu genau einem Beitritt), aber getrennt von den PQXDH-Bündeln,
+/// weil es nur beim Gruppenbeitritt gebraucht wird (specs/mls-delivery-service.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PrekeyKind {
     Signed,
     OneTime,
     PqSigned,
     PqOneTime,
+    MlsKeyPackage,
 }
 
 impl PrekeyKind {
-    /// Signierte Prekeys werden beim Abruf gelesen, Einmal-Prekeys
-    /// konsumiert; an dieser Eigenschaft hängt die gesamte Pool-Logik.
+    /// Signierte Prekeys werden beim Abruf gelesen, Einmal-Prekeys und
+    /// MLS-KeyPackages konsumiert; an dieser Eigenschaft hängt die
+    /// gesamte Pool-Logik.
     pub fn is_one_time(self) -> bool {
-        matches!(self, PrekeyKind::OneTime | PrekeyKind::PqOneTime)
+        matches!(
+            self,
+            PrekeyKind::OneTime | PrekeyKind::PqOneTime | PrekeyKind::MlsKeyPackage
+        )
     }
 
     /// Stabile Zeichenform, identisch mit dem CHECK-Constraint der Tabelle.
@@ -31,6 +39,7 @@ impl PrekeyKind {
             PrekeyKind::OneTime => "one_time",
             PrekeyKind::PqSigned => "pq_signed",
             PrekeyKind::PqOneTime => "pq_one_time",
+            PrekeyKind::MlsKeyPackage => "mls_key_package",
         }
     }
 }
@@ -63,9 +72,11 @@ pub struct DeviceBundle {
 }
 
 /// Verbleibende Einmal-Prekeys eines Geräts; der Client füllt ab 20 nach
-/// (Zielwerte aus datenmodell.md).
+/// (Zielwerte aus datenmodell.md). `mls_key_package` zählt die
+/// verbleibenden Gruppen-Beitritts-Pakete getrennt.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PoolCounts {
     pub one_time: u64,
     pub pq_one_time: u64,
+    pub mls_key_package: u64,
 }

@@ -13,7 +13,7 @@ crates/
                       Server und Clients (auch wasm32); Feature verify liefert die akd-Konfiguration samt Domain-Label
   client-core/        der Krypto-Kern der Clients (libsignal, OpenMLS, gepinnt); kein Dienst hängt davon ab
     src/onetoone.rs   1:1-Sitzungen: PQXDH-Aufbau, Double Ratchet, Safety Number (Wrapper, keine Eigenbauten)
-    src/group.rs      MLS-Gruppen: Suite 0x0003, Skipped-Keys-Fenster (Wrapper)
+    src/group.rs      MLS-Gruppen: Suite 0x0003, Skipped-Keys-Fenster, GroupSession (Byte-Ein-Byte-Aus für den Client)
     tests/roundtrips.rs  Integrations-Beweise: PQXDH+Ratchet-Roundtrip, MLS-Gruppen-Roundtrip
   client-app/         Protokoll-Orchestrierung der Clients (GOAL.md): HTTP gegen die Dienste, keine UI, baut nativ und nach wasm32
     src/account.rs    Konto-Wurzelschlüssel (Ed25519) und Geräte-Credential smdc.v1 (Client-Seite)
@@ -21,7 +21,7 @@ crates/
     src/directory.rs  Client des Schlüssel-Verzeichnisses (Prekeys veröffentlichen, Bündel holen)
     src/delivery.rs   Client der Zustellung (einreichen, abholen, bestätigen) plus WS-Rahmenvertrag (ws_url, Auth-Frame, Events)
     src/prekeys.rs    Blob-Codec smpk.v1: libsignal-PreKeyBundle in Verzeichnis-Blobs und zurück
-    src/wire.rs       Hüllen-Framing smenv.v1 um den libsignal-Chiffretext
+    src/wire.rs       Hüllen-Framing smenv.v1 (1:1) und smgrp.v1 (Gruppen-Blobs) plus Klassifikation des Posteingangs
     src/storage.rs    Storage-Trait der lokalen Ablage (In-Memory, JSON-Datei; IndexedDB folgt)
     src/protocol_store.rs   libsignals fünf Store-Traits über dem Storage-Trait: Sitzungen überleben Prozessgrenzen
     src/kt.rs         KT-Client und Selbstprüfung: Wurzelsignatur, Wurzelbindung, Inklusionsbeweis, Commitment-Vergleich
@@ -194,6 +194,7 @@ Die `/internal`-Routen sind Dienst-zu-Dienst-Schnittstellen und dürfen nie öff
 | `POST /keys/prekeys` | Prekeys des eigenen Geräts hochladen (signierte rotieren, Einmal-Prekeys füllen den Pool); 200 mit Restbestand, 400, 401, 409 |
 | `GET /keys/prekeys` | Zählstände der eigenen Einmal-Pools, fürs Nachfüllen durch den Client; 200, 401 |
 | `GET /keys/{handle}` | Prekey-Bündel aller gültigen Geräte eines Kontos; konsumiert je einen Einmal-Prekey pro Gerät; 200, 401, 404 |
+| `GET /keys/{handle}/mls` | je gültigem Gerät ein MLS-KeyPackage (konsumiert), für Gruppen-Einladungen; Geräte ohne freies Paket fehlen; 200, 401, 404, 429 |
 | `GET /live`, `/ready`, `/metrics` | Betriebs-Endpunkte |
 
 Der Dienst kennt keine Passwörter und keine Sessions: Bearer-Tokens prüft er über `POST /internal/introspect` beim identity-Dienst (`IDENTITY_URL` plus `INTERNAL_TOKEN`), die Gerätemenge eines Kontos holt er von dort. Prekeys sind für den Server opake Blobs (Base64) mit client-erzeugter UUID; er interpretiert sie nie (Krypto liegt im Client-Core). Ist identity nicht erreichbar, antwortet directory mit 500 - nie mit 401, damit Clients nicht fälschlich ausloggen. Vier Prekey-Arten: `signed`, `one_time`, `pq_signed`, `pq_one_time` (PQXDH braucht klassische und Post-Quantum-Schlüssel, siehe [krypto-kern.md](dokumentation/specs/krypto-kern.md)). Einmal-Prekeys werden beim Bündel-Abruf atomar konsumiert (`FOR UPDATE SKIP LOCKED`), derselbe Schlüssel geht nie an zwei Abrufer. [ANNAHME: Bündel-Abruf nur mit Konto-Session; Rate-Limits pro Abrufer folgen mit der Edge-Etappe. Upload-Batch max. 500 Einträge.] Die Anbindung an identity (`IdentityGateway`, Introspektion plus Gerätemenge) liegt als wiederverwendbarer Baustein in `crates/common/src/identity_client.rs`.

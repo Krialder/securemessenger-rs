@@ -36,11 +36,31 @@ pub struct AccountBundles {
     pub devices: Vec<DeviceBundleJson>,
 }
 
+/// Ein MLS-KeyPackage eines Geräts (Antwort von `GET /keys/{handle}/mls`).
+/// Der `key_package`-Blob ist das serialisierte OpenMLS-KeyPackage,
+/// opak für den Server.
+#[derive(Deserialize, Debug, Clone)]
+pub struct MlsKeyPackageEntry {
+    pub device_id: String,
+    pub key_package: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct MlsKeyPackages {
+    pub handle: String,
+    pub devices: Vec<MlsKeyPackageEntry>,
+}
+
 #[derive(Serialize)]
 struct UploadRequest<'a> {
     signed_prekey: &'a DirectoryPrekey,
     pq_signed_prekey: &'a DirectoryPrekey,
     one_time_prekeys: &'a [DirectoryPrekey],
+}
+
+#[derive(Serialize)]
+struct MlsUploadRequest<'a> {
+    mls_key_packages: &'a [DirectoryPrekey],
 }
 
 impl DirectoryClient {
@@ -84,6 +104,43 @@ impl DirectoryClient {
         let response = self
             .http
             .get(format!("{}/keys/{handle}", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(transport)?;
+        parse_json(response).await
+    }
+
+    /// `POST /keys/prekeys` mit MLS-KeyPackages: füllt den KeyPackage-Pool
+    /// des eigenen Geräts (Gruppen-Beitritte konsumieren je eins).
+    pub async fn publish_mls_key_packages(
+        &self,
+        access_token: &str,
+        packages: &[DirectoryPrekey],
+    ) -> Result<(), ClientError> {
+        let response = self
+            .http
+            .post(format!("{}/keys/prekeys", self.base_url))
+            .bearer_auth(access_token)
+            .json(&MlsUploadRequest {
+                mls_key_packages: packages,
+            })
+            .send()
+            .await
+            .map_err(transport)?;
+        crate::http::expect_success(response).await
+    }
+
+    /// `GET /keys/{handle}/mls`: je gültigem Gerät ein MLS-KeyPackage,
+    /// konsumiert. Geräte ohne freies Paket fehlen in der Antwort.
+    pub async fn mls_key_packages(
+        &self,
+        access_token: &str,
+        handle: &str,
+    ) -> Result<MlsKeyPackages, ClientError> {
+        let response = self
+            .http
+            .get(format!("{}/keys/{handle}/mls", self.base_url))
             .bearer_auth(access_token)
             .send()
             .await
