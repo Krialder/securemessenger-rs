@@ -33,7 +33,8 @@ clients/
     tests/chat_e2e.rs Chat-Beweis (jeder Befehl ein eigener Prozess, Dienste in-process) plus Hinweiskanal-Beweis (listen --once)
   web/                Leptos-Web-Client (WASM, CSR): nur Darstellung, Krypto und Protokoll kommen aus den Crates
     src/main.rs       Einstieg mit cfg-Weiche: nativ nur ein Stub, damit `cargo test --workspace` nicht am Browser-Code hängt
-    src/app.rs        Oberfläche und Ablaufsteuerung: Konto anlegen, senden, abrufen (Ablage In-Memory, IndexedDB folgt)
+    src/app.rs        Oberfläche und Ablaufsteuerung: Konto anlegen, anmelden (nach Neuladen), senden, abrufen
+    src/storage.rs    IndexedDB hinter dem Storage-Trait: In-Memory-Spiegel, asynchroner Flush des Gesamtzustands
 services/
   identity/           Identitäts- und Auth-Dienst (Fundament, Phase 1)
     migrations/       SQL-Migrationen, von sqlx beim Start eingebettet ausgeführt

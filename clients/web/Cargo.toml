@@ -36,3 +36,16 @@ js-sys = "0.3"
 send_wrapper = "0.6"
 base64 = { workspace = true }
 rand = { workspace = true }
+# Zustands-Blob der Ablage und Profil/Kontakte: dasselbe debugbare
+# JSON-Format wie beim CLI.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Persistente Ablage: IndexedDB ist die einzige fuer groessere Datenmengen
+# gedachte Browser-Ablage; der synchrone Storage-Trait wird ueber einen
+# In-Memory-Spiegel mit asynchronem Flush erfuellt (storage.rs).
+indexed_db_futures = "0.6"
+# WebSocket-Hinweiskanal im Browser: Browser-Sockets koennen keine Header
+# setzen, gloo-net kapselt die web-sys-API als Stream/Sink.
+gloo-net = { version = "0.7", features = ["websocket"] }
+# Der Flush und die Socket-Schleife laufen als spawn_local-Tasks.
+wasm-bindgen-futures = "0.4"

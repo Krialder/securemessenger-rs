@@ -1,21 +1,23 @@
-//! Die Leptos-Oberfläche des Web-Clients: nur Darstellung und
-//! Ablaufsteuerung.
+//! Web-Client (Leptos, CSR): Oberfläche und Ablaufsteuerung.
 //!
 //! Die Schichten darunter bleiben unangetastet: `client-core` trägt die
-//! Krypto, `client-app` das Protokoll (HTTP, Blobs, Framing, Ablage). Hier
-//! wird beides mit einer bewusst schlichten Oberfläche verdrahtet:
-//! Konto anlegen, Nachricht senden, Nachrichten abrufen.
+//! Krypto, `client-app` das Protokoll (HTTP, Blobs, Framing, Ablage).
+//! Der Zustand liegt persistent in IndexedDB (storage.rs): Geräte-Identität,
+//! Sitzungen, Prekey-Zähler, Kontakte und das Profil überleben das Neuladen,
+//! dieselben Ablage-Schlüssel wie beim CLI (contact/..., counter/...), damit
+//! die Formate nicht auseinanderlaufen.
 //!
-//! [ANNAHME: Die Ablage ist In-Memory und lebt nur so lange wie der Tab;
-//! ein Neuladen der Seite verliert Sitzungen und Geräte-Identität
-//! (IndexedDB-Anbindung ist die nächste Etappe, storage.rs). Abruf per
-//! Knopf statt WebSocket-Hinweis; der Hinweiskanal folgt. Der Web-Client
-//! ist laut sicherheit.md das kryptografisch schwächste Glied (kein
-//! OS-Keystore, XSS-Fläche); die Oberfläche sagt das sichtbar an, statt es
-//! zu kaschieren.]
+//! [ANNAHME: Tokens werden nicht persistiert; nach einem Neuladen meldet
+//! sich der Nutzer mit dem Passwort neu an. Das ist bewusst: ein
+//! dauerhaft gespeichertes Token im unverschlüsselten Browser-Storage
+//! wäre ein größeres Diebstahlsziel als die erneute Eingabe wert ist.
+//! Ein Konto je Browser-Profil; ein zweites Konto braucht ein anderes
+//! Browser-Profil. Abruf per Knopf; der gloo-net-Hinweiskanal folgt als
+//! nächster Schnitt. Der Web-Client ist laut sicherheit.md das
+//! kryptografisch schwächste Glied (kein OS-Keystore, XSS-Fläche); die
+//! Oberfläche sagt das sichtbar an, statt es zu kaschieren.]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -28,21 +30,41 @@ use client_app::prekeys::{
     PROTOCOL_DEVICE_ID,
 };
 use client_app::protocol_store::{store_own_identity, PersistentProtocolStore};
-use client_app::storage::InMemoryStorage;
+use client_app::storage::KeyValueStorage as _;
 use client_app::{wire, IdentityClient, NewAccount};
 use client_core::libsignal_protocol::{IdentityKeyPair, ProtocolAddress};
 use client_core::onetoone::Device;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use send_wrapper::SendWrapper;
+use serde::{Deserialize, Serialize};
+
+use crate::storage::BrowserStorage;
 
 /// Gültigkeit des Geräte-Credentials: ein Jahr, wie beim CLI.
 const CREDENTIAL_TTL_SECONDS: u64 = 60 * 60 * 24 * 365;
+/// Ablage-Schlüssel, identisch zum CLI (Zähler) bzw. web-eigen (Profil).
+const COUNTER_KEY: &str = "counter/next_prekey_id";
+const PROFILE_KEY: &str = "profile/v1";
 
-type WebDevice = Device<PersistentProtocolStore<InMemoryStorage>>;
+type SharedStorage = Rc<RefCell<BrowserStorage>>;
+type WebDevice = Device<PersistentProtocolStore<BrowserStorage>>;
 
-/// Ein bekannter Kontakt: Zustell-Adresse und Protokoll-Gerätenummer.
-struct Contact {
+/// Das persistente Profil: was der Client nach einem Neuladen braucht,
+/// um sich wieder anzumelden. Der Konto-Seed bleibt für spätere
+/// Geräte-Credentials erhalten (wer die Ablage hat, hat das Konto,
+/// wie beim CLI-Profil).
+#[derive(Serialize, Deserialize, Clone)]
+struct Profile {
+    handle: String,
+    account_seed: String,
+    device_id: String,
+}
+
+/// Ein bekanntes Kontakt-Gerät, Format identisch zum CLI
+/// (`contact/{handle}` in der Ablage).
+#[derive(Serialize, Deserialize, Clone)]
+struct ContactDevice {
     server_device_id: String,
     protocol_device_id: u32,
 }
@@ -51,17 +73,17 @@ struct Contact {
 /// `Rc<RefCell<...>>`, weil das Gerät nicht klonbar ist und die
 /// Leptos-Handler es teilen; der `busy`-Riegel in der UI verhindert, dass
 /// zwei Abläufe gleichzeitig hineingreifen. Der `SendWrapper` darum herum
-/// stillt die Send-Anforderung des Leptos-Renderers: der Browser ist
-/// eindrähtig, ein Zugriff aus einem fremden Thread (der hier nie
-/// vorkommt) würde kontrolliert panicken statt still Daten zu zerreißen.
+/// überbrückt die Send-Anforderung des Leptos-Renderers im eindrähtigen
+/// Browser.
 struct Core {
     device: WebDevice,
     handle: String,
     token: String,
-    contacts: HashMap<String, Vec<Contact>>,
+    storage: SharedStorage,
 }
 
 type SharedCore = SendWrapper<Rc<RefCell<Option<Core>>>>;
+type SharedBoot = SendWrapper<Rc<RefCell<Option<SharedStorage>>>>;
 
 fn origin() -> String {
     web_sys::window()
@@ -89,19 +111,52 @@ fn now_unix() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
 }
 
+fn load_profile(storage: &SharedStorage) -> Option<Profile> {
+    let bytes = storage.borrow().get(PROFILE_KEY).ok()??;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn save_profile(storage: &SharedStorage, profile: &Profile) -> Result<(), String> {
+    let json = serde_json::to_vec(profile).map_err(|e| e.to_string())?;
+    storage.borrow_mut().put(PROFILE_KEY, &json)
+}
+
+fn load_counter(storage: &SharedStorage) -> Result<u32, String> {
+    match storage.borrow().get(COUNTER_KEY)? {
+        Some(bytes) => {
+            Ok(u32::from_be_bytes(bytes.try_into().map_err(|_| {
+                "Prekey-Zähler hat die falsche Länge".to_string()
+            })?))
+        }
+        None => Ok(1),
+    }
+}
+
+fn save_counter(storage: &SharedStorage, next_prekey_id: u32) -> Result<(), String> {
+    storage
+        .borrow_mut()
+        .put(COUNTER_KEY, &next_prekey_id.to_be_bytes())
+}
+
 /// Konto anlegen: Schlüssel erzeugen, registrieren, anmelden, Prekeys
-/// veröffentlichen. Ein Schritt aus Nutzersicht, weil ein frisch angelegtes
-/// Konto ohne veröffentlichte Prekeys nicht erreichbar wäre.
-async fn onboard(handle: String, password: String) -> Result<Core, String> {
+/// veröffentlichen, Profil und Zähler verankern. Ein Schritt aus
+/// Nutzersicht, weil ein frisch angelegtes Konto ohne veröffentlichte
+/// Prekeys nicht erreichbar wäre.
+async fn onboard(storage: SharedStorage, handle: String, password: String) -> Result<Core, String> {
     let mut rng = rand::rng();
     let identity = IdentityKeyPair::generate(&mut rng);
+    // libsignal-Registration-IDs sind 14 Bit (1..16380).
     let registration_id = rand::Rng::random_range(&mut rng, 1u32..16380);
 
-    let storage = Rc::new(RefCell::new(InMemoryStorage::default()));
     store_own_identity(&storage, &identity.serialize(), registration_id)
         .map_err(|e| e.to_string())?;
-    let mut device = Device::with_store(&handle, 1, PersistentProtocolStore::open(storage), 1)
-        .map_err(|e| e.to_string())?;
+    let mut device = Device::with_store(
+        &handle,
+        1,
+        PersistentProtocolStore::open(storage.clone()),
+        1,
+    )
+    .map_err(|e| e.to_string())?;
     let device_public = BASE64.encode(device.identity_public().await.map_err(|e| e.to_string())?);
 
     let account_key = IdentityKeypair::generate();
@@ -133,19 +188,67 @@ async fn onboard(handle: String, password: String) -> Result<Core, String> {
         .publish(&session.access_token, &publication)
         .await
         .map_err(|e| e.to_string())?;
+    save_counter(&storage, device.next_prekey_id())?;
+    save_profile(
+        &storage,
+        &Profile {
+            handle: handle.clone(),
+            account_seed: BASE64.encode(account_key.to_seed()),
+            device_id,
+        },
+    )?;
 
     Ok(Core {
         device,
         handle,
         token: session.access_token,
-        contacts: HashMap::new(),
+        storage,
+    })
+}
+
+/// Anmeldung nach einem Neuladen: das Profil kommt aus der Ablage, die
+/// Geräte-Identität und alle Sitzungen liegen schon im Protokoll-Store;
+/// nur das Passwort muss der Nutzer neu eingeben (Tokens werden bewusst
+/// nicht persistiert, siehe Modulkopf).
+async fn login(storage: SharedStorage, password: String) -> Result<Core, String> {
+    let profile = load_profile(&storage).ok_or_else(|| "Kein Profil in der Ablage".to_string())?;
+    let session = IdentityClient::new(identity_url())
+        .login(&profile.handle, &password, &profile.device_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let next_prekey_id = load_counter(&storage)?;
+    let device = Device::with_store(
+        &profile.handle,
+        1,
+        PersistentProtocolStore::open(storage.clone()),
+        next_prekey_id,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(Core {
+        device,
+        handle: profile.handle,
+        token: session.access_token,
+        storage,
     })
 }
 
 /// Sendet eine Nachricht; baut beim ersten Kontakt die PQXDH-Sitzungen aus
-/// den Verzeichnis-Bündeln auf (gleicher Fluss wie im CLI).
+/// den Verzeichnis-Bündeln auf und merkt sich die Geräte des Kontakts in
+/// der Ablage (gleicher Fluss und gleiches Format wie im CLI).
 async fn send_message(core: &mut Core, peer: &str, text: &str) -> Result<(), String> {
-    if !core.contacts.contains_key(peer) {
+    let contact_key = format!("contact/{peer}");
+    let known: Vec<ContactDevice> = match core
+        .storage
+        .borrow()
+        .get(&contact_key)
+        .map_err(|e| e.to_string())?
+    {
+        Some(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| format!("Kontakt unlesbar: {e}"))?
+        }
+        None => Vec::new(),
+    };
+    let devices = if known.is_empty() {
         let bundles = DirectoryClient::new(directory_url())
             .bundles(&core.token, peer)
             .await
@@ -165,16 +268,23 @@ async fn send_message(core: &mut Core, peer: &str, text: &str) -> Result<(), Str
                 .establish_session(&address, &bundle)
                 .await
                 .map_err(|e| format!("Sitzungsaufbau: {e}"))?;
-            contact.push(Contact {
+            contact.push(ContactDevice {
                 server_device_id: bundle_json.device_id.clone(),
                 protocol_device_id,
             });
         }
-        core.contacts.insert(peer.to_string(), contact);
-    }
+        let json = serde_json::to_vec(&contact).map_err(|e| e.to_string())?;
+        core.storage
+            .borrow_mut()
+            .put(&contact_key, &json)
+            .map_err(|e| e.to_string())?;
+        contact
+    } else {
+        known
+    };
 
     let mut envelopes = Vec::new();
-    for target in &core.contacts[peer] {
+    for target in &devices {
         let address = ProtocolAddress::new(
             peer.to_string(),
             device_id_from_u32(target.protocol_device_id).map_err(|e| e.to_string())?,
@@ -248,9 +358,26 @@ async fn fetch_messages(core: &mut Core) -> Result<Vec<(String, String)>, String
     Ok(received)
 }
 
+/// Startzustand der Oberfläche, Ergebnis der Ablage-Hydration.
+#[derive(Clone, PartialEq)]
+enum Boot {
+    /// IndexedDB wird noch gelesen.
+    Loading,
+    /// Keine Identität in der Ablage: Registrierungs-Formular.
+    Fresh,
+    /// Profil vorhanden: Anmelde-Formular für dieses Handle.
+    Known(String),
+    /// Ablage nicht nutzbar (etwa privates Fenster ohne IndexedDB).
+    Broken(String),
+}
+
 #[component]
 fn App() -> impl IntoView {
     let core: SharedCore = SendWrapper::new(Rc::new(RefCell::new(None)));
+    // Die hydratisierte Ablage, bis Login/Registrierung sie in den Core
+    // übernehmen; getrennt vom Core, weil sie vor der Anmeldung existiert.
+    let boot_storage: SharedBoot = SendWrapper::new(Rc::new(RefCell::new(None)));
+    let (boot, set_boot) = signal(Boot::Loading);
     let (logged_in, set_logged_in) = signal(false);
     let (status, set_status) = signal(String::new());
     let (busy, set_busy) = signal(false);
@@ -262,12 +389,37 @@ fn App() -> impl IntoView {
     // (Absender, Text); der eigene Handle markiert ausgehende Nachrichten.
     let (messages, set_messages) = signal(Vec::<(String, String)>::new());
 
+    // Hydration: einmal beim Start die Ablage öffnen und entscheiden,
+    // welches Formular gezeigt wird.
+    {
+        let boot_storage = boot_storage.clone();
+        spawn_local(async move {
+            match BrowserStorage::open().await {
+                Ok(storage) => {
+                    let storage: SharedStorage = Rc::new(RefCell::new(storage));
+                    let known = load_profile(&storage).map(|p| p.handle);
+                    *boot_storage.borrow_mut() = Some(storage);
+                    set_boot.set(match known {
+                        Some(handle) => Boot::Known(handle),
+                        None => Boot::Fresh,
+                    });
+                }
+                Err(error) => set_boot.set(Boot::Broken(error)),
+            }
+        });
+    }
+
     let on_register = {
         let core = core.clone();
+        let boot_storage = boot_storage.clone();
         move |_| {
             if busy.get_untracked() {
                 return;
             }
+            let Some(storage) = boot_storage.borrow().clone() else {
+                set_status.set("Ablage noch nicht bereit.".to_string());
+                return;
+            };
             let handle = handle_input.get_untracked();
             let password = password_input.get_untracked();
             if handle.is_empty() || password.is_empty() {
@@ -278,7 +430,7 @@ fn App() -> impl IntoView {
             set_status.set("Konto wird angelegt ...".to_string());
             let core = core.clone();
             spawn_local(async move {
-                match onboard(handle.clone(), password).await {
+                match onboard(storage, handle.clone(), password).await {
                     Ok(new_core) => {
                         *core.borrow_mut() = Some(new_core);
                         set_me.set(handle);
@@ -286,6 +438,40 @@ fn App() -> impl IntoView {
                         set_status.set("Bereit.".to_string());
                     }
                     Err(error) => set_status.set(format!("Fehlgeschlagen: {error}")),
+                }
+                set_busy.set(false);
+            });
+        }
+    };
+
+    let on_login = {
+        let core = core.clone();
+        let boot_storage = boot_storage.clone();
+        move |_| {
+            if busy.get_untracked() {
+                return;
+            }
+            let Some(storage) = boot_storage.borrow().clone() else {
+                set_status.set("Ablage noch nicht bereit.".to_string());
+                return;
+            };
+            let password = password_input.get_untracked();
+            if password.is_empty() {
+                set_status.set("Passwort angeben.".to_string());
+                return;
+            }
+            set_busy.set(true);
+            set_status.set("Anmeldung ...".to_string());
+            let core = core.clone();
+            spawn_local(async move {
+                match login(storage, password).await {
+                    Ok(new_core) => {
+                        set_me.set(new_core.handle.clone());
+                        *core.borrow_mut() = Some(new_core);
+                        set_logged_in.set(true);
+                        set_status.set("Bereit; Sitzungen aus der Ablage geladen.".to_string());
+                    }
+                    Err(error) => set_status.set(format!("Anmeldung fehlgeschlagen: {error}")),
                 }
                 set_busy.set(false);
             });
@@ -308,20 +494,27 @@ fn App() -> impl IntoView {
             set_status.set("Wird gesendet ...".to_string());
             let core = core.clone();
             spawn_local(async move {
-                let mut guard = core.borrow_mut();
-                match guard.as_mut() {
-                    Some(core) => match send_message(core, &peer, &text).await {
-                        Ok(()) => {
-                            let who = core.handle.clone();
-                            set_messages.update(|list| list.push((who, text)));
-                            set_text_input.set(String::new());
-                            set_status.set(String::new());
+                // Den Core für die Dauer der Operation herausnehmen statt
+                // den RefCell-Borrow über await zu halten (clippy
+                // await_holding_refcell_ref): ein zweiter Task sähe sonst
+                // einen Panic statt eines sauberen "beschäftigt".
+                let taken = core.borrow_mut().take();
+                match taken {
+                    Some(mut active) => {
+                        let result = send_message(&mut active, &peer, &text).await;
+                        let who = active.handle.clone();
+                        *core.borrow_mut() = Some(active);
+                        match result {
+                            Ok(()) => {
+                                set_messages.update(|list| list.push((who, text)));
+                                set_text_input.set(String::new());
+                                set_status.set(String::new());
+                            }
+                            Err(error) => set_status.set(format!("Senden fehlgeschlagen: {error}")),
                         }
-                        Err(error) => set_status.set(format!("Senden fehlgeschlagen: {error}")),
-                    },
+                    }
                     None => set_status.set("Nicht angemeldet.".to_string()),
                 }
-                drop(guard);
                 set_busy.set(false);
             });
         }
@@ -336,21 +529,26 @@ fn App() -> impl IntoView {
             set_busy.set(true);
             let core = core.clone();
             spawn_local(async move {
-                let mut guard = core.borrow_mut();
-                match guard.as_mut() {
-                    Some(core) => match fetch_messages(core).await {
-                        Ok(received) if received.is_empty() => {
-                            set_status.set("Keine neuen Nachrichten.".to_string());
+                // Herausnehmen statt Borrow über await halten, wie beim
+                // Senden (clippy await_holding_refcell_ref).
+                let taken = core.borrow_mut().take();
+                match taken {
+                    Some(mut active) => {
+                        let result = fetch_messages(&mut active).await;
+                        *core.borrow_mut() = Some(active);
+                        match result {
+                            Ok(received) if received.is_empty() => {
+                                set_status.set("Keine neuen Nachrichten.".to_string());
+                            }
+                            Ok(received) => {
+                                set_messages.update(|list| list.extend(received));
+                                set_status.set(String::new());
+                            }
+                            Err(error) => set_status.set(format!("Abruf fehlgeschlagen: {error}")),
                         }
-                        Ok(received) => {
-                            set_messages.update(|list| list.extend(received));
-                            set_status.set(String::new());
-                        }
-                        Err(error) => set_status.set(format!("Abruf fehlgeschlagen: {error}")),
-                    },
+                    }
                     None => set_status.set("Nicht angemeldet.".to_string()),
                 }
-                drop(guard);
                 set_busy.set(false);
             });
         }
@@ -360,9 +558,9 @@ fn App() -> impl IntoView {
         <main>
             <h1>"SecureMessenger"</h1>
             <p class="warnung">
-                "Web-Client ohne dauerhafte Ablage: ein Neuladen der Seite verwirft "
-                "Geräte-Identität und Sitzungen (IndexedDB folgt). Der Browser ist "
-                "das kryptografisch schwächste Glied der Plattform (sicherheit.md)."
+                "Geräte-Identität, Sitzungen und Kontakte liegen unverschlüsselt in "
+                "IndexedDB dieses Browser-Profils. Der Browser ist das kryptografisch "
+                "schwächste Glied der Plattform (sicherheit.md)."
             </p>
             {move || {
                 if logged_in.get() {
@@ -405,26 +603,51 @@ fn App() -> impl IntoView {
                     }
                         .into_any()
                 } else {
-                    view! {
-                        <p>"Konto anlegen (Registrierung, Anmeldung und Prekey-Veröffentlichung in einem Schritt):"</p>
-                        <div class="zeile">
-                            <input
-                                prop:value=handle_input
-                                on:input=move |ev| set_handle_input.set(event_target_value(&ev))
-                                placeholder="Handle (a-z, 0-9, _ . -)"
-                            />
-                        </div>
-                        <div class="zeile">
-                            <input
-                                type="password"
-                                prop:value=password_input
-                                on:input=move |ev| set_password_input.set(event_target_value(&ev))
-                                placeholder="Passwort (mindestens 12 Zeichen)"
-                            />
-                            <button on:click=on_register.clone() disabled=busy>"Konto anlegen"</button>
-                        </div>
+                    match boot.get() {
+                        Boot::Loading => view! { <p>"Ablage wird geladen ..."</p> }.into_any(),
+                        Boot::Broken(error) => view! {
+                            <p class="warnung">
+                                {format!(
+                                    "Ablage nicht verfügbar: {error}. Ohne IndexedDB (z. B. \
+                                     privates Fenster) kann dieser Client keine Identität halten.",
+                                )}
+                            </p>
+                        }
+                            .into_any(),
+                        Boot::Known(handle) => view! {
+                            <p>{format!("Konto '{handle}' auf diesem Gerät gefunden. Anmelden:")}</p>
+                            <div class="zeile">
+                                <input
+                                    type="password"
+                                    prop:value=password_input
+                                    on:input=move |ev| set_password_input.set(event_target_value(&ev))
+                                    placeholder="Passwort"
+                                />
+                                <button on:click=on_login.clone() disabled=busy>"Anmelden"</button>
+                            </div>
+                        }
+                            .into_any(),
+                        Boot::Fresh => view! {
+                            <p>"Konto anlegen (Registrierung, Anmeldung und Prekey-Veröffentlichung in einem Schritt):"</p>
+                            <div class="zeile">
+                                <input
+                                    prop:value=handle_input
+                                    on:input=move |ev| set_handle_input.set(event_target_value(&ev))
+                                    placeholder="Handle (a-z, 0-9, _ . -)"
+                                />
+                            </div>
+                            <div class="zeile">
+                                <input
+                                    type="password"
+                                    prop:value=password_input
+                                    on:input=move |ev| set_password_input.set(event_target_value(&ev))
+                                    placeholder="Passwort (mindestens 12 Zeichen)"
+                                />
+                                <button on:click=on_register.clone() disabled=busy>"Konto anlegen"</button>
+                            </div>
+                        }
+                            .into_any(),
                     }
-                        .into_any()
                 }
             }}
             <p class="status">{status}</p>
