@@ -85,9 +85,23 @@ impl IdentityClient {
         format!("{}{}", self.base_url, path)
     }
 
+    /// `GET /pow`: die geforderte Proof-of-Work-Schwierigkeit (führende
+    /// Nullbits) der Registrierung; 0 heißt: keine Bremse.
+    pub async fn pow_difficulty(&self) -> Result<u32, ClientError> {
+        let response = self
+            .http
+            .get(self.url("/pow"))
+            .send()
+            .await
+            .map_err(transport)?;
+        let info: PowInfo = parse_json(response).await?;
+        Ok(info.difficulty)
+    }
+
     /// `POST /accounts`: legt Konto und erstes Gerät an. Erzeugt die
     /// öffentlichen Schlüssel und das signierte Geräte-Credential aus den
-    /// übergebenen Schlüsselpaaren.
+    /// übergebenen Schlüsselpaaren. Verlangt der Dienst einen Proof-of-Work
+    /// (Sybil-Bremse), löst der Client ihn vorher selbst.
     pub async fn register(&self, account: &NewAccount<'_>) -> Result<Account, ClientError> {
         let identity_key = account.account_key.public_b64();
         let device_public = account.device_public_key.to_string();
@@ -98,6 +112,16 @@ impl IdentityClient {
             &device_public,
             account.not_after,
         );
+        // Nur bei aktiver Bremse rechnen; solve blockiert kurz und läuft
+        // deshalb auf einem Blocking-Thread, damit die async-Worker frei
+        // bleiben. Auf wasm gibt es kein spawn_blocking, dort direkt
+        // (die Schwierigkeit ist im Referenzbetrieb klein).
+        let difficulty = self.pow_difficulty().await?;
+        let pow_nonce = if difficulty > 0 {
+            Some(solve_pow(account.handle, difficulty).await?)
+        } else {
+            None
+        };
         let body = RegisterRequest {
             handle: account.handle,
             display_name: account.display_name,
@@ -110,6 +134,7 @@ impl IdentityClient {
                 not_after: account.not_after,
                 credential: &credential,
             },
+            pow_nonce,
         };
         let response = self
             .http
@@ -206,6 +231,22 @@ struct RegisterRequest<'a> {
     password: &'a str,
     identity_key: &'a str,
     device: DeviceRequest<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pow_nonce: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct PowInfo {
+    difficulty: u32,
+}
+
+/// Löst den Proof-of-Work fürs Registrieren. Läuft inline (die Bibliothek
+/// setzt keine Laufzeit voraus); bei Referenz-Schwierigkeit ist die Suche
+/// kurz. Auf teuren Schwierigkeiten würde ein Aufrufer sie auf einen
+/// eigenen Thread legen. `async` bleibt der Einheitlichkeit halber.
+async fn solve_pow(handle: &str, difficulty: u32) -> Result<u64, ClientError> {
+    pow::solve(handle, difficulty)
+        .ok_or_else(|| ClientError::Protocol("kein Proof-of-Work-nonce gefunden".to_string()))
 }
 
 #[derive(Serialize)]

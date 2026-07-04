@@ -15,7 +15,11 @@ use client_app::{ClientError, IdentityClient, NewAccount};
 
 /// Startet den identity-Dienst auf `127.0.0.1:0` und liefert seine Basis-URL.
 async fn start_identity() -> String {
-    let app = identity::api::app(identity::api::AppState::new_in_memory());
+    start_identity_with(identity::api::AppState::new_in_memory()).await
+}
+
+async fn start_identity_with(state: identity::api::AppState) -> String {
+    let app = identity::api::app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Ephemeralport");
@@ -72,6 +76,33 @@ async fn register_login_refresh_logout_roundtrip() {
     assert_ne!(rotated.access_token, session.access_token);
 
     client.logout(&rotated.access_token).await.expect("Logout");
+}
+
+/// Verlangt der Dienst einen Proof-of-Work, löst der Client ihn selbst:
+/// die Registrierung geht durch, ohne dass der Aufrufer davon weiß.
+#[tokio::test]
+async fn register_solves_proof_of_work_transparently() {
+    let url =
+        start_identity_with(identity::api::AppState::new_in_memory().with_pow_difficulty(12)).await;
+    let client = IdentityClient::new(&url);
+    assert_eq!(client.pow_difficulty().await.expect("pow-Info"), 12);
+
+    let account_key = IdentityKeypair::generate();
+    let device_key = IdentityKeypair::generate();
+    let device_id = uuid::Uuid::new_v4().to_string();
+    let account = client
+        .register(&NewAccount {
+            handle: "powuser",
+            display_name: None,
+            password: "korrektes-pferd-batterie",
+            account_key: &account_key,
+            device_public_key: &device_key.public_b64(),
+            device_id: &device_id,
+            not_after: now_unix() + 3600,
+        })
+        .await
+        .expect("Registrierung mit gelöstem Proof-of-Work");
+    assert_eq!(account.handle, "powuser");
 }
 
 #[tokio::test]

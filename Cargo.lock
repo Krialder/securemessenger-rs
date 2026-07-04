@@ -528,6 +528,7 @@ dependencies = [
  "kt",
  "kt-format",
  "oprf",
+ "pow",
  "rand 0.9.4",
  "reqwest",
  "serde",
@@ -1946,6 +1947,7 @@ dependencies = [
  "ed25519-dalek",
  "http-body-util",
  "oprf",
+ "pow",
  "reqwest",
  "serde",
  "serde_json",
@@ -3280,6 +3282,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0103b1cef7ec0cf76490e969665504990193874ea05c85ff9bab8b911d0a0564"
 dependencies = [
  "zerovec",
+]
+
+[[package]]
+name = "pow"
+version = "0.1.0"
+dependencies = [
+ "sha2",
 ]
 
 [[package]]

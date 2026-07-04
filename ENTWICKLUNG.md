@@ -15,6 +15,8 @@ crates/
                       entblenden) und Server (auswerten), kein Eigenbau
   franking/           Message-Franking-Commitment (HMAC-SHA256); geteilt zwischen Client (committen) und Server
                       (Meldung verifizieren), kein Eigenbau
+  pow/                Proof-of-Work-Sybil-Bremse (hashcash über SHA-256); geteilt zwischen Client (lösen) und Server
+                      (prüfen), kein Eigenbau
   client-core/        der Krypto-Kern der Clients (libsignal, OpenMLS, gepinnt); kein Dienst hängt davon ab
     src/onetoone.rs   1:1-Sitzungen: PQXDH-Aufbau, Double Ratchet, Safety Number, Schlüsselwechsel-Erkennung (Wrapper, keine Eigenbauten)
     src/group.rs      MLS-Gruppen: Suite 0x0003, Skipped-Keys-Fenster, GroupSession (Byte-Ein-Byte-Aus für den Client)
@@ -181,6 +183,7 @@ cargo test -p kt --test pg
 | `GET /devices` | gültige Gerätemenge des eigenen Kontos; 200, 401 |
 | `POST /devices` | weiteres Gerät freischalten (Credential vom Konto-Identitätsschlüssel signiert); 201, 400, 401, 409 |
 | `DELETE /devices/{id}` | Gerät revozieren, widerruft dessen Sessions; das eigene Gerät nicht (409); 204, 401, 404 |
+| `GET /pow` | aktuelle Proof-of-Work-Schwierigkeit der Registrierung (Sybil-Bremse); `{difficulty}`, 0 = aus |
 | `POST /internal/introspect` | Dienst-zu-Dienst: Access-Token zur Identität auflösen (RFC-7662-Zuschnitt); nur mit `INTERNAL_TOKEN` |
 | `GET /internal/accounts/{handle}/devices` | Dienst-zu-Dienst: Identitätsschlüssel und gültige Gerätemenge eines Kontos |
 | `POST /discovery/evaluate` | OPRF-Runde der Contact Discovery: geblendetes Element rein, Server-Auswertung raus; nur bei gesetztem `CDS_OPRF_KEY`; rate-limitiert; 200, 400, 401, 429 |

@@ -65,6 +65,9 @@ pub struct AppState {
     /// OPRF-Schlüssel für Contact Discovery (specs/contact-discovery.md);
     /// ohne Wert sind die Discovery-Routen abgeschaltet.
     discovery_oprf: Option<Arc<oprf::ServerKey>>,
+    /// Proof-of-Work-Schwierigkeit (führende Nullbits) bei der
+    /// Registrierung; 0 = aus (specs/sealed-sender-und-abuse.md).
+    pow_difficulty: u32,
 }
 
 impl AppState {
@@ -102,7 +105,15 @@ impl AppState {
             limiter: Arc::new(RateLimiter::default()),
             kt: Arc::new(NoopKtNotifier),
             discovery_oprf: None,
+            pow_difficulty: 0,
         }
+    }
+
+    /// Setzt die Proof-of-Work-Schwierigkeit der Registrierung (führende
+    /// Nullbits); 0 lässt die Bremse aus (main.rs, aus POW_DIFFICULTY).
+    pub fn with_pow_difficulty(mut self, bits: u32) -> Self {
+        self.pow_difficulty = bits;
+        self
     }
 
     /// Hängt den KT-Melder ein (main.rs, wenn KT_URL konfiguriert ist).
@@ -134,6 +145,7 @@ pub fn app(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/", get(|| async { "SecureMessenger identity service" }))
         .route("/accounts", post(register))
+        .route("/pow", get(pow_info))
         .route("/sessions", post(login).delete(logout))
         .route("/sessions/refresh", post(refresh))
         .route("/devices", get(list_devices).post(add_device))
@@ -176,6 +188,28 @@ struct RegisterRequest {
     identity_key: String,
     /// Das erste Gerät; ein Konto ohne Gerät gibt es nicht.
     device: DeviceRequest,
+    /// Proof-of-Work-nonce, wenn der Dienst eine Bremse verlangt
+    /// (`GET /pow` nennt die Schwierigkeit).
+    #[serde(default)]
+    pow_nonce: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct PowInfo {
+    /// Geforderte führende Nullbits; 0 heißt: keine Bremse.
+    difficulty: u32,
+}
+
+/// `GET /pow`: die aktuelle Proof-of-Work-Schwierigkeit, damit der Client
+/// vor der Registrierung den passenden nonce sucht.
+async fn pow_info(State(st): State<AppState>) -> Response {
+    (
+        StatusCode::OK,
+        Json(PowInfo {
+            difficulty: st.pow_difficulty,
+        }),
+    )
+        .into_response()
 }
 
 /// Ein Gerät, wie der Client es anmeldet. Das Credential ist die Signatur
@@ -462,6 +496,20 @@ async fn register(State(st): State<AppState>, Json(req): Json<RegisterRequest>) 
         .check(&format!("register:{}", req.handle), REGISTER_RATE_LIMIT)
     {
         return common::rate::too_many_requests(retry_after);
+    }
+    // Proof-of-Work-Bremse (Sybil-Widerstand): vor der teuren Arbeit prüfen.
+    // Ohne konfigurierte Schwierigkeit ist sie aus, dann ist kein nonce nötig.
+    if st.pow_difficulty > 0 {
+        match req.pow_nonce {
+            Some(nonce) if pow::verify(&req.handle, nonce, st.pow_difficulty) => {}
+            _ => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "pow_required",
+                    "Registrierung braucht einen gueltigen Proof-of-Work (Schwierigkeit unter GET /pow)",
+                )
+            }
+        }
     }
     if let Err(message) = validate_password(&req.password) {
         return api_error(StatusCode::BAD_REQUEST, "invalid_password", message);

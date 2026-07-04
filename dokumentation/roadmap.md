@@ -49,7 +49,7 @@ Baut auf Identität und Auth auf, macht den Kern zum Fundament für die übrigen
 - [x] Key Transparency: Konsistenzbeweise client-seitig prüfbar (`KtClient::verify_consistency`, `sm audit`); der unabhängige Auditor-Betrieb und Gossip gegen den Split-View bleiben offen (Betreiber, Phase 3)
 - [x] Safety Numbers (Web und CLI) und sichtbare Warnung bei Schlüsselwechsel (`Device::stored_identity`, `sm keycheck`)
 - [x] Contact Discovery (OPRF): der Client blendet den Handle, identity wertet die OPRF aus (voprf, RFC 9497), der Client entblendet und schlägt oblivious nach; rate-limitiert gegen Enumeration, Ergebnis gegen KT prüfbar
-- [x] Abuse: Message Franking (HMAC-Commitment, beweisbare Meldung) und empfängerseitige Kontrollen (Blockieren); Sybil-Widerstand (PoW/Privacy Pass) offen
+- [x] Abuse: Message Franking (HMAC-Commitment, beweisbare Meldung), empfängerseitige Kontrollen (Blockieren) und Sybil-Bremse (Proof-of-Work bei der Registrierung); Privacy Pass für rate-limitierte Tokens bleibt offen
 - [ ] Compliance-Position festgelegt (CSAR, Online Safety Act)
 
 ## Phase 4: Gruppen

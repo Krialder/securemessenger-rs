@@ -15,6 +15,7 @@ members = [
     "crates/franking",
     "crates/kt-format",
     "crates/oprf",
+    "crates/pow",
     "services/delivery",
     "services/directory",
     "services/identity",
@@ -79,6 +80,9 @@ oprf = { path = "crates/oprf" }
 # Message-Franking-Commitment, geteilt zwischen Client (committen) und
 # Server (Meldung verifizieren).
 franking = { path = "crates/franking" }
+# Proof-of-Work-Sybil-Bremse, geteilt zwischen Client (lösen) und Server
+# (prüfen).
+pow = { path = "crates/pow" }
 
 # Argon2 ist in Debug-Builds unbrauchbar langsam (Sekunden pro Hash).
 # Die Krypto-Pakete werden deshalb auch im Dev-Profil optimiert gebaut,

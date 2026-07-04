@@ -80,6 +80,20 @@ async fn main() {
         None => state,
     };
 
+    // Mit POW_DIFFICULTY (fuehrende Nullbits) verlangt die Registrierung
+    // einen Proof-of-Work als Sybil-Bremse; 0 oder ungesetzt = aus.
+    let state = match std::env::var("POW_DIFFICULTY")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|bits| *bits > 0)
+    {
+        Some(bits) => {
+            tracing::info!(bits, "Proof-of-Work bei der Registrierung aktiv");
+            state.with_pow_difficulty(bits)
+        }
+        None => state,
+    };
+
     let router = app(state);
 
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr)

@@ -143,6 +143,44 @@ async fn hot_paths_are_rate_limited() {
 }
 
 #[tokio::test]
+async fn registration_requires_proof_of_work_when_configured() {
+    // Kleine Schwierigkeit, damit der Test schnell bleibt.
+    let app = app(AppState::new_in_memory().with_pow_difficulty(12));
+    let identity = key(17);
+
+    // Ohne nonce: abgewiesen mit pow_required.
+    let register = register_body(&identity, "poworka", "korrektes-pferd-batterie", DEV_FIRST);
+    let (status, body) = send(&app, "POST", "/accounts", Some(register.clone()), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "pow_required");
+
+    // GET /pow nennt die Schwierigkeit.
+    let (status, info) = send(&app, "GET", "/pow", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(info["difficulty"], 12);
+
+    // Mit gültigem nonce: angenommen.
+    let nonce = pow::solve("poworka", 12).expect("nonce");
+    let mut with_pow = register;
+    with_pow["pow_nonce"] = json!(nonce);
+    let (status, _) = send(&app, "POST", "/accounts", Some(with_pow), None).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Ein falscher nonce fällt durch.
+    let identity2 = key(18);
+    let mut bad = register_body(
+        &identity2,
+        "poworkb",
+        "korrektes-pferd-batterie",
+        DEV_SECOND,
+    );
+    bad["pow_nonce"] = json!(1u64);
+    let (status, body) = send(&app, "POST", "/accounts", Some(bad), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "pow_required");
+}
+
+#[tokio::test]
 async fn register_login_logout_flow() {
     let app = test_app();
     let identity = key(1);

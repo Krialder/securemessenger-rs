@@ -28,6 +28,9 @@ reqwest.workspace = true
 # OPRF-Kern für Contact Discovery (specs/contact-discovery.md): die
 # Server-Auswertung der geblendeten Handles.
 oprf.workspace = true
+# Proof-of-Work-Sybil-Bremse bei der Registrierung: der Server prüft den
+# Client-Nachweis (specs/sealed-sender-und-abuse.md).
+pow.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

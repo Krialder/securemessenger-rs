@@ -1,0 +1,16 @@
+[package]
+name = "pow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Proof-of-Work als Sybil-Bremse bei der Registrierung
+# (specs/sealed-sender-und-abuse.md "Sybil-Widerstand"). Bewusst eine
+# Bremse, kein Riegel: sie verteuert Massenkonten, haelt aber niemanden
+# ab, der einzeln registriert. Hashcash-artig ueber SHA-256, kein
+# Eigenbau einer Hashfunktion. Geteilt zwischen Client (loesen) und
+# Server (pruefen), damit beide exakt dieselbe Bedingung rechnen.
+
+[dependencies]
+sha2.workspace = true

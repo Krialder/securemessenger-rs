@@ -38,6 +38,8 @@ oprf = { workspace = true }
 # Message Franking: der Absender committet sich beim Senden, der Empfänger
 # deckt beim Melden auf (specs/sealed-sender-und-abuse.md).
 franking = { workspace = true }
+# Proof-of-Work-Sybil-Bremse: der Client löst sie beim Registrieren.
+pow = { workspace = true }
 # Die persistente Protokoll-Ablage erfuellt libsignals Store-Traits, und
 # die sind mit async_trait(?Send) definiert.
 async-trait = { workspace = true }
