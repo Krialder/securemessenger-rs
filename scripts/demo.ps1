@@ -23,7 +23,20 @@ param(
     # Loescht die demo_*-Datenbanken vor dem Start (frische Vorfuehrung).
     [switch]$Reset,
     # Nur Dienste, keine Web-Clients (fuer reine CLI-Vorfuehrungen).
-    [switch]$NoWeb
+    [switch]$NoWeb,
+    # Nur ein Web-Client (Alice, 3000) statt Alice und Bob. Das ist der
+    # Alltags-Start: eine Messenger-Instanz statt der Zwei-Personen-Vorfuehrung.
+    [switch]$Solo,
+    # Oeffnet nach dem Start den Standardbrowser auf den/die Web-Client(s).
+    [switch]$OpenBrowser,
+    # Startet die Dienst-Fenster versteckt (WindowStyle Hidden). Fuer den
+    # GUI-Start, der die Logs nicht als Konsolenfenster zeigen will; die
+    # Konsolen-Vorfuehrung laesst sie sichtbar.
+    [switch]$Hidden,
+    # Ueberspringt cargo build. Der GUI-Start baut selbst (nur wenn noetig
+    # und vom Nutzer bestaetigt) und ruft demo.ps1 dann mit -NoBuild, damit
+    # nicht doppelt gebaut wird.
+    [switch]$NoBuild
 )
 
 # Kein globales 'Stop': native Programme (docker, psql) schreiben Hinweise
@@ -85,23 +98,29 @@ foreach ($db in $databases) {
     }
 }
 
-# 2. Binaries bauen (ein Lauf; die Fenster starten danach sofort)
-Write-Step 'Baue Dienste und CLI (cargo build, erster Lauf dauert)'
-Push-Location $root
-cargo build -p identity -p directory -p delivery -p kt -p sm-cli
-if ($LASTEXITCODE -ne 0) { Pop-Location; Write-Bad 'Build fehlgeschlagen'; exit 1 }
-Pop-Location
-Write-Ok 'Build fertig'
+# 2. Binaries bauen (ein Lauf; die Fenster starten danach sofort). -NoBuild
+# ueberspringt das, wenn der Aufrufer (GUI-Start) schon gebaut hat.
+if ($NoBuild) {
+    Write-Ok 'Build uebersprungen (-NoBuild)'
+} else {
+    Write-Step 'Baue Dienste und CLI (cargo build, erster Lauf dauert)'
+    Push-Location $root
+    cargo build -p identity -p directory -p delivery -p kt -p sm-cli
+    if ($LASTEXITCODE -ne 0) { Pop-Location; Write-Bad 'Build fehlgeschlagen'; exit 1 }
+    Pop-Location
+    Write-Ok 'Build fertig'
+}
 
 # 3. Dienste starten, je Dienst ein Fenster mit sichtbaren Logs.
 Write-Step 'Starte Dienste (identity 8080, directory 8081, delivery 8082, kt 8083)'
 $pids = @()
+$windowStyle = if ($Hidden) { 'Hidden' } else { 'Normal' }
 function Start-Service([string]$name, [string]$bind, [hashtable]$extraEnv) {
     $exe = Join-Path $root "target\debug\$name.exe"
     $envLines = "`$env:BIND_ADDR='$bind'; `$env:INTERNAL_TOKEN='$script:internalToken'; "
     foreach ($k in $extraEnv.Keys) { $envLines += "`$env:$k='$($extraEnv[$k])'; " }
     $cmd = "`$host.UI.RawUI.WindowTitle='sm-demo-$name'; $envLines & '$exe'"
-    $p = Start-Process powershell -ArgumentList '-NoExit', '-Command', $cmd -PassThru
+    $p = Start-Process powershell -ArgumentList '-NoExit', '-Command', $cmd -PassThru -WindowStyle $script:windowStyle
     $script:pids += $p.Id
     Write-Ok "$name gestartet (PID $($p.Id), $bind)"
 }
@@ -146,18 +165,22 @@ foreach ($port in $ports) {
     if ($ok) { Write-Ok "Port $port bereit" } else { Write-Bad "Port $port antwortet nicht; Fenster 'sm-demo-*' pruefen" }
 }
 
-# 5. Web-Clients (Alice und Bob), je ein trunk-Dev-Server mit /api-Proxys.
+# 5. Web-Clients, je ein trunk-Dev-Server mit /api-Proxys. -Solo startet nur
+# Alice (Alltags-Start), sonst Alice und Bob (Zwei-Personen-Vorfuehrung).
+$startedPorts = @()
 if (-not $NoWeb) {
-    Write-Step 'Starte Web-Clients (Alice 3000, Bob 3001)'
+    $clients = if ($Solo) { @(@{ name = 'alice'; port = 3000 }) } else { @(@{ name = 'alice'; port = 3000 }, @{ name = 'bob'; port = 3001 }) }
+    Write-Step ("Starte Web-Client(s): " + (($clients | ForEach-Object { "$($_.name) $($_.port)" }) -join ', '))
     if (-not ((Have 'trunk') -or (Test-Path $trunkExe))) {
         Write-Bad 'trunk fehlt; zuerst scripts\setup.ps1 ausfuehren (oder -NoWeb nutzen)'
     } else {
         $trunk = if (Have 'trunk') { 'trunk' } else { $trunkExe }
         $webDir = Join-Path $root 'clients\web'
-        foreach ($entry in @(@{ name = 'alice'; port = 3000 }, @{ name = 'bob'; port = 3001 })) {
+        foreach ($entry in $clients) {
             $cmd = "`$host.UI.RawUI.WindowTitle='sm-demo-web-$($entry.name)'; Set-Location '$webDir'; & '$trunk' serve --port $($entry.port)"
-            $p = Start-Process powershell -ArgumentList '-NoExit', '-Command', $cmd -PassThru
+            $p = Start-Process powershell -ArgumentList '-NoExit', '-Command', $cmd -PassThru -WindowStyle $windowStyle
             $pids += $p.Id
+            $startedPorts += $entry.port
             Write-Ok "Web-Client $($entry.name) auf http://localhost:$($entry.port) (PID $($p.Id))"
         }
     }
@@ -166,8 +189,23 @@ if (-not $NoWeb) {
 # PIDs fuer demo-stop.ps1 festhalten.
 $pids -join "`n" | Out-File -FilePath (Join-Path $env:TEMP 'sm-demo-pids.txt') -Encoding ascii
 
-Write-Host "`nVorfuehr-Umgebung laeuft." -ForegroundColor White
-Write-Host '    Web:     http://localhost:3000 (Alice)  http://localhost:3001 (Bob)'
+# Optional den Browser oeffnen. Der trunk-Server braucht nach dem Start einen
+# Moment, bis er die Seite ausliefert; kurz auf den ersten Port warten, damit
+# der Browser nicht auf eine noch tote Adresse trifft.
+if ($OpenBrowser -and $startedPorts.Count -gt 0) {
+    $first = $startedPorts[0]
+    for ($i = 0; $i -lt 60; $i++) {
+        try {
+            $r = Invoke-WebRequest -Uri "http://127.0.0.1:$first/" -UseBasicParsing -TimeoutSec 2
+            if ($r.StatusCode -eq 200) { break }
+        } catch { Start-Sleep -Seconds 1 }
+    }
+    foreach ($port in $startedPorts) { Start-Process "http://localhost:$port" | Out-Null }
+}
+
+Write-Host "`nUmgebung laeuft." -ForegroundColor White
+$webInfo = if ($Solo) { 'http://localhost:3000' } else { 'http://localhost:3000 (Alice)  http://localhost:3001 (Bob)' }
+if (-not $NoWeb) { Write-Host "    Web:     $webInfo" }
 Write-Host "    CLI:     $root\target\debug\sm.exe (im PATH-freien Aufruf: .\target\debug\sm.exe help)"
 Write-Host '    Stoppen: scripts\demo-stop.ps1'
 Write-Host '    Drehbuch der Vorfuehrung: DEMO.md im Projekt-Root'

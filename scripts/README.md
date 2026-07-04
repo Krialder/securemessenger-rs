@@ -1,10 +1,16 @@
 # Scripts
 
-Skripte, um die Entwicklungsumgebung aufzusetzen und Dienste zu starten, die laufen müssen.
+Skripte, um die Entwicklungsumgebung aufzusetzen und Dienste zu starten, die laufen müssen. Es gibt zwei Wege: die grafischen Doppelklick-Anwendungen (`install.cmd`, `SecureMessenger.cmd`) für den geführten Einstieg und die Konsolen-Skripte für Entwickler.
+
+## Grafischer Einstieg: install.cmd und SecureMessenger.cmd (im Projekt-Root)
+
+`install.cmd` öffnet den Installations-Assistenten (`scripts/install-gui.ps1`), eine WPF-Oberfläche im Stil des Web-Clients (Segoe UI, das App-Blau `#0078D7`, abgerundete Ecken). Sie läuft die Einrichtungsschritte als Liste mit Live-Status ab: Werkzeuge prüfen, Fehlendes installieren, Docker und die Datenbank hochfahren, das Projekt bauen. `SecureMessenger.cmd` öffnet die Start-Anwendung (`scripts/start-gui.ps1`): sie prüft beim Öffnen die Umgebung, verweist bei fehlenden schweren Werkzeugen auf den Assistenten, bietet für Veraltetes eine Haken-Auswahl "aktualisieren" an und startet sonst direkt (ein Messenger-Fenster auf `http://localhost:3000`, im Vorführmodus zusätzlich Bob auf 3001).
+
+Die eigentliche Prüf- und Reparaturlogik liegt einmal in `scripts/lib-checks.ps1` (die geteilte Wahrheit über den Zustand: Werkzeuge, Docker, Datenbank, ob die Programme aktuell gebaut sind), die WPF-Bausteine in `scripts/lib-gui.ps1`. Beide GUIs erledigen die langen Schritte in einem Hintergrund-Runspace und halten die Oberfläche über einen DispatcherTimer bedienbar. Der Start selbst läuft über `demo.ps1` (dieselbe eine Startlogik).
 
 ## start.cmd (im Projekt-Root)
 
-Der Doppelklick-Einstieg. Ruft `scripts/setup.ps1` mit gelockerter ExecutionPolicy auf, sodass das Setup ohne Vorkonfiguration läuft. Ein Konsolenfenster öffnet sich und bleibt bis zum Tastendruck offen.
+Der Konsolen-Einstieg für Entwickler. Ruft `scripts/setup.ps1` mit gelockerter ExecutionPolicy auf, sodass das Setup ohne Vorkonfiguration läuft. Ein Konsolenfenster öffnet sich und bleibt bis zum Tastendruck offen. Deckt dieselben Werkzeuge ab wie der Assistent, nur ohne Oberfläche.
 
 ## setup.ps1
 
