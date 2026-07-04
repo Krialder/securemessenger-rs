@@ -23,7 +23,9 @@ use std::rc::Rc;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use client_app::account::IdentityKeypair;
-use client_app::delivery::{DeliveryClient, OutgoingEnvelope};
+use client_app::delivery::{
+    parse_ws_event, ws_auth_frame, DeliveryClient, OutgoingEnvelope, WsEvent,
+};
 use client_app::directory::DirectoryClient;
 use client_app::prekeys::{
     bundle_from_directory, device_id_from_u32, new_uuid, publication_from_bundle,
@@ -34,6 +36,8 @@ use client_app::storage::KeyValueStorage as _;
 use client_app::{wire, IdentityClient, NewAccount};
 use client_core::libsignal_protocol::{IdentityKeyPair, ProtocolAddress};
 use client_core::onetoone::Device;
+use futures_util::{SinkExt as _, StreamExt as _};
+use gloo_net::websocket::{futures::WebSocket, Message as WsMessage};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use send_wrapper::SendWrapper;
@@ -358,6 +362,48 @@ async fn fetch_messages(core: &mut Core) -> Result<Vec<(String, String)>, String
     Ok(received)
 }
 
+/// Hält den Hinweiskanal offen: die Browser-Seite des Vertrags aus
+/// `client_app::delivery`. Die Schleife fasst den Client-Zustand nie an,
+/// sie zählt nur das Hinweis-Signal hoch; den Abruf stößt ein Effect an,
+/// sobald die Oberfläche frei ist (kein RefCell-Borrow über await).
+fn start_hint_channel(token: String, set_hints: WriteSignal<u64>, set_status: WriteSignal<String>) {
+    spawn_local(async move {
+        let url = client_app::delivery::ws_url(&delivery_url());
+        let mut socket = match WebSocket::open(&url) {
+            Ok(socket) => socket,
+            Err(error) => {
+                set_status.set(format!("Echtzeit-Kanal nicht erreichbar: {error}"));
+                return;
+            }
+        };
+        if let Err(error) = socket.send(WsMessage::Text(ws_auth_frame(&token))).await {
+            set_status.set(format!("Echtzeit-Kanal: Auth nicht gesendet: {error}"));
+            return;
+        }
+        while let Some(frame) = socket.next().await {
+            match frame {
+                Ok(WsMessage::Text(text)) => match parse_ws_event(&text) {
+                    Some(WsEvent::MessageWaiting) => set_hints.update(|n| *n += 1),
+                    Some(WsEvent::Notification { tenant, title }) => {
+                        set_status.set(format!("[Benachrichtigung von {tenant}] {title}"));
+                    }
+                    // Unbekannte und unlesbare Frames bewusst still: neue
+                    // Server-Events dürfen alte Clients nicht stören.
+                    Some(WsEvent::Other { .. }) | None => {}
+                },
+                Ok(WsMessage::Bytes(_)) => {}
+                Err(error) => {
+                    set_status.set(format!("Echtzeit-Kanal gestört: {error}"));
+                    return;
+                }
+            }
+        }
+        // [ANNAHME: kein automatischer Wiederverbinder, wie beim CLI; der
+        // Abruf-Knopf bleibt als Rückfallebene sichtbar.]
+        set_status.set("Echtzeit-Kanal geschlossen; Abrufen weiter per Knopf.".to_string());
+    });
+}
+
 /// Startzustand der Oberfläche, Ergebnis der Ablage-Hydration.
 #[derive(Clone, PartialEq)]
 enum Boot {
@@ -388,6 +434,10 @@ fn App() -> impl IntoView {
     let (text_input, set_text_input) = signal(String::new());
     // (Absender, Text); der eigene Handle markiert ausgehende Nachrichten.
     let (messages, set_messages) = signal(Vec::<(String, String)>::new());
+    // Zähler der message.waiting-Hinweise vom Echtzeit-Kanal; der Effect
+    // weiter unten holt ab, sobald die Oberfläche frei ist.
+    let (hints, set_hints) = signal(0u64);
+    let handled_hints = StoredValue::new(0u64);
 
     // Hydration: einmal beim Start die Ablage öffnen und entscheiden,
     // welches Formular gezeigt wird.
@@ -432,6 +482,7 @@ fn App() -> impl IntoView {
             spawn_local(async move {
                 match onboard(storage, handle.clone(), password).await {
                     Ok(new_core) => {
+                        start_hint_channel(new_core.token.clone(), set_hints, set_status);
                         *core.borrow_mut() = Some(new_core);
                         set_me.set(handle);
                         set_logged_in.set(true);
@@ -466,10 +517,14 @@ fn App() -> impl IntoView {
             spawn_local(async move {
                 match login(storage, password).await {
                     Ok(new_core) => {
+                        start_hint_channel(new_core.token.clone(), set_hints, set_status);
                         set_me.set(new_core.handle.clone());
                         *core.borrow_mut() = Some(new_core);
                         set_logged_in.set(true);
                         set_status.set("Bereit; Sitzungen aus der Ablage geladen.".to_string());
+                        // Was schon wartet, kündigt kein Hinweis mehr an:
+                        // einmal initial abholen (wie sm listen).
+                        set_hints.update(|n| *n += 1);
                     }
                     Err(error) => set_status.set(format!("Anmeldung fehlgeschlagen: {error}")),
                 }
@@ -520,9 +575,10 @@ fn App() -> impl IntoView {
         }
     };
 
-    let on_fetch = {
+    // Der Abhol-Ablauf, geteilt zwischen Knopf und Hinweis-Effect.
+    let run_fetch = SendWrapper::new(Rc::new({
         let core = core.clone();
-        move |_| {
+        move || {
             if busy.get_untracked() {
                 return;
             }
@@ -552,7 +608,27 @@ fn App() -> impl IntoView {
                 set_busy.set(false);
             });
         }
+    }));
+
+    let on_fetch = {
+        let run_fetch = run_fetch.clone();
+        move |_| run_fetch()
     };
+
+    // Holt nach jedem Hinweis ab, sobald die Oberfläche frei ist: der
+    // Effect läuft erneut, wenn busy zurück auf false kippt, und sieht
+    // dann noch unbehandelte Hinweise. Verpasst wird so keiner.
+    {
+        let run_fetch = run_fetch.clone();
+        Effect::new(move |_| {
+            let pending = hints.get();
+            let currently_busy = busy.get();
+            if logged_in.get() && !currently_busy && pending > handled_hints.get_value() {
+                handled_hints.set_value(pending);
+                run_fetch();
+            }
+        });
+    }
 
     view! {
         <main>

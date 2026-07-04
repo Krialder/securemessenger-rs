@@ -4357,6 +4357,7 @@ dependencies = [
  "client-app",
  "client-core",
  "console_error_panic_hook",
+ "futures-util",
  "gloo-net 0.7.0",
  "indexed_db_futures",
  "js-sys",
