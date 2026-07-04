@@ -71,6 +71,15 @@ pub struct SignedRoot {
     pub signature: String,
 }
 
+/// Antwort von `GET /kt/consistency`: der Append-only-Beweis zwischen zwei
+/// Epochen (bincode-serialisiertes akd-Material, Base64).
+#[derive(Deserialize, Debug, Clone)]
+pub struct ConsistencyProof {
+    pub from: u64,
+    pub to: u64,
+    pub proof: String,
+}
+
 /// Ergebnis einer bestandenen Selbstprüfung: gegen welche Epoche geprüft
 /// wurde und die wievielte Version des eigenen Eintrags dort steht.
 #[derive(Debug, Clone, Copy)]
@@ -125,6 +134,79 @@ impl KtClient {
             .await
             .map_err(transport)?;
         parse_json(response).await
+    }
+
+    /// `GET /kt/consistency?from=&to=`: der Append-only-Beweis zwischen
+    /// zwei Epochen.
+    pub async fn consistency_proof(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> Result<ConsistencyProof, ClientError> {
+        let response = self
+            .http
+            .get(self.url(&format!("/kt/consistency?from={from}&to={to}")))
+            .send()
+            .await
+            .map_err(transport)?;
+        parse_json(response).await
+    }
+
+    /// Die Auditor-Prüfung: ist das Log zwischen `from` und `to`
+    /// append-only, also wurde nichts nachträglich verändert oder gelöscht?
+    /// Das ist der Hebel gegen den Split-View aus specs/key-transparency.md:
+    /// ein Auditor (oder ein Client als Gelegenheits-Auditor) prüft die
+    /// signierte Wurzelfolge auf Konsistenz. Beide Wurzeln müssen vom
+    /// Dienst signiert sein (gegen den gepinnten Schlüssel, sonst
+    /// Trust-on-first-use), und der akd-Beweis muss sie als reine
+    /// Erweiterung ausweisen. Jeder Fehlschlag ist ein
+    /// `ClientError::KeyTransparency`-Alarm.
+    ///
+    /// [ANNAHME: Ein einzelner Auditor deckt keinen Split-View auf, bei dem
+    /// der Server jedem eine eigene, in sich konsistente Kette zeigt; dafür
+    /// braucht es mehrere unabhängige Auditoren plus Gossip (Spec, Phase 3,
+    /// Betreiber offen). Diese Prüfung ist der lokale, jederzeit machbare
+    /// Teil davon.]
+    pub async fn verify_consistency(
+        &self,
+        from: u64,
+        to: u64,
+        pinned_root_key: Option<&str>,
+    ) -> Result<(), ClientError> {
+        if from >= to {
+            return Err(ClientError::KeyTransparency(
+                "Konsistenz braucht from < to".to_string(),
+            ));
+        }
+        let info = self.info().await?;
+        let signing_key_b64 = match pinned_root_key {
+            Some(pinned) if pinned != info.root_signing_key => {
+                return Err(ClientError::KeyTransparency(
+                    "Wurzel-Signaturschlüssel des Dienstes weicht vom gepinnten ab".to_string(),
+                ));
+            }
+            Some(pinned) => pinned,
+            None => &info.root_signing_key,
+        };
+        let verifying_key = decode_verifying_key(signing_key_b64)?;
+
+        let start = self.signed_root(from).await?;
+        let end = self.signed_root(to).await?;
+        let start_root = verify_signed_root(&start, &verifying_key)?;
+        let end_root = verify_signed_root(&end, &verifying_key)?;
+
+        let consistency = self.consistency_proof(from, to).await?;
+        let proof_bytes = decode_b64(&consistency.proof, "consistency proof")?;
+        let audit: akd::AppendOnlyProof = bincode::deserialize(&proof_bytes)
+            .map_err(|error| ClientError::Decode(format!("Append-only-Beweis: {error}")))?;
+
+        akd::auditor::audit_verify::<KtConfiguration>(vec![start_root, end_root], audit)
+            .await
+            .map_err(|error| {
+                ClientError::KeyTransparency(format!(
+                    "Log ist zwischen Epoche {from} und {to} nicht append-only: {error}"
+                ))
+            })
     }
 
     /// Die Selbstprüfung: steht im Verzeichnis exakt das Commitment, das
@@ -240,4 +322,28 @@ fn decode_verifying_key(b64: &str) -> Result<VerifyingKey, ClientError> {
         .map_err(|_| ClientError::Decode("Wurzelschlüssel hat nicht 32 Byte".to_string()))?;
     VerifyingKey::from_bytes(&bytes)
         .map_err(|error| ClientError::Decode(format!("Wurzelschlüssel: {error}")))
+}
+
+/// Prüft die Ed25519-Signatur einer Wurzel gegen den (schon dekodierten)
+/// Signaturschlüssel und liefert den 32-Byte-Wurzel-Hash. Ein Fehlschlag
+/// ist ein Alarm, keine Format-Panne.
+fn verify_signed_root(
+    signed: &SignedRoot,
+    verifying_key: &VerifyingKey,
+) -> Result<[u8; 32], ClientError> {
+    let root_hash = decode_b64(&signed.root_hash, "root_hash")?;
+    let signature_bytes = decode_b64(&signed.signature, "signature")?;
+    let signature = Signature::from_slice(&signature_bytes)
+        .map_err(|error| ClientError::Decode(format!("Wurzelsignatur: {error}")))?;
+    verifying_key
+        .verify(&root_message(signed.epoch, &root_hash), &signature)
+        .map_err(|_| {
+            ClientError::KeyTransparency(format!(
+                "Wurzelsignatur der Epoche {} verifiziert nicht",
+                signed.epoch
+            ))
+        })?;
+    root_hash
+        .try_into()
+        .map_err(|_| ClientError::Decode("Wurzel-Hash hat nicht 32 Byte".to_string()))
 }

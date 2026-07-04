@@ -93,6 +93,7 @@ async fn run() -> Result<(), String> {
         "recv" => recv().await,
         "listen" => listen(&args[1..]).await,
         "verify" => verify().await,
+        "audit" => audit(&args[1..]).await,
         "report" => report(&args[1..]).await,
         "block" => block(&args[1..]).await,
         "unblock" => unblock(&args[1..]).await,
@@ -509,6 +510,35 @@ async fn listen(args: &[String]) -> Result<(), String> {
     Err("Verbindung beendet".to_string())
 }
 
+/// `sm audit <from> <to>`: prüft als Gelegenheits-Auditor, ob das
+/// KT-Log zwischen zwei Epochen append-only ist (specs/key-transparency.md,
+/// Konsistenzbeweis). Braucht keine Anmeldung; die signierten Wurzeln und
+/// der Beweis sind öffentlich.
+async fn audit(args: &[String]) -> Result<(), String> {
+    let [from, to] = args else {
+        return Err("Aufruf: sm audit <von-epoche> <bis-epoche>".to_string());
+    };
+    let from: u64 = from
+        .parse()
+        .map_err(|_| "von-epoche ist keine Zahl".to_string())?;
+    let to: u64 = to
+        .parse()
+        .map_err(|_| "bis-epoche ist keine Zahl".to_string())?;
+    match client_app::kt::KtClient::new(kt_url())
+        .verify_consistency(from, to, None)
+        .await
+    {
+        Ok(()) => {
+            println!("Log ist zwischen Epoche {from} und {to} append-only (konsistent).");
+            Ok(())
+        }
+        Err(client_app::ClientError::KeyTransparency(detail)) => {
+            Err(format!("KT-KONSISTENZ-ALARM: {detail}"))
+        }
+        Err(other) => Err(format!("Konsistenzprüfung nicht möglich: {other}")),
+    }
+}
+
 /// `sm report <message_id>`: meldet eine empfangene Nachricht. Deckt den
 /// beim Empfang abgelegten Franking-Schlüssel und Klartext auf; der Server
 /// prüft, ob sie das aufbewahrte Commitment öffnen (beweisbar echt).
@@ -645,6 +675,7 @@ fn print_usage() {
          \x20 recv                           wartende Nachrichten abholen und entschlüsseln\n\
          \x20 listen [--once]                Hinweiskanal halten und bei Hinweisen abholen\n\
          \x20 verify                         eigenen KT-Eintrag pruefen (Selbstpruefung)\n\
+         \x20 audit <von> <bis>              KT-Log-Konsistenz zwischen zwei Epochen pruefen\n\
          \x20 report <message_id>            empfangene Nachricht melden (Franking aufdecken)\n\
          \x20 block <handle>                 Absender blockieren\n\
          \x20 unblock <handle>               Blockierung aufheben\n\

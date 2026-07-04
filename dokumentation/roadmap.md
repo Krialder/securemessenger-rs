@@ -46,7 +46,7 @@ Baut auf Identität und Auth auf, macht den Kern zum Fundament für die übrigen
 ## Phase 3: Metadaten, Verifikation, Abuse
 
 - [ ] Sealed Sender mit anonymen Credentials (zkgroup)
-- [ ] Key Transparency vollständig: Auditoren, Gossip, Konsistenzbeweise
+- [x] Key Transparency: Konsistenzbeweise client-seitig prüfbar (`KtClient::verify_consistency`, `sm audit`); der unabhängige Auditor-Betrieb und Gossip gegen den Split-View bleiben offen (Betreiber, Phase 3)
 - [ ] Safety Numbers und sichtbare Warnung bei Schlüsselwechsel
 - [x] Contact Discovery (OPRF): der Client blendet den Handle, identity wertet die OPRF aus (voprf, RFC 9497), der Client entblendet und schlägt oblivious nach; rate-limitiert gegen Enumeration, Ergebnis gegen KT prüfbar
 - [x] Abuse: Message Franking (HMAC-Commitment, beweisbare Meldung) und empfängerseitige Kontrollen (Blockieren); Sybil-Widerstand (PoW/Privacy Pass) offen

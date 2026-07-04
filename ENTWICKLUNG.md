@@ -28,12 +28,12 @@ crates/
     src/wire.rs       Hüllen-Framing smenv.v1 (1:1) und smgrp.v1 (Gruppen-Blobs) plus Klassifikation des Posteingangs
     src/storage.rs    Storage-Trait der lokalen Ablage (In-Memory, JSON-Datei; IndexedDB folgt)
     src/protocol_store.rs   libsignals fünf Store-Traits über dem Storage-Trait: Sitzungen überleben Prozessgrenzen
-    src/kt.rs         KT-Client und Selbstprüfung: Wurzelsignatur, Wurzelbindung, Inklusionsbeweis, Commitment-Vergleich
+    src/kt.rs         KT-Client: Selbstprüfung (Inklusionsbeweis) und Konsistenzprüfung (Auditor, Append-only zwischen Epochen)
     tests/account_e2e.rs    End-to-End gegen den echten identity-Router (in-process)
     tests/messaging_e2e.rs  End-to-End über identity+directory+delivery: PQXDH, E2EE-Umlauf, Ablage ohne Klartext
     tests/kt_e2e.rs   End-to-End über identity+kt: Selbstprüfung besteht, untergeschobener Schlüssel schlägt Alarm
 clients/
-  cli/                Headless-Referenzclient `sm`: register/login/logout/whoami/publish-keys/send/recv/listen/verify/report/block/unblock/blocks
+  cli/                Headless-Referenzclient `sm`: register/login/logout/whoami/publish-keys/send/recv/listen/verify/audit/report/block/unblock/blocks
     tests/chat_e2e.rs Chat-Beweis (jeder Befehl ein eigener Prozess, Dienste in-process) plus Hinweiskanal-Beweis (listen --once)
   web/                Leptos-Web-Client (WASM, CSR): nur Darstellung, Krypto und Protokoll kommen aus den Crates
     src/main.rs       Einstieg mit cfg-Weiche: nativ nur ein Stub, damit `cargo test --workspace` nicht am Browser-Code hängt

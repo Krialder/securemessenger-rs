@@ -189,4 +189,12 @@ async fn self_check_passes_and_detects_planted_key() {
         }
         other => panic!("erwartet KeyTransparency-Alarm, bekam: {other}"),
     }
+
+    // Auditor-Prüfung: das Log ist zwischen Epoche 1 und 2 append-only. Der
+    // Rogue-Key ist eine Erweiterung, keine Umschreibung; die Konsistenz
+    // hält also (den Tausch fängt die Selbstprüfung, nicht der Auditor).
+    kt_client
+        .verify_consistency(1, 2, None)
+        .await
+        .expect("die Wurzelfolge muss append-only sein");
 }
