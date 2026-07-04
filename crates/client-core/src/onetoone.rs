@@ -20,10 +20,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use libsignal_protocol::{
     kem, message_decrypt, message_encrypt, process_prekey_bundle, CiphertextMessage, DeviceId,
-    GenericSignedPreKey as _, IdentityKeyPair, IdentityKeyStore, InMemIdentityKeyStore,
-    InMemKyberPreKeyStore, InMemPreKeyStore, InMemSessionStore, InMemSignalProtocolStore,
-    InMemSignedPreKeyStore, KeyPair, KyberPreKeyRecord, KyberPreKeyStore, PreKeyBundle,
-    PreKeyRecord, PreKeyStore, ProtocolAddress, SessionStore, SignalProtocolError,
+    Fingerprint, GenericSignedPreKey as _, IdentityKeyPair, IdentityKeyStore,
+    InMemIdentityKeyStore, InMemKyberPreKeyStore, InMemPreKeyStore, InMemSessionStore,
+    InMemSignalProtocolStore, InMemSignedPreKeyStore, KeyPair, KyberPreKeyRecord, KyberPreKeyStore,
+    PreKeyBundle, PreKeyRecord, PreKeyStore, ProtocolAddress, SessionStore, SignalProtocolError,
     SignedPreKeyRecord, SignedPreKeyStore, Timestamp,
 };
 
@@ -210,6 +210,48 @@ impl<S: ProtocolStoreParts> Device<S> {
     pub async fn registration_id(&mut self) -> Result<u32, SignalProtocolError> {
         let (_, identities, _, _, _) = self.store.parts();
         identities.get_local_registration_id().await
+    }
+
+    /// Die Sicherheitsnummer (Safety Number) zum Vergleich mit einem
+    /// Kontakt: libsignals `Fingerprint` über beide Identitätsschlüssel,
+    /// als Ziffernfolge. Sie ist symmetrisch, beide Seiten sehen dieselbe
+    /// Nummer; stimmt sie nicht überein, spricht einer der beiden mit
+    /// einem fremden Schlüssel. `None`, solange der Kontakt-Schlüssel
+    /// nicht in der Ablage liegt (noch keine Sitzung).
+    ///
+    /// [ANNAHME: Version 2 und 5200 Iterationen wie bei Signal produktiv;
+    /// als stabile Kennungen dienen die Handles (Signal nimmt dort
+    /// Telefonnummern, die es hier nicht gibt). Kein Eigenbau: die
+    /// Konstruktion kommt unverändert aus libsignal.]
+    pub async fn safety_number(
+        &mut self,
+        remote: &ProtocolAddress,
+    ) -> Result<Option<String>, SignalProtocolError> {
+        let local_name = self.address.name().to_string();
+        let (_, identities, _, _, _) = self.store.parts();
+        let local = identities.get_identity_key_pair().await?;
+        let Some(remote_key) = identities.get_identity(remote).await? else {
+            return Ok(None);
+        };
+        // Der Fingerprint-Fehlertyp kennt keinen Weg nach
+        // SignalProtocolError; mit festen, gültigen Parametern (Iterationen
+        // im erlaubten Bereich, 64-Byte-Hashes) ist er praktisch
+        // unerreichbar, das Mapping hält die Device-API einheitlich.
+        let fingerprint_error = |error: libsignal_protocol::FingerprintError| {
+            SignalProtocolError::InvalidArgument(format!("Fingerprint: {error}"))
+        };
+        let fingerprint = Fingerprint::new(
+            2,
+            5200,
+            local_name.as_bytes(),
+            local.identity_key(),
+            remote.name().as_bytes(),
+            &remote_key,
+        )
+        .map_err(fingerprint_error)?;
+        Ok(Some(
+            fingerprint.display_string().map_err(fingerprint_error)?,
+        ))
     }
 
     /// Erzeugt einen frischen Prekey-Satz (signiert, Einmal, ML-KEM-1024),

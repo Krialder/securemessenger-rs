@@ -79,6 +79,31 @@ async fn pqxdh_session_and_double_ratchet_roundtrip() {
         matches!(replay, Err(SignalProtocolError::DuplicatedMessage(_, _))),
         "Replay muss als Duplikat abgewiesen werden, kam {replay:?}"
     );
+
+    // Safety Number: beide Seiten sehen dieselbe Nummer (symmetrische
+    // Konstruktion), und ein Dritter mit anderem Schlüssel eine andere.
+    let alice_sees = alice
+        .safety_number(&bob_address)
+        .await
+        .unwrap()
+        .expect("Bobs Schlüssel liegt nach der Sitzung in der Ablage");
+    let bob_sees = bob
+        .safety_number(&alice_address)
+        .await
+        .unwrap()
+        .expect("Alices Schlüssel liegt nach der Sitzung in der Ablage");
+    assert_eq!(
+        alice_sees, bob_sees,
+        "beide Seiten müssen dieselbe Sicherheitsnummer sehen"
+    );
+    assert_eq!(alice_sees.len(), 60, "Signal-Format: 60 Ziffern");
+
+    // Unbekannte Adresse: keine Nummer statt einer erfundenen.
+    let stranger = libsignal_protocol::ProtocolAddress::new(
+        "fremd".to_string(),
+        libsignal_protocol::DeviceId::new(1).unwrap(),
+    );
+    assert!(alice.safety_number(&stranger).await.unwrap().is_none());
 }
 
 #[test]

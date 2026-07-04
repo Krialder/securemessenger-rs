@@ -4,7 +4,7 @@
 # der Browser same-origin spricht und keine CORS-Konfiguration in den
 # Diensten noetig ist. Im Cluster uebernimmt der Ingress dieselbe
 # Pfad-Zuordnung (deploy/k8s/ingress.yaml). [ANNAHME: Ports wie in
-# ENTWICKLUNG.md, identity 8080, directory 8081, delivery 8082.]
+# ENTWICKLUNG.md, identity 8080, directory 8081, delivery 8082, kt 8083.]
 
 [[proxy]]
 rewrite = "/api/identity/"
@@ -14,6 +14,18 @@ backend = "http://127.0.0.1:8080/"
 rewrite = "/api/directory/"
 backend = "http://127.0.0.1:8081/"
 
+# Der Hinweiskanal braucht einen eigenen ws-Proxy: HTTP-Proxys reichen
+# das Upgrade nicht durch. Vor dem allgemeinen delivery-Proxy, damit die
+# spezifischere Route zuerst greift.
+[[proxy]]
+rewrite = "/api/delivery/ws"
+backend = "ws://127.0.0.1:8082/ws"
+ws = true
+
 [[proxy]]
 rewrite = "/api/delivery/"
 backend = "http://127.0.0.1:8082/"
+
+[[proxy]]
+rewrite = "/api/kt/"
+backend = "http://127.0.0.1:8083/"

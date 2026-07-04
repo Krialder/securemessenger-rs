@@ -41,6 +41,7 @@ use tokio_tungstenite::tungstenite::Message;
 const DEFAULT_IDENTITY_URL: &str = "http://127.0.0.1:8080";
 const DEFAULT_DIRECTORY_URL: &str = "http://127.0.0.1:8081";
 const DEFAULT_DELIVERY_URL: &str = "http://127.0.0.1:8082";
+const DEFAULT_KT_URL: &str = "http://127.0.0.1:8083";
 /// Gültigkeit des Geräte-Credentials: ein Jahr. Der Client wählt die Dauer
 /// (specs/geraete-identitaet.md), der Server lehnt nur Abgelaufenes ab.
 const CREDENTIAL_TTL_SECONDS: u64 = 60 * 60 * 24 * 365;
@@ -91,6 +92,7 @@ async fn run() -> Result<(), String> {
         "send" => send(&args[1..]).await,
         "recv" => recv().await,
         "listen" => listen(&args[1..]).await,
+        "verify" => verify().await,
         "help" | "-h" | "--help" => {
             print_usage();
             Ok(())
@@ -458,6 +460,42 @@ async fn listen(args: &[String]) -> Result<(), String> {
     Err("Verbindung beendet".to_string())
 }
 
+/// `sm verify`: die KT-Selbstprüfung des eigenen Kontos
+/// (specs/key-transparency.md). Rechnet das Commitment aus Konto-Schlüssel
+/// und eigener Gerätemenge nach und verifiziert den Inklusionsbeweis gegen
+/// die signierte Wurzel. Ein Alarm ist ein Sicherheitssignal (möglicher
+/// stiller Schlüsseltausch), kein gewöhnlicher Fehler.
+async fn verify() -> Result<(), String> {
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    let seed: [u8; 32] = BASE64
+        .decode(&profile.account_seed)
+        .map_err(|e| format!("Konto-Seed unlesbar: {e}"))?
+        .try_into()
+        .map_err(|_| "Konto-Seed hat die falsche Länge".to_string())?;
+    let account = IdentityKeypair::from_seed(&seed);
+    let devices = IdentityClient::new(identity_url())
+        .devices(&token)
+        .await
+        .map_err(|e| format!("Gerätemenge nicht abrufbar: {e}"))?;
+    match client_app::kt::KtClient::new(kt_url())
+        .verify_self(&profile.handle, &account.public_b64(), &devices, None)
+        .await
+    {
+        Ok(check) => {
+            println!(
+                "KT-Eintrag stimmt: Epoche {}, Version {} ({} Gerät(e) im Commitment)",
+                check.epoch,
+                check.version,
+                devices.len()
+            );
+            Ok(())
+        }
+        Err(client_app::ClientError::KeyTransparency(detail)) => Err(format!("KT-ALARM: {detail}")),
+        Err(other) => Err(format!("KT-Prüfung nicht möglich: {other}")),
+    }
+}
+
 fn print_usage() {
     eprintln!(
         "sm - SecureMessenger Referenzclient\n\
@@ -471,12 +509,14 @@ fn print_usage() {
          \x20 send <handle> <text>           E2EE-Nachricht senden (baut Sitzung bei Bedarf auf)\n\
          \x20 recv                           wartende Nachrichten abholen und entschlüsseln\n\
          \x20 listen [--once]                Hinweiskanal halten und bei Hinweisen abholen\n\
+         \x20 verify                         eigenen KT-Eintrag pruefen (Selbstpruefung)\n\
          \x20 help                           diese Hilfe\n\
          \n\
          Umgebung:\n\
          \x20 SM_IDENTITY_URL    identity-Dienst (Vorgabe {DEFAULT_IDENTITY_URL})\n\
          \x20 SM_DIRECTORY_URL   directory-Dienst (Vorgabe {DEFAULT_DIRECTORY_URL})\n\
          \x20 SM_DELIVERY_URL    delivery-Dienst (Vorgabe {DEFAULT_DELIVERY_URL})\n\
+         \x20 SM_KT_URL          kt-Dienst (Vorgabe {DEFAULT_KT_URL})\n\
          \x20 SM_PROFILE         Profildatei (Vorgabe sm-profile.json)\n\
          \x20 SM_STATE           Zustands-Ablage (Vorgabe sm-state.json)"
     );
@@ -492,6 +532,10 @@ fn directory_url() -> String {
 
 fn delivery_url() -> String {
     std::env::var("SM_DELIVERY_URL").unwrap_or_else(|_| DEFAULT_DELIVERY_URL.to_string())
+}
+
+fn kt_url() -> String {
+    std::env::var("SM_KT_URL").unwrap_or_else(|_| DEFAULT_KT_URL.to_string())
 }
 
 fn profile_path() -> String {

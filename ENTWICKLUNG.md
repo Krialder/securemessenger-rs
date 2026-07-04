@@ -12,7 +12,7 @@ crates/
   kt-format/          kanonische KT-Byte-Formate (Commitment smktc.v1, Wurzelnachricht smkt.v1), geteilt zwischen
                       Server und Clients (auch wasm32); Feature verify liefert die akd-Konfiguration samt Domain-Label
   client-core/        der Krypto-Kern der Clients (libsignal, OpenMLS, gepinnt); kein Dienst hängt davon ab
-    src/onetoone.rs   1:1-Sitzungen: PQXDH-Aufbau und Double Ratchet (Wrapper, keine Eigenbauten)
+    src/onetoone.rs   1:1-Sitzungen: PQXDH-Aufbau, Double Ratchet, Safety Number (Wrapper, keine Eigenbauten)
     src/group.rs      MLS-Gruppen: Suite 0x0003, Skipped-Keys-Fenster (Wrapper)
     tests/roundtrips.rs  Integrations-Beweise: PQXDH+Ratchet-Roundtrip, MLS-Gruppen-Roundtrip
   client-app/         Protokoll-Orchestrierung der Clients (GOAL.md): HTTP gegen die Dienste, keine UI, baut nativ und nach wasm32
@@ -29,7 +29,7 @@ crates/
     tests/messaging_e2e.rs  End-to-End über identity+directory+delivery: PQXDH, E2EE-Umlauf, Ablage ohne Klartext
     tests/kt_e2e.rs   End-to-End über identity+kt: Selbstprüfung besteht, untergeschobener Schlüssel schlägt Alarm
 clients/
-  cli/                Headless-Referenzclient `sm`: register/login/logout/whoami/publish-keys/send/recv/listen
+  cli/                Headless-Referenzclient `sm`: register/login/logout/whoami/publish-keys/send/recv/listen/verify
     tests/chat_e2e.rs Chat-Beweis (jeder Befehl ein eigener Prozess, Dienste in-process) plus Hinweiskanal-Beweis (listen --once)
   web/                Leptos-Web-Client (WASM, CSR): nur Darstellung, Krypto und Protokoll kommen aus den Crates
     src/main.rs       Einstieg mit cfg-Weiche: nativ nur ein Stub, damit `cargo test --workspace` nicht am Browser-Code hängt

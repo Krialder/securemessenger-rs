@@ -27,13 +27,14 @@ use client_app::delivery::{
     parse_ws_event, ws_auth_frame, DeliveryClient, OutgoingEnvelope, WsEvent,
 };
 use client_app::directory::DirectoryClient;
+use client_app::kt::KtClient;
 use client_app::prekeys::{
     bundle_from_directory, device_id_from_u32, new_uuid, publication_from_bundle,
     PROTOCOL_DEVICE_ID,
 };
 use client_app::protocol_store::{store_own_identity, PersistentProtocolStore};
 use client_app::storage::KeyValueStorage as _;
-use client_app::{wire, IdentityClient, NewAccount};
+use client_app::{wire, ClientError, IdentityClient, NewAccount};
 use client_core::libsignal_protocol::{IdentityKeyPair, ProtocolAddress};
 use client_core::onetoone::Device;
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -109,6 +110,21 @@ fn directory_url() -> String {
 
 fn delivery_url() -> String {
     format!("{}/api/delivery", origin())
+}
+
+fn kt_url() -> String {
+    format!("{}/api/kt", origin())
+}
+
+/// Die 60 Ziffern der Sicherheitsnummer in Fünfergruppen, wie Signal sie
+/// zeigt; am Stück wäre sie nicht abgleichbar.
+fn group_safety_number(number: &str) -> String {
+    number
+        .as_bytes()
+        .chunks(5)
+        .map(|chunk| String::from_utf8_lossy(chunk).to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn now_unix() -> u64 {
@@ -404,6 +420,37 @@ fn start_hint_channel(token: String, set_hints: WriteSignal<u64>, set_status: Wr
     });
 }
 
+/// Die KT-Selbstprüfung für das eigene Konto (kt-Modul in client-app):
+/// Commitment aus Konto-Schlüssel und eigener Gerätemenge nachrechnen,
+/// Beweis gegen die signierte Wurzel verifizieren. Alarm (`true` im
+/// Fehler-Tupel) und gewöhnlicher Fehler werden getrennt gemeldet, weil
+/// nur ersterer ein Sicherheitssignal ist; ein kt-Ausfall ist keiner.
+async fn kt_self_check(core: &Core) -> Result<String, (bool, String)> {
+    let profile =
+        load_profile(&core.storage).ok_or((false, "Kein Profil in der Ablage".to_string()))?;
+    let seed: [u8; 32] = BASE64
+        .decode(&profile.account_seed)
+        .map_err(|e| (false, format!("Konto-Seed unlesbar: {e}")))?
+        .try_into()
+        .map_err(|_| (false, "Konto-Seed hat die falsche Länge".to_string()))?;
+    let account = IdentityKeypair::from_seed(&seed);
+    let devices = IdentityClient::new(identity_url())
+        .devices(&core.token)
+        .await
+        .map_err(|e| (false, format!("Gerätemenge nicht abrufbar: {e}")))?;
+    match KtClient::new(kt_url())
+        .verify_self(&core.handle, &account.public_b64(), &devices, None)
+        .await
+    {
+        Ok(check) => Ok(format!(
+            "Eigener KT-Eintrag stimmt (Epoche {}, Version {}).",
+            check.epoch, check.version
+        )),
+        Err(ClientError::KeyTransparency(detail)) => Err((true, format!("KT-ALARM: {detail}"))),
+        Err(other) => Err((false, format!("KT-Prüfung nicht möglich: {other}"))),
+    }
+}
+
 /// Startzustand der Oberfläche, Ergebnis der Ablage-Hydration.
 #[derive(Clone, PartialEq)]
 enum Boot {
@@ -438,6 +485,10 @@ fn App() -> impl IntoView {
     // weiter unten holt ab, sobald die Oberfläche frei ist.
     let (hints, set_hints) = signal(0u64);
     let handled_hints = StoredValue::new(0u64);
+    // (Kontakt, gruppierte Nummer) der zuletzt gezeigten Sicherheitsnummer.
+    let (safety_info, set_safety_info) = signal(Option::<(String, String)>::None);
+    // Ergebnis der KT-Selbstprüfung: (bestanden, Meldung).
+    let (kt_info, set_kt_info) = signal(Option::<(bool, String)>::None);
 
     // Hydration: einmal beim Start die Ablage öffnen und entscheiden,
     // welches Formular gezeigt wird.
@@ -630,6 +681,91 @@ fn App() -> impl IntoView {
         });
     }
 
+    let on_safety = {
+        let core = core.clone();
+        move |_| {
+            if busy.get_untracked() {
+                return;
+            }
+            let peer = peer_input.get_untracked();
+            if peer.is_empty() {
+                set_status.set("Empfänger-Handle angeben.".to_string());
+                return;
+            }
+            set_busy.set(true);
+            let core = core.clone();
+            spawn_local(async move {
+                let taken = core.borrow_mut().take();
+                match taken {
+                    Some(mut active) => {
+                        let result = match device_id_from_u32(PROTOCOL_DEVICE_ID) {
+                            Ok(id) => {
+                                let address = ProtocolAddress::new(peer.clone(), id);
+                                active
+                                    .device
+                                    .safety_number(&address)
+                                    .await
+                                    .map_err(|e| e.to_string())
+                            }
+                            Err(error) => Err(error.to_string()),
+                        };
+                        *core.borrow_mut() = Some(active);
+                        match result {
+                            Ok(Some(number)) => {
+                                set_safety_info.set(Some((peer, group_safety_number(&number))));
+                                set_status.set(String::new());
+                            }
+                            Ok(None) => set_status.set(format!(
+                                "Noch keine Sitzung mit '{peer}': erst eine Nachricht \
+                                 senden oder empfangen."
+                            )),
+                            Err(error) => set_status.set(format!("Sicherheitsnummer: {error}")),
+                        }
+                    }
+                    None => set_status.set("Nicht angemeldet.".to_string()),
+                }
+                set_busy.set(false);
+            });
+        }
+    };
+
+    let on_kt_check = {
+        let core = core.clone();
+        move |_| {
+            if busy.get_untracked() {
+                return;
+            }
+            set_busy.set(true);
+            set_kt_info.set(None);
+            set_status.set("Key-Transparency-Prüfung ...".to_string());
+            let core = core.clone();
+            spawn_local(async move {
+                let taken = core.borrow_mut().take();
+                match taken {
+                    Some(active) => {
+                        let result = kt_self_check(&active).await;
+                        *core.borrow_mut() = Some(active);
+                        match result {
+                            Ok(message) => {
+                                set_kt_info.set(Some((true, message)));
+                                set_status.set(String::new());
+                            }
+                            // Der Alarm bleibt als rote Zeile stehen; ein
+                            // gewöhnlicher Fehler ist nur Status.
+                            Err((true, message)) => {
+                                set_kt_info.set(Some((false, message)));
+                                set_status.set(String::new());
+                            }
+                            Err((false, message)) => set_status.set(message),
+                        }
+                    }
+                    None => set_status.set("Nicht angemeldet.".to_string()),
+                }
+                set_busy.set(false);
+            });
+        }
+    };
+
     view! {
         <main>
             <h1>"SecureMessenger"</h1>
@@ -658,6 +794,37 @@ fn App() -> impl IntoView {
                             <button on:click=on_send.clone() disabled=busy>"Senden"</button>
                             <button on:click=on_fetch.clone() disabled=busy>"Abrufen"</button>
                         </div>
+                        <div class="zeile">
+                            <button on:click=on_safety.clone() disabled=busy>
+                                "Sicherheitsnummer"
+                            </button>
+                            <button on:click=on_kt_check.clone() disabled=busy>
+                                "Schlüssel prüfen (KT)"
+                            </button>
+                        </div>
+                        {move || {
+                            safety_info
+                                .get()
+                                .map(|(peer, number)| {
+                                    view! {
+                                        <p class="safety">
+                                            <strong>
+                                                {format!("Sicherheitsnummer mit {peer}: ")}
+                                            </strong>
+                                            <code>{number}</code>
+                                            " (über einen zweiten Kanal abgleichen)"
+                                        </p>
+                                    }
+                                })
+                        }}
+                        {move || {
+                            kt_info
+                                .get()
+                                .map(|(ok, message)| {
+                                    let klasse = if ok { "status" } else { "warnung" };
+                                    view! { <p class=klasse>{message}</p> }
+                                })
+                        }}
                         <ul class="chat">
                             {move || {
                                 let own = me.get();
