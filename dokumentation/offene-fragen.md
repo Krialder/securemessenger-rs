@@ -2,6 +2,10 @@
 
 Was noch nicht entschieden ist. Manches hat schon eine Tendenz, manches ist offen, manches ist nur ein Stichwort, das nicht vergessen werden soll. Jeder Punkt sollte fallen, bevor das zugehörige Stück gebaut wird.
 
+## Was inzwischen gebaut ist (Stand 04.07.2026)
+
+Ein Teil der früher offenen Punkte ist umgesetzt und im [Live-Dokument](live-dokument.md) Abschnitt 10 dokumentiert: Contact Discovery über eine OPRF (voprf, RFC 9497), Message Franking (HMAC-Commitment) mit beweisbarer Meldung, empfängerseitiges Blockieren, die Sybil-Bremse über Proof-of-Work bei der Registrierung, die KT-Selbstprüfung und die KT-Konsistenzprüfung (Auditor-Logik client-seitig), die sichtbare Warnung bei Schlüsselwechsel samt Safety Number, das MLS-Gruppen-Backend mit Epochen-Serialisierung samt Client-Gruppensitzungen, und die server-seitigen Disappearing Messages. Was unten steht, ist entweder noch offen oder braucht ein externes Ereignis (Audit) beziehungsweise eine echte Organisation (unabhängige Auditoren, Push-Konten, Cluster) und bleibt deshalb bewusst offen.
+
 ## Das Dickste zuerst
 
 **Backup-Enclave.** SGX ist auf Intel-Client-CPUs faktisch tot (EOL), bleibt also AWS Nitro oder Azure Confidential Computing. Tendenz Nitro. Dann hängt die Frage dran: Wo liegen die verschlüsselten Backups physisch, im eigenen Objektspeicher? Und wie wird der Counter-State für das PIN-Limit repliziert, ohne das Limit zu unterlaufen? Das ist ein halbes Subprojekt. Rahmen inzwischen gesetzt (NF120, Pflichtenheft 8.4): SVR ist optional, aufgeschoben und nur unter Threshold über mehrere unabhängige Anbieter sowie mit Genehmigung zulässig; bis dahin bleibt der nutzergehaltene Recovery-Key der Standard. Offen bleiben Enclave-Wahl, Threshold-Aufteilung und Counter-State-Replikation.
