@@ -46,6 +46,24 @@ pub trait MessageStore: Send + Sync {
 
     /// Ob für das Gerät etwas wartet (für den Hinweis beim WS-Verbinden).
     async fn has_waiting(&self, device_id: &str) -> Result<bool, StoreError>;
+
+    /// Bewahrt das Franking-Commitment einer Hülle auf (fürs spätere
+    /// Verifizieren einer Meldung). Idempotent: derselbe Fan-out legt für
+    /// dieselbe Hüllen-ID dasselbe Commitment ab.
+    async fn store_franking(&self, message_id: &str, commitment: &[u8]) -> Result<(), StoreError>;
+
+    /// Das aufbewahrte Commitment einer Hülle, `None` wenn keins vorliegt.
+    async fn franking_commitment(&self, message_id: &str) -> Result<Option<Vec<u8>>, StoreError>;
+
+    /// Setzt oder entfernt einen Blocklisten-Eintrag: `owner` blockiert
+    /// `blocked` (`block = true`) beziehungsweise hebt das auf.
+    async fn set_block(&self, owner: &str, blocked: &str, block: bool) -> Result<(), StoreError>;
+
+    /// Ob `owner` das Handle `sender` blockiert hat.
+    async fn is_blocked(&self, owner: &str, sender: &str) -> Result<bool, StoreError>;
+
+    /// Die Blockliste von `owner` (die blockierten Handles).
+    async fn list_blocks(&self, owner: &str) -> Result<Vec<String>, StoreError>;
 }
 
 struct StoredEntry {
@@ -60,6 +78,10 @@ struct Inner {
     /// Alle je gesehenen Hüllen-IDs, Spiegel der message_dedupe-Tabelle.
     seen_ids: HashSet<String>,
     by_device: HashMap<String, Vec<StoredEntry>>,
+    /// Franking-Commitments je Hüllen-ID (Spiegel der franking_log-Tabelle).
+    franking: HashMap<String, Vec<u8>>,
+    /// Blocklisten je Eigentümer-Handle (Spiegel der blocks-Tabelle).
+    blocks: HashMap<String, HashSet<String>>,
 }
 
 /// Prozesslokale Ablage für Entwicklung und Tests (Daten enden mit dem
@@ -138,6 +160,60 @@ impl MessageStore for InMemoryMessageStore {
             .by_device
             .get(device_id)
             .is_some_and(|entries| !entries.is_empty()))
+    }
+
+    async fn store_franking(&self, message_id: &str, commitment: &[u8]) -> Result<(), StoreError> {
+        self.inner
+            .lock()
+            .expect("Lock nicht vergiftet")
+            .franking
+            .insert(message_id.to_string(), commitment.to_vec());
+        Ok(())
+    }
+
+    async fn franking_commitment(&self, message_id: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("Lock nicht vergiftet")
+            .franking
+            .get(message_id)
+            .cloned())
+    }
+
+    async fn set_block(&self, owner: &str, blocked: &str, block: bool) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().expect("Lock nicht vergiftet");
+        if block {
+            inner
+                .blocks
+                .entry(owner.to_string())
+                .or_default()
+                .insert(blocked.to_string());
+        } else if let Some(set) = inner.blocks.get_mut(owner) {
+            set.remove(blocked);
+        }
+        Ok(())
+    }
+
+    async fn is_blocked(&self, owner: &str, sender: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("Lock nicht vergiftet")
+            .blocks
+            .get(owner)
+            .is_some_and(|set| set.contains(sender)))
+    }
+
+    async fn list_blocks(&self, owner: &str) -> Result<Vec<String>, StoreError> {
+        let inner = self.inner.lock().expect("Lock nicht vergiftet");
+        let mut blocked: Vec<String> = inner
+            .blocks
+            .get(owner)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+        blocked.sort();
+        Ok(blocked)
     }
 }
 

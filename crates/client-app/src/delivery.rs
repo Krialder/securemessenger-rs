@@ -25,12 +25,16 @@ pub struct DeliveryClient {
 
 /// Eine ausgehende Hülle: client-erzeugte ID (Idempotenz), Empfänger-Handle,
 /// dessen Server-Geräte-ID und der geframte Chiffretext (wire::seal).
-#[derive(Serialize, Debug, Clone)]
+/// Optional das Franking-Commitment (Base64), unter dem sich die Nachricht
+/// später melden lässt (specs/sealed-sender-und-abuse.md).
+#[derive(Serialize, Debug, Clone, Default)]
 pub struct OutgoingEnvelope {
     pub id: String,
     pub recipient: String,
     pub device_id: String,
     pub envelope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub franking_tag: Option<String>,
 }
 
 /// Ergebnis der Annahme: angenommen plus als Duplikat erkannt (Retries
@@ -62,6 +66,28 @@ struct SubmitRequest<'a> {
 #[derive(Serialize)]
 struct AckRequest<'a> {
     ids: &'a [String],
+}
+
+#[derive(Serialize)]
+struct ReportRequest<'a> {
+    message_id: &'a str,
+    plaintext: &'a str,
+    franking_key: &'a str,
+}
+
+#[derive(Deserialize)]
+struct ReportResponse {
+    verified: bool,
+}
+
+#[derive(Serialize)]
+struct BlockRequest<'a> {
+    handle: &'a str,
+}
+
+#[derive(Deserialize)]
+struct BlocksResponse {
+    blocked: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -126,6 +152,72 @@ impl DeliveryClient {
     /// Die WebSocket-URL des Hinweiskanals zu dieser Basis-URL.
     pub fn ws_url(&self) -> String {
         ws_url(&self.base_url)
+    }
+
+    /// `POST /reports`: meldet eine Nachricht, indem der Empfänger Klartext
+    /// und Franking-Schlüssel aufdeckt. Liefert, ob die Meldung das
+    /// aufbewahrte Commitment öffnet (also beweisbar echt ist).
+    pub async fn report(
+        &self,
+        access_token: &str,
+        message_id: &str,
+        plaintext: &[u8],
+        franking_key: &[u8],
+    ) -> Result<bool, ClientError> {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine as _;
+        let response = self
+            .http
+            .post(format!("{}/reports", self.base_url))
+            .bearer_auth(access_token)
+            .json(&ReportRequest {
+                message_id,
+                plaintext: &BASE64.encode(plaintext),
+                franking_key: &BASE64.encode(franking_key),
+            })
+            .send()
+            .await
+            .map_err(transport)?;
+        let body: ReportResponse = parse_json(response).await?;
+        Ok(body.verified)
+    }
+
+    /// `POST /blocks`: blockiert ein Handle.
+    pub async fn block(&self, access_token: &str, handle: &str) -> Result<(), ClientError> {
+        let response = self
+            .http
+            .post(format!("{}/blocks", self.base_url))
+            .bearer_auth(access_token)
+            .json(&BlockRequest { handle })
+            .send()
+            .await
+            .map_err(transport)?;
+        crate::http::expect_success(response).await
+    }
+
+    /// `DELETE /blocks/{handle}`: hebt eine Blockierung auf.
+    pub async fn unblock(&self, access_token: &str, handle: &str) -> Result<(), ClientError> {
+        let response = self
+            .http
+            .delete(format!("{}/blocks/{handle}", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(transport)?;
+        crate::http::expect_success(response).await
+    }
+
+    /// `GET /blocks`: die eigene Blockliste.
+    pub async fn blocks(&self, access_token: &str) -> Result<Vec<String>, ClientError> {
+        let response = self
+            .http
+            .get(format!("{}/blocks", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(transport)?;
+        let body: BlocksResponse = parse_json(response).await?;
+        Ok(body.blocked)
     }
 
     /// `POST /groups`: legt eine Gruppe an (Mitglieder als Handles, vom

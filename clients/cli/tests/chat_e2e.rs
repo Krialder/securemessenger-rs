@@ -99,6 +99,17 @@ impl CliUser {
         );
         String::from_utf8_lossy(&output.stdout).to_string()
     }
+
+    /// Wie `run`, liefert aber stdout und stderr (der recv-Befehl schreibt
+    /// die Melde-ID auf stderr).
+    fn run_full(&self, args: &[&str]) -> (String, String) {
+        let output = self.command(args).output().expect("sm-Binary startet");
+        assert!(output.status.success(), "sm {args:?} scheiterte");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -216,6 +227,60 @@ async fn listen_receives_message_via_websocket_hint() {
         stdout.contains("[alice] geweckt vom hinweis"),
         "Bob muss die Nachricht über den Hinweis empfangen haben, stdout war: {stdout}\nstderr: {listen_stderr}"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Der Abuse-Abwehr-Beweis: eine Nachricht lässt sich beweisbar melden
+/// (Message Franking), und ein blockierter Absender kommt nicht mehr durch.
+#[tokio::test(flavor = "multi_thread")]
+async fn franking_report_verifies_and_blocking_drops() {
+    let urls = start_stack().await;
+    let dir = std::env::temp_dir().join(format!("sm-abuse-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("Testverzeichnis");
+
+    let alice = CliUser::new(&dir, "alice", &urls);
+    let bob = CliUser::new(&dir, "bob", &urls);
+    alice.run(&["register", "alice", "alices-langes-passwort"]);
+    alice.run(&["login", "alices-langes-passwort"]);
+    alice.run(&["publish-keys"]);
+    bob.run(&["register", "bob", "bobs-langes-passwort"]);
+    bob.run(&["login", "bobs-langes-passwort"]);
+    bob.run(&["publish-keys"]);
+
+    // Alice sendet, Bob empfaengt und liest die Melde-ID von stderr ab.
+    alice.run(&["send", "bob", "eine meldbare nachricht"]);
+    let (stdout, stderr) = bob.run_full(&["recv"]);
+    assert!(stdout.contains("[alice] eine meldbare nachricht"));
+    let message_id = stderr
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("(Melde-ID: "))
+        .and_then(|rest| rest.strip_suffix(")"))
+        .expect("recv gibt eine Melde-ID auf stderr aus")
+        .to_string();
+
+    // Bob meldet die Nachricht: der Server verifiziert das Franking.
+    let reported = bob.run(&["report", &message_id]);
+    assert!(
+        reported.contains("Meldung verifiziert"),
+        "die Meldung muss beweisbar echt sein, stdout war: {reported}"
+    );
+
+    // Bob blockiert Alice; ihre naechste Nachricht kommt nicht mehr an.
+    bob.run(&["block", "alice"]);
+    assert!(bob.run(&["blocks"]).contains("alice"));
+    alice.run(&["send", "bob", "das kommt nicht durch"]);
+    let blocked = bob.run(&["recv"]);
+    assert!(
+        blocked.contains("Keine neuen Nachrichten"),
+        "die blockierte Nachricht darf nicht ankommen, stdout war: {blocked}"
+    );
+
+    // Nach dem Entblocken geht es wieder.
+    bob.run(&["unblock", "alice"]);
+    alice.run(&["send", "bob", "jetzt wieder"]);
+    let received = bob.run(&["recv"]);
+    assert!(received.contains("[alice] jetzt wieder"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -523,6 +523,7 @@ dependencies = [
  "delivery",
  "directory",
  "ed25519-dalek",
+ "franking",
  "identity",
  "kt",
  "kt-format",
@@ -900,6 +901,7 @@ dependencies = [
  "axum",
  "base64",
  "common",
+ "franking",
  "futures-util",
  "http-body-util",
  "serde",
@@ -1236,6 +1238,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "franking"
+version = "0.1.0"
+dependencies = [
+ "hmac",
+ "rand 0.9.4",
+ "sha2",
+ "subtle",
 ]
 
 [[package]]

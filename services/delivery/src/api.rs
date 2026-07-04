@@ -27,7 +27,7 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -117,6 +117,9 @@ pub fn app(state: AppState) -> Router {
         .route("/", get(|| async { "SecureMessenger delivery service" }))
         .route("/messages", get(fetch).post(submit))
         .route("/messages/ack", post(acknowledge))
+        .route("/reports", post(report_message))
+        .route("/blocks", get(list_blocks).post(add_block))
+        .route("/blocks/{handle}", delete(remove_block))
         .route("/groups", post(create_group))
         .route("/groups/{group_id}/commit", post(group_commit))
         .route("/groups/{group_id}/messages", post(group_messages))
@@ -257,11 +260,11 @@ async fn submit(
     headers: HeaderMap,
     Json(req): Json<SubmitRequest>,
 ) -> Response {
-    match authenticate(&st, &headers).await {
-        Ok(Some(_)) => {}
+    let sender = match authenticate(&st, &headers).await {
+        Ok(Some(caller)) => caller.handle,
         Ok(None) => return invalid_token(),
         Err(()) => return internal(),
-    }
+    };
     if req.envelopes.is_empty() {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -307,7 +310,24 @@ async fn submit(
             }
         }
     }
+    // Blocklisten je Empfänger einmal abfragen: hat ein Empfänger den
+    // Absender blockiert, werden seine Hüllen still verworfen. Der Absender
+    // erfährt das nicht (die Hüllen zählen als angenommen), sonst wäre die
+    // Blockliste über die Antwort auslesbar.
+    let mut blocked_recipients = std::collections::HashMap::new();
+    for recipient in accounts.keys() {
+        let blocked = match st.store.is_blocked(recipient, &sender).await {
+            Ok(blocked) => blocked,
+            Err(error) => {
+                tracing::error!(%error, "Blocklisten-Abfrage fehlgeschlagen");
+                return internal();
+            }
+        };
+        blocked_recipients.insert(recipient.clone(), blocked);
+    }
+
     let mut messages = Vec::with_capacity(req.envelopes.len());
+    let mut dropped = 0u64;
     for envelope in &req.envelopes {
         let account = &accounts[&envelope.recipient];
         if !account.devices.iter().any(|d| d.id == envelope.device_id) {
@@ -320,6 +340,11 @@ async fn submit(
                 ),
             );
         }
+        if blocked_recipients[&envelope.recipient] {
+            // Still verwerfen: der Empfänger hat den Absender blockiert.
+            dropped += 1;
+            continue;
+        }
         messages.push(NewMessage {
             id: envelope.id.clone(),
             recipient_id: account.id.clone(),
@@ -329,9 +354,29 @@ async fn submit(
         });
     }
 
+    // Franking-Commitments der zugestellten Hüllen aufbewahren (fürs spätere
+    // Verifizieren einer Meldung). Der Server sieht dabei nur das Commitment,
+    // nie Klartext oder Franking-Schlüssel.
+    let frankings: Vec<(String, Vec<u8>)> = req
+        .envelopes
+        .iter()
+        .filter(|e| !blocked_recipients[&e.recipient])
+        .filter_map(|e| {
+            e.franking_tag
+                .as_ref()
+                .and_then(|tag| BASE64.decode(tag).ok())
+                .map(|commitment| (e.id.clone(), commitment))
+        })
+        .collect();
+
     let devices: Vec<String> = messages.iter().map(|m| m.device_id.clone()).collect();
     match st.store.store_batch(messages).await {
         Ok(outcome) => {
+            for (id, commitment) in frankings {
+                if let Err(error) = st.store.store_franking(&id, &commitment).await {
+                    tracing::error!(%error, "Franking-Commitment nicht aufbewahrt");
+                }
+            }
             // Hinweis je Zielgerät, auch bei Duplikaten: der Hinweis ist
             // billig und trägt keinen Inhalt, das Gerät holt und sieht
             // selbst, ob etwas wartet.
@@ -344,7 +389,9 @@ async fn submit(
             (
                 StatusCode::OK,
                 Json(SubmitResponse {
-                    accepted: outcome.accepted,
+                    // Verworfene (blockierte) Hüllen zählen als angenommen,
+                    // damit die Antwort die Blockliste nicht verrät.
+                    accepted: outcome.accepted + dropped,
                     duplicates: outcome.duplicates,
                 }),
             )
@@ -443,6 +490,166 @@ async fn acknowledge(
         Ok(removed) => (StatusCode::OK, Json(AckResponse { removed })).into_response(),
         Err(error) => {
             tracing::error!(%error, "Ack fehlgeschlagen");
+            internal()
+        }
+    }
+}
+
+// ---- Abuse-Abwehr: Meldungen und Blocklisten ----------------------------
+
+#[derive(Deserialize)]
+struct ReportRequest {
+    /// Die Hüllen-ID der gemeldeten Nachricht (wie abgeholt).
+    message_id: String,
+    /// Der entschlüsselte Klartext (Base64), den der Empfänger aufdeckt.
+    plaintext: String,
+    /// Der Franking-Schlüssel `K_f` (Base64), den der Absender E2E
+    /// mitschickte und den der Empfänger jetzt aufdeckt.
+    franking_key: String,
+}
+
+#[derive(Serialize)]
+struct ReportResponse {
+    /// Ob die Meldung das aufbewahrte Commitment öffnet: nur dann ist sie
+    /// echt (die Nachricht wurde wirklich so gesendet).
+    verified: bool,
+}
+
+/// `POST /reports`: prüft eine Missbrauchs-Meldung. Der Empfänger deckt
+/// Klartext und Franking-Schlüssel auf; der Server rechnet das Commitment
+/// nach und vergleicht es mit dem aufbewahrten. Öffnet es, ist die Meldung
+/// beweisbar echt; sonst ist sie gefälscht. Der Server lernt den Inhalt
+/// erst durch die Meldung des Empfängers, nie vorher.
+async fn report_message(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ReportRequest>,
+) -> Response {
+    match authenticate(&st, &headers).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return invalid_token(),
+        Err(()) => return internal(),
+    }
+    if !canonical_uuid(&req.message_id) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_report",
+            "message_id muss eine UUID in kanonischer Form sein",
+        );
+    }
+    let plaintext = match BASE64.decode(&req.plaintext) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_report",
+                "plaintext ist kein gültiges Base64",
+            )
+        }
+    };
+    let franking_key = match BASE64.decode(&req.franking_key) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_report",
+                "franking_key ist kein gültiges Base64",
+            )
+        }
+    };
+    let commitment = match st.store.franking_commitment(&req.message_id).await {
+        Ok(Some(commitment)) => commitment,
+        Ok(None) => {
+            // Kein Commitment: die Nachricht trug kein Franking oder ist
+            // längst weggeräumt. 404, nicht "nicht verifiziert".
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "no_franking",
+                "Zu dieser Nachricht liegt kein Franking-Commitment vor",
+            );
+        }
+        Err(error) => {
+            tracing::error!(%error, "Franking-Commitment nicht lesbar");
+            return internal();
+        }
+    };
+    let verified = franking::verify(&franking_key, &plaintext, &commitment);
+    (StatusCode::OK, Json(ReportResponse { verified })).into_response()
+}
+
+#[derive(Deserialize)]
+struct BlockRequest {
+    /// Das zu blockierende Handle.
+    handle: String,
+}
+
+#[derive(Serialize)]
+struct BlocksResponse {
+    blocked: Vec<String>,
+}
+
+/// `POST /blocks`: blockiert ein Handle für das eigene Konto. Danach werden
+/// Nachrichten dieses Absenders still verworfen (submit).
+async fn add_block(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<BlockRequest>,
+) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(caller)) => caller,
+        Ok(None) => return invalid_token(),
+        Err(()) => return internal(),
+    };
+    if req.handle.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_block", "handle fehlt");
+    }
+    if req.handle == who.handle {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_block",
+            "Das eigene Konto lässt sich nicht blockieren",
+        );
+    }
+    match st.store.set_block(&who.handle, &req.handle, true).await {
+        Ok(()) => (StatusCode::NO_CONTENT, ()).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "Blockieren fehlgeschlagen");
+            internal()
+        }
+    }
+}
+
+/// `DELETE /blocks/{handle}`: hebt eine Blockierung auf.
+async fn remove_block(
+    State(st): State<AppState>,
+    axum::extract::Path(handle): axum::extract::Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(caller)) => caller,
+        Ok(None) => return invalid_token(),
+        Err(()) => return internal(),
+    };
+    match st.store.set_block(&who.handle, &handle, false).await {
+        Ok(()) => (StatusCode::NO_CONTENT, ()).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "Entblocken fehlgeschlagen");
+            internal()
+        }
+    }
+}
+
+/// `GET /blocks`: die eigene Blockliste.
+async fn list_blocks(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(caller)) => caller,
+        Ok(None) => return invalid_token(),
+        Err(()) => return internal(),
+    };
+    match st.store.list_blocks(&who.handle).await {
+        Ok(blocked) => (StatusCode::OK, Json(BlocksResponse { blocked })).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "Blockliste nicht lesbar");
             internal()
         }
     }

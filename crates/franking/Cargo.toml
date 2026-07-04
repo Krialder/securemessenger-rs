@@ -1,0 +1,23 @@
+[package]
+name = "franking"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Message Franking (specs/sealed-sender-und-abuse.md): das kryptografische
+# Commitment, mit dem sich eine missbraeuchliche Nachricht beweisbar melden
+# laesst, ohne dass sich Meldungen faelschen lassen. Der Absender committet
+# sich beim Senden, der Server bewahrt das Commitment auf (ohne den Inhalt
+# zu sehen), der Empfaenger deckt es beim Melden auf.
+#
+# Kein Eigenbau: Committing ueber HMAC-SHA256, die Standard-Konstruktion
+# fuer Message Franking (Grubbs/Lu/Ristenpart; so nutzt es auch Signal/
+# WhatsApp). Geteilt zwischen Client (committen) und Server (verifizieren),
+# damit beide dieselbe Rechnung machen.
+
+[dependencies]
+hmac = "0.12"
+sha2.workspace = true
+subtle = "2"
+rand.workspace = true

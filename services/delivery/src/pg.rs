@@ -251,6 +251,77 @@ impl MessageStore for PgMessageStore {
                 .map_err(backend)?;
         Ok(row.get("waiting"))
     }
+
+    async fn store_franking(&self, message_id: &str, commitment: &[u8]) -> Result<(), StoreError> {
+        let id = parse_uuid(message_id, "Hüllen-ID")?;
+        // Idempotent: derselbe Fan-out schreibt für dieselbe ID dasselbe
+        // Commitment; ON CONFLICT lässt den ersten Eintrag stehen.
+        sqlx::query(
+            "INSERT INTO franking_log (message_id, commitment) VALUES ($1, $2) \
+             ON CONFLICT (message_id) DO NOTHING",
+        )
+        .bind(id)
+        .bind(commitment)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn franking_commitment(&self, message_id: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let id = parse_uuid(message_id, "Hüllen-ID")?;
+        let row = sqlx::query("SELECT commitment FROM franking_log WHERE message_id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(row.map(|r| r.get::<Vec<u8>, _>("commitment")))
+    }
+
+    async fn set_block(&self, owner: &str, blocked: &str, block: bool) -> Result<(), StoreError> {
+        if block {
+            sqlx::query(
+                "INSERT INTO blocks (owner_handle, blocked_handle) VALUES ($1, $2) \
+                 ON CONFLICT (owner_handle, blocked_handle) DO NOTHING",
+            )
+            .bind(owner)
+            .bind(blocked)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        } else {
+            sqlx::query("DELETE FROM blocks WHERE owner_handle = $1 AND blocked_handle = $2")
+                .bind(owner)
+                .bind(blocked)
+                .execute(&self.pool)
+                .await
+                .map_err(backend)?;
+        }
+        Ok(())
+    }
+
+    async fn is_blocked(&self, owner: &str, sender: &str) -> Result<bool, StoreError> {
+        let row = sqlx::query(
+            "SELECT EXISTS(SELECT 1 FROM blocks WHERE owner_handle = $1 AND blocked_handle = $2) AS blocked",
+        )
+        .bind(owner)
+        .bind(sender)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(row.get("blocked"))
+    }
+
+    async fn list_blocks(&self, owner: &str) -> Result<Vec<String>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT blocked_handle FROM blocks WHERE owner_handle = $1 ORDER BY blocked_handle",
+        )
+        .bind(owner)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(rows.iter().map(|r| r.get("blocked_handle")).collect())
+    }
 }
 
 /// PostgreSQL-Umsetzung der Gruppen-Ablage (groups.rs). Teilt den Pool mit

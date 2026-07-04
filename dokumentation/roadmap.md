@@ -49,7 +49,7 @@ Baut auf Identität und Auth auf, macht den Kern zum Fundament für die übrigen
 - [ ] Key Transparency vollständig: Auditoren, Gossip, Konsistenzbeweise
 - [ ] Safety Numbers und sichtbare Warnung bei Schlüsselwechsel
 - [x] Contact Discovery (OPRF): der Client blendet den Handle, identity wertet die OPRF aus (voprf, RFC 9497), der Client entblendet und schlägt oblivious nach; rate-limitiert gegen Enumeration, Ergebnis gegen KT prüfbar
-- [ ] Abuse: Message Franking, empfängerseitige Kontrollen, Sybil-Widerstand
+- [x] Abuse: Message Franking (HMAC-Commitment, beweisbare Meldung) und empfängerseitige Kontrollen (Blockieren); Sybil-Widerstand (PoW/Privacy Pass) offen
 - [ ] Compliance-Position festgelegt (CSAR, Online Safety Act)
 
 ## Phase 4: Gruppen

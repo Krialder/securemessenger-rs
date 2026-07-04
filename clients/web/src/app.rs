@@ -303,6 +303,11 @@ async fn send_message(core: &mut Core, peer: &str, text: &str) -> Result<(), Str
         known
     };
 
+    // Einmal je Nachricht franken (specs/sealed-sender-und-abuse.md): der
+    // Franking-Schlüssel reist im verschlüsselten Payload, das Commitment
+    // als Tag an der Hülle. Dieselben Werte für alle Zielgeräte.
+    let franked = client_app::franking::frank(text.as_bytes());
+    let franking_tag = BASE64.encode(&franked.commitment);
     let mut envelopes = Vec::new();
     for target in &devices {
         let address = ProtocolAddress::new(
@@ -311,7 +316,7 @@ async fn send_message(core: &mut Core, peer: &str, text: &str) -> Result<(), Str
         );
         let message = core
             .device
-            .encrypt(&address, text.as_bytes())
+            .encrypt(&address, &franked.payload)
             .await
             .map_err(|e| format!("Verschlüsselung: {e}"))?;
         let envelope =
@@ -321,6 +326,7 @@ async fn send_message(core: &mut Core, peer: &str, text: &str) -> Result<(), Str
             recipient: peer.to_string(),
             device_id: target.server_device_id.clone(),
             envelope,
+            franking_tag: Some(franking_tag.clone()),
         });
     }
     DeliveryClient::new(delivery_url())
@@ -354,11 +360,14 @@ async fn fetch_messages(core: &mut Core) -> Result<Vec<(String, String)>, String
             device_id_from_u32(opened.from_device).map_err(|e| e.to_string())?,
         );
         match core.device.decrypt(&address, &opened.message).await {
-            Ok(plaintext) => {
-                received.push((
-                    opened.from.clone(),
-                    String::from_utf8_lossy(&plaintext).to_string(),
-                ));
+            Ok(payload) => {
+                // Payload ist gefrankt (K_f vorangestellt); entrahmen, sonst
+                // roh anzeigen (ältere, ungefrankte Nachrichten).
+                let text = match client_app::franking::unfrank(&payload) {
+                    Ok(opened_msg) => String::from_utf8_lossy(&opened_msg.message).to_string(),
+                    Err(_) => String::from_utf8_lossy(&payload).to_string(),
+                };
+                received.push((opened.from.clone(), text));
                 acked.push(message.id.clone());
             }
             Err(error) => {

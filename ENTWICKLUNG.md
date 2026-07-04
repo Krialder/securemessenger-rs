@@ -13,6 +13,8 @@ crates/
                       Server und Clients (auch wasm32); Feature verify liefert die akd-Konfiguration samt Domain-Label
   oprf/               OPRF-Kern für Contact Discovery (voprf, RFC 9497, Ristretto255); geteilt zwischen Client (blenden,
                       entblenden) und Server (auswerten), kein Eigenbau
+  franking/           Message-Franking-Commitment (HMAC-SHA256); geteilt zwischen Client (committen) und Server
+                      (Meldung verifizieren), kein Eigenbau
   client-core/        der Krypto-Kern der Clients (libsignal, OpenMLS, gepinnt); kein Dienst hängt davon ab
     src/onetoone.rs   1:1-Sitzungen: PQXDH-Aufbau, Double Ratchet, Safety Number (Wrapper, keine Eigenbauten)
     src/group.rs      MLS-Gruppen: Suite 0x0003, Skipped-Keys-Fenster, GroupSession (Byte-Ein-Byte-Aus für den Client)
@@ -31,7 +33,7 @@ crates/
     tests/messaging_e2e.rs  End-to-End über identity+directory+delivery: PQXDH, E2EE-Umlauf, Ablage ohne Klartext
     tests/kt_e2e.rs   End-to-End über identity+kt: Selbstprüfung besteht, untergeschobener Schlüssel schlägt Alarm
 clients/
-  cli/                Headless-Referenzclient `sm`: register/login/logout/whoami/publish-keys/send/recv/listen/verify
+  cli/                Headless-Referenzclient `sm`: register/login/logout/whoami/publish-keys/send/recv/listen/verify/report/block/unblock/blocks
     tests/chat_e2e.rs Chat-Beweis (jeder Befehl ein eigener Prozess, Dienste in-process) plus Hinweiskanal-Beweis (listen --once)
   web/                Leptos-Web-Client (WASM, CSR): nur Darstellung, Krypto und Protokoll kommen aus den Crates
     src/main.rs       Einstieg mit cfg-Weiche: nativ nur ein Stub, damit `cargo test --workspace` nicht am Browser-Code hängt
@@ -213,6 +215,8 @@ Der Dienst kennt keine Passwörter und keine Sessions: Bearer-Tokens prüft er �
 | `POST /groups` | Gruppe anlegen (client-erzeugte UUID, Mitglieder als Handles, aufgelöst zu Zielgeräten); 201 mit `epoch`/`devices`, 400, 401, 409 |
 | `POST /groups/{id}/commit` | Commit serialisieren: passt `from_epoch`, Epoche +1, Mitgliederliste ersetzt, Fan-out; 200 mit `epoch`, 409 `stale_epoch` mit `current_epoch`, 400, 401, 404 |
 | `POST /groups/{id}/messages` | Anwendungsnachricht an die Mitglieds-Geräte fächern; nur bekannte Mitglieder; 200 mit `accepted`/`duplicates`, 400, 401, 404 |
+| `POST /reports` | Missbrauchs-Meldung prüfen: aufgedeckten Klartext und Franking-Schlüssel gegen das aufbewahrte Commitment; 200 mit `verified`, 400, 401, 404 |
+| `GET /blocks`, `POST /blocks`, `DELETE /blocks/{handle}` | eigene Blockliste lesen, blockieren, aufheben; blockierte Absender werden bei `POST /messages` still verworfen; 200/204, 400, 401 |
 | `GET /ws` | WebSocket für Echtzeit-Hinweise; erster Frame `{"token":"..."}` binnen 10 s, danach `{"event":"message.waiting"}`-Hinweise und `integration.notification`-Events; Close 4401 bei Auth-Fehlern, 1011 bei internen Fehlern |
 | `POST /internal/events` | Dienst-zu-Dienst (integrations): Event an verbundene Geräte verteilen; nur mit `INTERNAL_TOKEN` |
 | `POST /internal/presence/query` | Dienst-zu-Dienst: welche Geräte sind gerade verbunden (Grundlage von F080) |

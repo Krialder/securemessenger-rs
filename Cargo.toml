@@ -12,6 +12,7 @@ members = [
     "crates/client-app",
     "crates/client-core",
     "crates/common",
+    "crates/franking",
     "crates/kt-format",
     "crates/oprf",
     "services/delivery",
@@ -75,6 +76,9 @@ common = { path = "crates/common" }
 kt-format = { path = "crates/kt-format" }
 # OPRF-Kern für Contact Discovery, geteilt zwischen Client und Server.
 oprf = { path = "crates/oprf" }
+# Message-Franking-Commitment, geteilt zwischen Client (committen) und
+# Server (Meldung verifizieren).
+franking = { path = "crates/franking" }
 
 # Argon2 ist in Debug-Builds unbrauchbar langsam (Sekunden pro Hash).
 # Die Krypto-Pakete werden deshalb auch im Dev-Profil optimiert gebaut,

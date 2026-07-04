@@ -93,6 +93,10 @@ async fn run() -> Result<(), String> {
         "recv" => recv().await,
         "listen" => listen(&args[1..]).await,
         "verify" => verify().await,
+        "report" => report(&args[1..]).await,
+        "block" => block(&args[1..]).await,
+        "unblock" => unblock(&args[1..]).await,
+        "blocks" => blocks().await,
         "help" | "-h" | "--help" => {
             print_usage();
             Ok(())
@@ -300,6 +304,12 @@ async fn send(args: &[String]) -> Result<(), String> {
         devices
     };
 
+    // Einmal je Nachricht franken: derselbe Franking-Schlüssel und dasselbe
+    // Commitment für alle Zielgeräte, damit der Empfänger jede Kopie melden
+    // kann (specs/sealed-sender-und-abuse.md). Der Schlüssel reist im
+    // verschlüsselten Payload, das Commitment als Franking-Tag.
+    let franked = client_app::franking::frank(text.as_bytes());
+    let franking_tag = BASE64.encode(&franked.commitment);
     let mut envelopes = Vec::with_capacity(devices.len());
     for target in &devices {
         let address = ProtocolAddress::new(
@@ -307,7 +317,7 @@ async fn send(args: &[String]) -> Result<(), String> {
             device_id_from_u32(target.protocol_device_id).map_err(|e| e.to_string())?,
         );
         let message = device
-            .encrypt(&address, text.as_bytes())
+            .encrypt(&address, &franked.payload)
             .await
             .map_err(|e| format!("Verschlüsselung: {e}"))?;
         let envelope =
@@ -317,6 +327,7 @@ async fn send(args: &[String]) -> Result<(), String> {
             recipient: recipient.to_string(),
             device_id: target.server_device_id.clone(),
             envelope,
+            franking_tag: Some(franking_tag.clone()),
         });
     }
 
@@ -338,13 +349,31 @@ async fn send(args: &[String]) -> Result<(), String> {
 async fn recv() -> Result<(), String> {
     let profile = load_profile()?;
     let token = access_token(&profile)?;
-    let (mut device, _storage) = open_device(&profile)?;
+    let (mut device, storage) = open_device(&profile)?;
 
     let delivery = DeliveryClient::new(delivery_url());
-    if drain_waiting(&delivery, &token, &mut device).await? == 0 {
+    if drain_waiting(&delivery, &token, &mut device, &storage).await? == 0 {
         println!("Keine neuen Nachrichten.");
     }
     Ok(())
+}
+
+/// Legt Franking-Schlüssel und Klartext einer empfangenen Nachricht ab,
+/// damit `sm report` sie später aufdecken kann. Schlüssel: `franking/{id}`.
+fn remember_franking(
+    storage: &SharedStorage,
+    message_id: &str,
+    opened: &client_app::franking::OpenedMessage,
+) -> Result<(), String> {
+    let record = serde_json::json!({
+        "key": BASE64.encode(&opened.franking_key),
+        "message": BASE64.encode(&opened.message),
+    });
+    let json = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
+    storage
+        .borrow_mut()
+        .put(&format!("franking/{message_id}"), &json)
+        .map_err(|e| e.to_string())
 }
 
 /// Der Abhol-Durchlauf von `recv` und `listen`: wartende Hüllen holen,
@@ -354,6 +383,7 @@ async fn drain_waiting(
     delivery: &DeliveryClient,
     token: &str,
     device: &mut Device<PersistentProtocolStore<FileStorage>>,
+    storage: &SharedStorage,
 ) -> Result<usize, String> {
     let waiting = delivery.fetch(token).await.map_err(|e| e.to_string())?;
     let mut acked = Vec::with_capacity(waiting.len());
@@ -372,8 +402,27 @@ async fn drain_waiting(
             device_id_from_u32(opened.from_device).map_err(|e| e.to_string())?,
         );
         match device.decrypt(&address, &opened.message).await {
-            Ok(plaintext) => {
-                println!("[{}] {}", opened.from, String::from_utf8_lossy(&plaintext));
+            Ok(payload) => {
+                // Der Payload ist gefrankt (K_f vorangestellt); entrahmen,
+                // die eigentliche Nachricht ausgeben und das Franking-Material
+                // fürs spätere Melden ablegen (sm report). Ältere, ungefrankte
+                // Nachrichten fallen auf die rohe Anzeige zurück.
+                match client_app::franking::unfrank(&payload) {
+                    Ok(opened_msg) => {
+                        println!(
+                            "[{}] {}",
+                            opened.from,
+                            String::from_utf8_lossy(&opened_msg.message)
+                        );
+                        // Die Melde-ID auf stderr, damit die Nachrichtenzeile
+                        // (stdout) schlicht bleibt: `sm report <id>`.
+                        eprintln!("  (Melde-ID: {})", message.id);
+                        remember_franking(storage, &message.id, &opened_msg)?;
+                    }
+                    Err(_) => {
+                        println!("[{}] {}", opened.from, String::from_utf8_lossy(&payload));
+                    }
+                }
                 acked.push(message.id.clone());
             }
             Err(error) => {
@@ -409,7 +458,7 @@ async fn listen(args: &[String]) -> Result<(), String> {
     };
     let profile = load_profile()?;
     let token = access_token(&profile)?;
-    let (mut device, _storage) = open_device(&profile)?;
+    let (mut device, storage) = open_device(&profile)?;
     let delivery = DeliveryClient::new(delivery_url());
 
     let (mut socket, _) = tokio_tungstenite::connect_async(delivery.ws_url())
@@ -421,7 +470,7 @@ async fn listen(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("Auth-Frame nicht gesendet: {e}"))?;
 
     // Was schon wartet, kündigt kein Hinweis mehr an.
-    if drain_waiting(&delivery, &token, &mut device).await? > 0 && once {
+    if drain_waiting(&delivery, &token, &mut device, &storage).await? > 0 && once {
         return Ok(());
     }
 
@@ -431,7 +480,7 @@ async fn listen(args: &[String]) -> Result<(), String> {
         match frame {
             Message::Text(text) => match parse_ws_event(text.as_str()) {
                 Some(WsEvent::MessageWaiting) => {
-                    if drain_waiting(&delivery, &token, &mut device).await? > 0 && once {
+                    if drain_waiting(&delivery, &token, &mut device, &storage).await? > 0 && once {
                         return Ok(());
                     }
                 }
@@ -458,6 +507,92 @@ async fn listen(args: &[String]) -> Result<(), String> {
         }
     }
     Err("Verbindung beendet".to_string())
+}
+
+/// `sm report <message_id>`: meldet eine empfangene Nachricht. Deckt den
+/// beim Empfang abgelegten Franking-Schlüssel und Klartext auf; der Server
+/// prüft, ob sie das aufbewahrte Commitment öffnen (beweisbar echt).
+async fn report(args: &[String]) -> Result<(), String> {
+    let [message_id] = args else {
+        return Err("Aufruf: sm report <message_id>".to_string());
+    };
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    let (_device, storage) = open_device(&profile)?;
+
+    let bytes = storage
+        .borrow()
+        .get(&format!("franking/{message_id}"))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Kein Franking-Material zu {message_id} (erst empfangen)"))?;
+    let record: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("Franking-Ablage unlesbar: {e}"))?;
+    let key = BASE64
+        .decode(record["key"].as_str().unwrap_or_default())
+        .map_err(|e| e.to_string())?;
+    let message = BASE64
+        .decode(record["message"].as_str().unwrap_or_default())
+        .map_err(|e| e.to_string())?;
+
+    let verified = DeliveryClient::new(delivery_url())
+        .report(&token, message_id, &message, &key)
+        .await
+        .map_err(|e| e.to_string())?;
+    if verified {
+        println!("Meldung verifiziert: die Nachricht wurde nachweislich so gesendet.");
+    } else {
+        println!("Meldung NICHT verifiziert: das Commitment öffnet nicht.");
+    }
+    Ok(())
+}
+
+/// `sm block <handle>`: blockiert ein Handle; danach werden dessen
+/// Nachrichten still verworfen.
+async fn block(args: &[String]) -> Result<(), String> {
+    let [handle] = args else {
+        return Err("Aufruf: sm block <handle>".to_string());
+    };
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    DeliveryClient::new(delivery_url())
+        .block(&token, handle)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("{handle} blockiert.");
+    Ok(())
+}
+
+/// `sm unblock <handle>`: hebt eine Blockierung auf.
+async fn unblock(args: &[String]) -> Result<(), String> {
+    let [handle] = args else {
+        return Err("Aufruf: sm unblock <handle>".to_string());
+    };
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    DeliveryClient::new(delivery_url())
+        .unblock(&token, handle)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("{handle} entblockt.");
+    Ok(())
+}
+
+/// `sm blocks`: zeigt die eigene Blockliste.
+async fn blocks() -> Result<(), String> {
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    let blocked = DeliveryClient::new(delivery_url())
+        .blocks(&token)
+        .await
+        .map_err(|e| e.to_string())?;
+    if blocked.is_empty() {
+        println!("Keine blockierten Handles.");
+    } else {
+        for handle in blocked {
+            println!("{handle}");
+        }
+    }
+    Ok(())
 }
 
 /// `sm verify`: die KT-Selbstprüfung des eigenen Kontos
@@ -510,6 +645,10 @@ fn print_usage() {
          \x20 recv                           wartende Nachrichten abholen und entschlüsseln\n\
          \x20 listen [--once]                Hinweiskanal halten und bei Hinweisen abholen\n\
          \x20 verify                         eigenen KT-Eintrag pruefen (Selbstpruefung)\n\
+         \x20 report <message_id>            empfangene Nachricht melden (Franking aufdecken)\n\
+         \x20 block <handle>                 Absender blockieren\n\
+         \x20 unblock <handle>               Blockierung aufheben\n\
+         \x20 blocks                         eigene Blockliste anzeigen\n\
          \x20 help                           diese Hilfe\n\
          \n\
          Umgebung:\n\

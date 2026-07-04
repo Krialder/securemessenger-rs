@@ -135,6 +135,55 @@ async fn franking_tag_roundtrips_as_absent_when_empty() {
     assert_eq!(waiting[0].franking_tag, None);
 }
 
+/// Franking-Commitments und Blocklisten über echtes PostgreSQL: das
+/// Commitment wird aufbewahrt und wieder gefunden, Blockeinträge sind
+/// idempotent und aufhebbar.
+#[tokio::test]
+async fn franking_and_blocks_over_postgres() {
+    let Some(store) = store().await else { return };
+    let message_id = Uuid::new_v4().to_string();
+
+    // Kein Commitment vor dem Speichern.
+    assert!(store
+        .franking_commitment(&message_id)
+        .await
+        .unwrap()
+        .is_none());
+    store
+        .store_franking(&message_id, b"das-commitment")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .franking_commitment(&message_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(b"das-commitment".as_slice())
+    );
+    // Erneutes Speichern derselben ID ist idempotent (erster Eintrag bleibt).
+    store.store_franking(&message_id, b"anderes").await.unwrap();
+    assert_eq!(
+        store
+            .franking_commitment(&message_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(b"das-commitment".as_slice())
+    );
+
+    // Blocklisten: setzen (idempotent), abfragen, aufheben.
+    let owner = format!("owner-{}", Uuid::new_v4());
+    assert!(!store.is_blocked(&owner, "spammer").await.unwrap());
+    store.set_block(&owner, "spammer", true).await.unwrap();
+    store.set_block(&owner, "spammer", true).await.unwrap();
+    assert!(store.is_blocked(&owner, "spammer").await.unwrap());
+    assert_eq!(store.list_blocks(&owner).await.unwrap(), vec!["spammer"]);
+    store.set_block(&owner, "spammer", false).await.unwrap();
+    assert!(!store.is_blocked(&owner, "spammer").await.unwrap());
+    assert!(store.list_blocks(&owner).await.unwrap().is_empty());
+}
+
 /// Konkurrierende Commits gegen dieselbe Epoche über echtes PostgreSQL:
 /// die Zeilensperre serialisiert sie, genau einer gewinnt und erhöht die
 /// Epoche, alle anderen bekommen StaleEpoch. Das ist die Auflösungsregel

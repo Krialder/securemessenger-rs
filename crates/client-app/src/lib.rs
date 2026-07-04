@@ -23,6 +23,7 @@ pub mod delivery;
 pub mod directory;
 pub mod discovery;
 pub mod error;
+pub mod franking;
 mod http;
 pub mod identity;
 pub mod kt;

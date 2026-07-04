@@ -19,6 +19,9 @@ uuid.workspace = true
 # Guard der /internal-Routen: das Shared Secret wird nur als SHA-256-Digest
 # gehalten und verglichen (gleiches Muster wie bei identity).
 sha2.workspace = true
+# Message-Franking-Commitment: Verifikation gemeldeter Nachrichten
+# (specs/sealed-sender-und-abuse.md), geteilt mit dem Client.
+franking.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
