@@ -13,7 +13,7 @@ Sortiert nach Abhängigkeiten, ohne Termine. Zwei Dinge sind bewusst eingebaut: 
 - [x] MLS Delivery Service, siehe [specs/mls-delivery-service.md](specs/mls-delivery-service.md)
 - [x] Binary Transparency, siehe [ADR-0007](entscheidungen/0007-binary-transparency.md)
 - [x] Backup/SVR-Skizze, siehe [specs/backup-und-recovery.md](specs/backup-und-recovery.md)
-- [ ] Threat-Model-Gerüst (Assets, Trust-Boundaries, Adversary-Katalog) zu vollem LINDDUN/STRIDE ausbauen, als Eingang in Phase 1
+- [x] Threat-Model-Gerüst zu vollem LINDDUN/STRIDE ausgebaut ([bedrohungsmodell.md](bedrohungsmodell.md): STRIDE je Dienst, LINDDUN je Datenfluss, Restrisiko-Register, jede Bedrohung mit Gegenmaßnahme im Code); formales Handshake-Modell (ProVerif/Tamarin) bleibt der Härtungsphase
 - [ ] Externer Krypto-Review auf Specs und Code, spätestens zusammen mit dem ersten Audit (M4); blockiert nicht mehr den Code-Start, sondern den Produktivbetrieb, siehe [ADR-0008](entscheidungen/0008-krypto-vor-externem-review.md)
 
 ## Phase 1: Fundament

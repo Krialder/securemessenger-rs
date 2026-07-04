@@ -1,6 +1,6 @@
 # Sicherheit und Bedrohungsmodell
 
-Dieses Dokument ist systematischer aufgezogen als eine reine Szenario-Liste: erst was wir schützen, dann die Vertrauensgrenzen, dann die Angreifer, und erst danach die Tabelle, wer gegen wen gewinnt. Ein vollständiges LINDDUN- und STRIDE-Modell kommt vor Phase 2, das hier ist sein Gerüst.
+Dieses Dokument ist systematischer aufgezogen als eine reine Szenario-Liste: erst was wir schützen, dann die Vertrauensgrenzen, dann die Angreifer, und erst danach die Tabelle, wer gegen wen gewinnt. Das vollständige LINDDUN- und STRIDE-Modell, je Komponente und Datenfluss und mit den Gegenmaßnahmen im Code, steht im [Bedrohungsmodell](bedrohungsmodell.md); dieses Dokument bleibt der Überblick.
 
 ## Assets
 

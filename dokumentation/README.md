@@ -31,7 +31,8 @@ Diese Doku ist eine Übersicht plus die Specs, an denen so ein System steht oder
 | [live-dokument.md](live-dokument.md) | Fortlaufendes Design Doc: Problem, Ziele, Architektur, SRE, Risiken, Postmortem-Vorlage |
 | [architektur.md](architektur.md) | Dienste, der Krypto-Core, Echtzeit, Skalierung |
 | [protokoll.md](protokoll.md) | Krypto im Überblick, mit Verweis auf die tiefen Specs |
-| [sicherheit.md](sicherheit.md) | Threat Model mit Assets und Grenzen |
+| [sicherheit.md](sicherheit.md) | Threat Model mit Assets und Grenzen (Überblick) |
+| [bedrohungsmodell.md](bedrohungsmodell.md) | Volles STRIDE je Dienst und LINDDUN je Datenfluss, mit Gegenmaßnahmen im Code und Restrisiko-Register |
 | [identitaet-und-geraete.md](identitaet-und-geraete.md) | Konten, Handles, Multi-Device, Verifikation |
 | [datenmodell.md](datenmodell.md) | Was der Server speichert, mit Indizes und Partitionierung |
 | [schnittstellen.md](schnittstellen.md) | APIs und Echtzeit-Events |
