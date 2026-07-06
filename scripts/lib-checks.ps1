@@ -47,6 +47,36 @@ function Test-SmDockerDaemon {
     return ($LASTEXITCODE -eq 0)
 }
 
+# Verwaiste Socket-Dateien hart beendeter Docker-Laeufe (kaputte Reparse
+# Points unter Docker\run) lassen den Daemon-Start mit "The file cannot be
+# accessed by the system" sterben; der Inference-Manager legt sie auch bei
+# abgeschaltetem EnableInference wieder an (Stand 07/2026). Loeschen
+# scheitert oft, das Umbenennen des Ordners funktioniert, Docker legt ihn
+# frisch an. Dieselbe Routine wie in setup.ps1; sie MUSS vor jedem
+# programmatischen Docker-Desktop-Start laufen, sonst haengt der Start im
+# Fehlerdialog.
+function Clear-SmStaleDockerSockets {
+    $dirs = @(
+        (Join-Path $env:LOCALAPPDATA 'Docker\run'),
+        (Join-Path $env:LOCALAPPDATA 'docker-secrets-engine')
+    )
+    foreach ($d in $dirs) {
+        if (-not (Test-Path $d)) { continue }
+        $stale = Get-ChildItem $d -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }
+        if (-not $stale) { continue }
+        $deleted = $true
+        foreach ($f in $stale) {
+            try { Remove-Item $f.FullName -Force -Confirm:$false -ErrorAction Stop }
+            catch { $deleted = $false }
+        }
+        if (-not $deleted) {
+            $backup = $d + '.broken-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+            try { Rename-Item $d $backup -ErrorAction Stop } catch {}
+        }
+    }
+}
+
 # Der gepinnte Toolchain-Kanal aus rust-toolchain.toml. Alles Rust-Bezogene
 # haengt daran: Format, Lint und das wasm-Target gelten je Toolchain.
 function Get-SmToolchainChannel {
@@ -313,6 +343,13 @@ function Get-SmComponents {
             & $log 'Starte Docker Desktop...'
             $dd = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
             if (-not (Test-Path $dd)) { & $log 'Docker Desktop nicht gefunden.'; return $false }
+            # Haengengebliebene Prozesse eines gescheiterten Starts nehmen
+            # den neuen Start sonst nicht an, und verwaiste Sockets lassen
+            # ihn im Fehlerdialog sterben.
+            Get-Process | Where-Object { $_.Name -like '*docker*' } |
+                Stop-Process -Force -Confirm:$false -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            Clear-SmStaleDockerSockets
             Start-Process $dd | Out-Null
             for ($i = 0; $i -lt 90; $i++) {
                 Start-Sleep -Seconds 2
