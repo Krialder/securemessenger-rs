@@ -19,6 +19,8 @@ crates/
                       (prüfen), kein Eigenbau
   sealed-cert/        Sealed-Sender-Zertifikate (libsignal-Format ServerCertificate/SenderCertificate): identity stellt
                       aus, der Empfänger-Client prüft die Kette beim Entsiegeln; der Trust Root ist der eine stabile Anker
+  btlog/              Binary-Transparency-Log (ADR-0007): hash-verkettetes, Ed25519-signiertes Release-Log als Mechanismus,
+                      dazu das Werkzeug sm-bt (append/verify/list/lookup; BT_SIGNING_KEY/BT_PUBLIC_KEY)
   client-core/        der Krypto-Kern der Clients (libsignal, OpenMLS, gepinnt); kein Dienst hängt davon ab
     src/onetoone.rs   1:1-Sitzungen: PQXDH-Aufbau, Double Ratchet, Safety Number, Schlüsselwechsel-Erkennung (Wrapper, keine Eigenbauten)
     src/group.rs      MLS-Gruppen: Suite 0x0003, Skipped-Keys-Fenster, GroupSession (Byte-Ein-Byte-Aus für den Client)

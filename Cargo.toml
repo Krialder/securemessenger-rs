@@ -9,6 +9,7 @@ resolver = "2"
 members = [
     "clients/cli",
     "clients/web",
+    "crates/btlog",
     "crates/client-app",
     "crates/client-core",
     "crates/common",
@@ -87,6 +88,12 @@ pow = { path = "crates/pow" }
 # Sealed-Sender-Zertifikate: identity stellt aus, Clients prüfen beim
 # Entsiegeln (Format aus libsignal, kein Eigenbau).
 sealed-cert = { path = "crates/sealed-cert" }
+# Binary-Transparency-Log (ADR-0007): Mechanismus als Bibliothek plus
+# sm-bt-Werkzeug.
+btlog = { path = "crates/btlog" }
+# Property-Tests (Roadmap Phase 6): zufällig erzeugte Eingaben gegen
+# Invarianten der Parser und der Krypto-Integration.
+proptest = "1"
 
 # Argon2 ist in Debug-Builds unbrauchbar langsam (Sekunden pro Hash).
 # Die Krypto-Pakete werden deshalb auch im Dev-Profil optimiert gebaut,

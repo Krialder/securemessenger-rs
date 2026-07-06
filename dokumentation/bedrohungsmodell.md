@@ -74,6 +74,7 @@ Die betrachteten Flüsse, alle über TLS und die meisten zusätzlich Ende-zu-End
 | PQ-Signaturen (Authentizität) | offen | Ed25519 bis ML-DSA in den Suites ist; betrifft erst reale Quantencomputer |
 | PQ-Gruppen | offen | MLS klassisch bis zum Combiner-Draft in OpenMLS (Upstream) |
 | Schadsoftware auf dem Endgerät | außerhalb | Wer das Gerät kontrolliert, sieht den Klartext; keine Software löst das |
+| BT-Log-Betrieb | teilweise | Mechanismus gebaut (`crates/btlog`, hash-verkettet, signierter Kopf); öffentliche Spiegel und Monitore offen |
 | Externes Audit | ausstehend | Blockiert per ADR-0008 den Produktivbetrieb, nicht den Bau |
 
 ## Verhältnis zu STRIDE-Phasen

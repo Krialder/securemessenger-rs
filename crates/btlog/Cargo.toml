@@ -1,0 +1,30 @@
+[package]
+name = "btlog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Binary-Transparency-Log (ADR-0007): der Mechanismus, mit dem
+# Release-Artefakte nachpruefbar protokolliert werden. Append-only ueber
+# eine Hash-Kette, der Kopf Ed25519-signiert; ein Auditor mit einer Kopie
+# des Logs erkennt jede nachtraegliche Aenderung. Kein Eigenbau-Krypto:
+# SHA-256 und Ed25519 aus den geprueften Bibliotheken, die Kette ist eine
+# Datenstruktur darueber. Der Betrieb (oeffentliche Spiegel, Monitore,
+# Sigstore/Rekor als Ersatz) bleibt die naechste Stufe; dieses Crate ist
+# bewusst so geschnitten, dass nur die Ablage wechselt, nicht das Format.
+
+[[bin]]
+name = "sm-bt"
+path = "src/bin/sm-bt.rs"
+
+[dependencies]
+sha2.workspace = true
+ed25519-dalek.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# Property-Tests: zufaellige Eingaben gegen die Invarianten (tests/properties.rs).
+proptest.workspace = true
