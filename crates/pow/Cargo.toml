@@ -14,3 +14,7 @@ license.workspace = true
 
 [dependencies]
 sha2.workspace = true
+
+[dev-dependencies]
+# Property-Tests: zufaellige Eingaben gegen die Invarianten (tests/properties.rs).
+proptest.workspace = true

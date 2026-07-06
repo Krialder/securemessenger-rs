@@ -66,3 +66,6 @@ common = { workspace = true }
 uuid = { workspace = true }
 # Der Sealed-Sender-E2E-Test stellt sein Test-Zertifikat selbst aus.
 sealed-cert = { workspace = true }
+# Property-Tests der Wire-Parser (tests/wire_properties.rs): die Parser
+# stehen an der Vertrauensgrenze und duerfen auf keiner Eingabe panieren.
+proptest = { workspace = true }

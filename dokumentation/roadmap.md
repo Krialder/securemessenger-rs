@@ -22,7 +22,7 @@ Sortiert nach Abhängigkeiten, ohne Termine. Zwei Dinge sind bewusst eingebaut: 
 - [x] Geräteverwaltung und Geräte-Identitätsbindung (Konto-Identitätsschlüssel signiert die Credentials `smdc.v1`, Schlüsseländerungen werden an KT gemeldet)
 - [x] Schlüssel-Verzeichnis mit Prekey-Pool (klassisch und post-quantum), atomare Konsumierung (directory-Dienst, F110)
 - [x] Key-Transparency-Grundgerüst serverseitig: Epochen, Merkle-Map über akd (kt-Dienst, F120); die Selbstprüfung im Client folgt mit der Client-Etappe
-- [ ] Reproducible-Build- und Release-Pipeline mit Binary-Transparency-Log (CI mit gepinnten, eingabestabilen Builds steht; das BT-Log ist offen)
+- [x] Reproducible-Build- und Release-Pipeline mit Binary-Transparency-Log: CI mit gepinnten, eingabestabilen Builds steht, und der Log-Mechanismus ist gebaut (`crates/btlog`: hash-verkettetes, Ed25519-signiertes Release-Log plus Werkzeug `sm-bt` mit append/verify/list/lookup); offen bleibt der Betrieb (öffentliche Spiegel, Monitore, Einbindung echter Release-Artefakte beziehungsweise Rekor/Sigstore als Ablösung)
 - [x] Web-Client (Leptos/WASM) und nativer CLI-Client parallel: beide registrieren sich, veröffentlichen Schlüssel, tauschen 1:1-E2EE-Nachrichten über PQXDH und Double Ratchet, empfangen über den WebSocket-Hinweiskanal, prüfen Schlüssel über Key Transparency und Safety Number. Meilenstein 1 aus GOAL.md ist mit der Abnahme vom 04.07.2026 erreicht (live-dokument v0.24).
 
 ## Phase 1b: Basis-Dienste für andere Projekte
@@ -67,7 +67,7 @@ Baut auf Identität und Auth auf, macht den Kern zum Fundament für die übrigen
 
 - [ ] PQ-MLS, sobald der Combiner-Draft in OpenMLS ist
 - [ ] PQ-Signaturen (ML-DSA) für die Authentizität
-- [ ] Formale Modelle vervollständigen, Fuzzing, Property-Tests
+- [x] Property-Tests der Parser und der Krypto-Integration (proptest: Wire-Framings panikfrei auf beliebiger Eingabe, Franking-Bindung, PoW-Konsistenz, KT-Commitment-Invarianten, BT-Log-Manipulationsfestigkeit, Out-of-Order über echte PQXDH-Sitzungen); formale Modelle (ProVerif/Tamarin) und ein cargo-fuzz-Harness (braucht nightly) bleiben offen
 - [ ] Zweites externes Audit vor Launch
 
 ## Später

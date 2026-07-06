@@ -20,3 +20,7 @@ akd = { workspace = true, optional = true }
 
 [features]
 verify = ["dep:akd"]
+
+[dev-dependencies]
+# Property-Tests: zufaellige Eingaben gegen die Invarianten (tests/properties.rs).
+proptest.workspace = true

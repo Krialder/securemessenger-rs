@@ -21,3 +21,7 @@ hmac = "0.12"
 sha2.workspace = true
 subtle = "2"
 rand.workspace = true
+
+[dev-dependencies]
+# Property-Tests: zufaellige Eingaben gegen die Invarianten (tests/properties.rs).
+proptest.workspace = true

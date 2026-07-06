@@ -54,3 +54,5 @@ tokio = { workspace = true }
 # Der Sealed-Sender-Roundtrip braucht einen Aussteller; produktiv stellt
 # der identity-Dienst aus, der Kern prueft nur.
 sealed-cert = { workspace = true }
+# Property-Test der Out-of-Order-Zustellung (tests/session_properties.rs).
+proptest = { workspace = true }
