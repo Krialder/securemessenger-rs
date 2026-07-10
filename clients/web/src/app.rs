@@ -75,11 +75,17 @@ fn history_key(peer: &str) -> String {
 
 /// Eine Zeile im Verlauf: Absender-Handle, Klartext, Zeitstempel
 /// (Unix-Sekunden). Der eigene Handle markiert ausgehende Nachrichten.
+/// `report_id` ist die Zustell-ID einer empfangenen, gefrankten Nachricht:
+/// der Schlüssel zum Franking-Material in der Ablage (`franking/<id>`) und
+/// damit die Voraussetzung fürs Melden. Eigene und ältere, ungefrankte
+/// Zeilen haben keine; `serde(default)` hält alte Verläufe lesbar.
 #[derive(Serialize, Deserialize, Clone)]
 struct StoredLine {
     from: String,
     text: String,
     at: u64,
+    #[serde(default)]
+    report_id: Option<String>,
 }
 
 /// Die Zusammenfassung einer Unterhaltung für die Seitenleiste: mit wem,
@@ -660,13 +666,14 @@ async fn send_message(
 }
 
 /// Holt wartende Hüllen ab, entschlüsselt und bestätigt sie; liefert
-/// (Absender, Klartext) je Nachricht. Token als Signal aus demselben Grund
-/// wie bei `send_message`: zwischen fetch und ack liegt die Entschlüsselung,
-/// in der die Erneuerung rotieren kann.
+/// (Absender, Klartext, Melde-ID) je Nachricht. Die Melde-ID ist gesetzt,
+/// wenn Franking-Material fürs Melden abgelegt wurde. Token als Signal aus
+/// demselben Grund wie bei `send_message`: zwischen fetch und ack liegt die
+/// Entschlüsselung, in der die Erneuerung rotieren kann.
 async fn fetch_messages(
     core: &mut Core,
     token: ReadSignal<String>,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<(String, String, Option<String>)>, String> {
     let delivery = DeliveryClient::new(delivery_url());
     let waiting = delivery
         .fetch(&token.get_untracked())
@@ -691,11 +698,43 @@ async fn fetch_messages(
             Ok(payload) => {
                 // Payload ist gefrankt (K_f vorangestellt); entrahmen, sonst
                 // roh anzeigen (ältere, ungefrankte Nachrichten).
-                let text = match client_app::franking::unfrank(&payload) {
-                    Ok(opened_msg) => String::from_utf8_lossy(&opened_msg.message).to_string(),
-                    Err(_) => String::from_utf8_lossy(&payload).to_string(),
+                let (text, report_id) = match client_app::franking::unfrank(&payload) {
+                    Ok(opened_msg) => {
+                        // Franking-Material fürs spätere Melden ablegen
+                        // (dasselbe Format wie im CLI): ohne K_f und
+                        // Klartext lässt sich das Commitment beim Dienst
+                        // nicht öffnen, ein Melden wäre unmöglich.
+                        let record = serde_json::json!({
+                            "key": BASE64.encode(&opened_msg.franking_key),
+                            "message": BASE64.encode(&opened_msg.message),
+                        });
+                        let stored = serde_json::to_vec(&record)
+                            .map_err(|e| e.to_string())
+                            .and_then(|json| {
+                                core.storage
+                                    .borrow_mut()
+                                    .put(&format!("franking/{}", message.id), &json)
+                            });
+                        let report_id = match stored {
+                            Ok(()) => Some(message.id.clone()),
+                            // Ablage voll oder kaputt: Nachricht trotzdem
+                            // zeigen, nur das Melden fällt für sie aus.
+                            Err(error) => {
+                                leptos::logging::warn!(
+                                    "Franking-Material zu {} nicht abgelegt: {error}",
+                                    message.id
+                                );
+                                None
+                            }
+                        };
+                        (
+                            String::from_utf8_lossy(&opened_msg.message).to_string(),
+                            report_id,
+                        )
+                    }
+                    Err(_) => (String::from_utf8_lossy(&payload).to_string(), None),
                 };
-                received.push((opened.from.clone(), text));
+                received.push((opened.from.clone(), text, report_id));
                 acked.push(message.id.clone());
             }
             Err(error) => {
@@ -1015,6 +1054,10 @@ fn App() -> impl IntoView {
     // (kein Wechsel, Meldung). Beim Chat-Wechsel zurückgesetzt, die Aussage
     // gilt nur für den geprüften Kontakt.
     let (key_info, set_key_info) = signal(Option::<(bool, String)>::None);
+    // Ob der offene Kontakt auf der eigenen Blockliste steht. `None`, bis
+    // die Liste nach dem Chat-Öffnen vom Dienst geladen ist; der Knopf
+    // erscheint erst dann, damit er nie den falschen Zustand anbietet.
+    let (blocked, set_blocked) = signal(Option::<bool>::None);
     // Maschinen-Benachrichtigungen vom integrations-Dienst, getrennt vom
     // Krypto-Status und vom E2E-Chat (design-system.md, Status-Trennung).
     let (notifications, set_notifications) = signal(Vec::<String>::new());
@@ -1247,6 +1290,7 @@ fn App() -> impl IntoView {
             set_safety_info.set(None);
             set_kt_info.set(None);
             set_key_info.set(None);
+            set_blocked.set(None);
             set_notifications.set(Vec::new());
             set_password_input.set(String::new());
             set_text_input.set(String::new());
@@ -1295,6 +1339,7 @@ fn App() -> impl IntoView {
                                     from: who,
                                     text: text.clone(),
                                     at: now_unix(),
+                                    report_id: None,
                                 };
                                 let summaries =
                                     record_message(&storage, &peer, line.clone(), false);
@@ -1360,12 +1405,13 @@ fn App() -> impl IntoView {
                             Ok(received) => {
                                 let open = selected.get_untracked();
                                 let mut summaries = None;
-                                for (sender, text) in received {
+                                for (sender, text, report_id) in received {
                                     let for_open = open.as_deref() == Some(sender.as_str());
                                     let line = StoredLine {
                                         from: sender.clone(),
                                         text,
                                         at: now_unix(),
+                                        report_id,
                                     };
                                     // Nur eine noch nicht offene Unterhaltung
                                     // zählt ungelesen hoch.
@@ -1453,6 +1499,110 @@ fn App() -> impl IntoView {
         }
     };
 
+    // Blockiert den offenen Kontakt oder hebt die Blockierung auf. Der
+    // Dienst verwirft Nachrichten blockierter Absender serverseitig und
+    // still (der Absender erfährt nichts); der Knopf erscheint erst, wenn
+    // der geladene Zustand bekannt ist, damit er nie falsch beschriftet
+    // ist. Fängt nur Copy-Signale ein und ist selbst Copy.
+    let on_block = move |_| {
+        if busy.get_untracked() {
+            return;
+        }
+        let Some(peer) = selected.get_untracked() else {
+            return;
+        };
+        let Some(is_blocked) = blocked.get_untracked() else {
+            return;
+        };
+        set_busy.set(true);
+        spawn_local(async move {
+            let delivery = DeliveryClient::new(delivery_url());
+            let token = access_token.get_untracked();
+            let result = if is_blocked {
+                delivery.unblock(&token, &peer).await
+            } else {
+                delivery.block(&token, &peer).await
+            };
+            match result {
+                Ok(()) => {
+                    if selected.get_untracked().as_deref() == Some(peer.as_str()) {
+                        set_blocked.set(Some(!is_blocked));
+                    }
+                    set_status.set(if is_blocked {
+                        format!("{peer} ist nicht mehr blockiert.")
+                    } else {
+                        format!(
+                            "{peer} ist blockiert; neue Nachrichten dieses Handles \
+                             verwirft der Dienst still."
+                        )
+                    });
+                }
+                Err(error) => set_status.set(format!("Blockieren: {error}")),
+            }
+            set_busy.set(false);
+        });
+    };
+
+    // Meldet eine empfangene Nachricht beim Dienst (Message Franking):
+    // K_f und Klartext aus der Ablage öffnen das beim Senden aufbewahrte
+    // Commitment, der Dienst prüft es nach und antwortet, ob die Nachricht
+    // nachweislich so gesendet wurde (specs/sealed-sender-und-abuse.md).
+    let run_report = SendWrapper::new(Rc::new({
+        let current_storage = current_storage.clone();
+        move |report_id: String| {
+            if busy.get_untracked() {
+                return;
+            }
+            let Some(storage) = current_storage() else {
+                set_status.set("Nicht angemeldet.".to_string());
+                return;
+            };
+            let record = storage
+                .borrow()
+                .get(&format!("franking/{report_id}"))
+                .ok()
+                .flatten();
+            let Some(bytes) = record else {
+                set_status.set("Kein Franking-Material zu dieser Nachricht.".to_string());
+                return;
+            };
+            let parsed: serde_json::Value = match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                Err(error) => {
+                    set_status.set(format!("Franking-Ablage unlesbar: {error}"));
+                    return;
+                }
+            };
+            let decoded = BASE64
+                .decode(parsed["key"].as_str().unwrap_or_default())
+                .and_then(|key| {
+                    BASE64
+                        .decode(parsed["message"].as_str().unwrap_or_default())
+                        .map(|message| (key, message))
+                });
+            let Ok((key, message)) = decoded else {
+                set_status.set("Franking-Ablage unlesbar: kein Base64.".to_string());
+                return;
+            };
+            set_busy.set(true);
+            spawn_local(async move {
+                let result = DeliveryClient::new(delivery_url())
+                    .report(&access_token.get_untracked(), &report_id, &message, &key)
+                    .await;
+                match result {
+                    Ok(true) => set_status.set(
+                        "Meldung bestätigt: die Nachricht wurde nachweislich so gesendet."
+                            .to_string(),
+                    ),
+                    Ok(false) => set_status
+                        .set("Meldung NICHT bestätigt: das Commitment öffnet nicht.".to_string()),
+                    Err(error) => set_status.set(format!("Melden: {error}")),
+                }
+                set_busy.set(false);
+            });
+        }
+    }));
+
     // Blendet die Sicherheitsnummer des offenen Chats ein oder aus. Beim
     // Öffnen wird sie für den ausgewählten Kontakt berechnet.
     let on_safety = {
@@ -1518,7 +1668,20 @@ fn App() -> impl IntoView {
             set_safety_open.set(false);
             set_safety_info.set(None);
             set_key_info.set(None);
-            set_selected.set(Some(peer));
+            set_blocked.set(None);
+            set_selected.set(Some(peer.clone()));
+            // Blockier-Zustand des Kontakts nachladen; das Ergebnis zählt
+            // nur, wenn der Chat beim Eintreffen noch offen ist.
+            spawn_local(async move {
+                if let Ok(list) = DeliveryClient::new(delivery_url())
+                    .blocks(&access_token.get_untracked())
+                    .await
+                {
+                    if selected.get_untracked().as_deref() == Some(peer.as_str()) {
+                        set_blocked.set(Some(list.iter().any(|h| h == &peer)));
+                    }
+                }
+            });
         }
     };
 
@@ -1526,6 +1689,7 @@ fn App() -> impl IntoView {
         set_selected.set(None);
         set_safety_open.set(false);
         set_key_info.set(None);
+        set_blocked.set(None);
     };
 
     // "Neuer Chat" bestätigen: Handle in die Liste aufnehmen und öffnen.
@@ -1668,6 +1832,7 @@ fn App() -> impl IntoView {
                     // braucht also keinen Klon.
                     let on_safety = on_safety.clone();
                     let on_key_check = on_key_check.clone();
+                    let run_report = run_report.clone();
                     let on_send = on_send.clone();
                     let on_fetch = on_fetch.clone();
                     let on_message_key = on_message_key.clone();
@@ -1894,6 +2059,26 @@ fn App() -> impl IntoView {
                                                     >
                                                         "Schlüssel prüfen"
                                                     </button>
+                                                    {move || {
+                                                        blocked
+                                                            .get()
+                                                            .map(|is_blocked| {
+                                                                view! {
+                                                                    <button
+                                                                        type="button"
+                                                                        class="sm-secondary"
+                                                                        on:click=on_block
+                                                                        disabled=busy
+                                                                    >
+                                                                        {if is_blocked {
+                                                                            "Blockierung aufheben"
+                                                                        } else {
+                                                                            "Blockieren"
+                                                                        }}
+                                                                    </button>
+                                                                }
+                                                            })
+                                                    }}
                                                 </div>
 
                                                 {move || {
@@ -1967,40 +2152,68 @@ fn App() -> impl IntoView {
                                                     aria-relevant="additions"
                                                     aria-atomic="false"
                                                 >
-                                                    {move || {
-                                                        let own = me.get();
-                                                        let msgs = messages.get();
-                                                        if msgs.is_empty() {
-                                                            view! {
-                                                                <li class="sm-status">
-                                                                    "Ende-zu-Ende verschlüsselt. Vor der ersten "
-                                                                    "Nachricht die Sicherheitsnummer vergleichen, "
-                                                                    "damit die Verbindung nicht umgeleitet ist."
-                                                                </li>
+                                                    {
+                                                        let run_report = run_report.clone();
+                                                        move || {
+                                                            let own = me.get();
+                                                            let msgs = messages.get();
+                                                            if msgs.is_empty() {
+                                                                view! {
+                                                                    <li class="sm-status">
+                                                                        "Ende-zu-Ende verschlüsselt. Vor der ersten "
+                                                                        "Nachricht die Sicherheitsnummer vergleichen, "
+                                                                        "damit die Verbindung nicht umgeleitet ist."
+                                                                    </li>
+                                                                }
+                                                                    .into_any()
+                                                            } else {
+                                                                msgs.into_iter()
+                                                                    .map(|line| {
+                                                                        let mine = line.from == own;
+                                                                        let class = if mine {
+                                                                            "sm-msg sm-mine"
+                                                                        } else {
+                                                                            "sm-msg"
+                                                                        };
+                                                                        // Melden nur für empfangene Nachrichten
+                                                                        // mit abgelegtem Franking-Material.
+                                                                        let report_id = if mine {
+                                                                            None
+                                                                        } else {
+                                                                            line.report_id.clone()
+                                                                        };
+                                                                        let report_click = run_report.clone();
+                                                                        view! {
+                                                                            <li class=class>
+                                                                                <span class="sm-msg-from">{line.from}</span>
+                                                                                <span class="sm-msg-text">{line.text}</span>
+                                                                                <span class="sm-msg-time">
+                                                                                    {format_time(line.at)}
+                                                                                </span>
+                                                                                {report_id
+                                                                                    .map(|id| {
+                                                                                        view! {
+                                                                                            <button
+                                                                                                type="button"
+                                                                                                class="sm-msg-report"
+                                                                                                title="Nachricht beim Dienst melden (Message Franking)"
+                                                                                                on:click=move |_| report_click(
+                                                                                                    id.clone(),
+                                                                                                )
+                                                                                                disabled=busy
+                                                                                            >
+                                                                                                "Melden"
+                                                                                            </button>
+                                                                                        }
+                                                                                    })}
+                                                                            </li>
+                                                                        }
+                                                                    })
+                                                                    .collect_view()
+                                                                    .into_any()
                                                             }
-                                                                .into_any()
-                                                        } else {
-                                                            msgs.into_iter()
-                                                                .map(|line| {
-                                                                    let class = if line.from == own {
-                                                                        "sm-msg sm-mine"
-                                                                    } else {
-                                                                        "sm-msg"
-                                                                    };
-                                                                    view! {
-                                                                        <li class=class>
-                                                                            <span class="sm-msg-from">{line.from}</span>
-                                                                            <span class="sm-msg-text">{line.text}</span>
-                                                                            <span class="sm-msg-time">
-                                                                                {format_time(line.at)}
-                                                                            </span>
-                                                                        </li>
-                                                                    }
-                                                                })
-                                                                .collect_view()
-                                                                .into_any()
                                                         }
-                                                    }}
+                                                    }
                                                 </ul>
 
                                                 <div class="sm-composer">
