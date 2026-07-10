@@ -131,6 +131,30 @@ fn now_unix() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
 }
 
+/// Die gespeicherte Modus-Wahl aus localStorage; ohne Wahl "system"
+/// (dann entscheidet die CSS-Media-Query nach der OS-Präferenz). Das
+/// gleiche Schlüsselwort wie im FOUC-Guard in index.html.
+fn stored_theme() -> String {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item("sm-theme").ok().flatten())
+        .unwrap_or_else(|| "system".to_string())
+}
+
+/// Setzt den Modus: data-theme am Wurzelelement (die CSS-Ebene 2 schaltet
+/// darüber um) und speichert die Wahl. Nur auf ausdrückliche Nutzeraktion,
+/// damit "system" nicht ungefragt zu einer festen Wahl wird.
+fn apply_theme(choice: &str) {
+    if let Some(window) = web_sys::window() {
+        if let Some(root) = window.document().and_then(|d| d.document_element()) {
+            let _ = root.set_attribute("data-theme", choice);
+        }
+        if let Ok(Some(storage)) = window.local_storage() {
+            let _ = storage.set_item("sm-theme", choice);
+        }
+    }
+}
+
 fn load_profile(storage: &SharedStorage) -> Option<Profile> {
     let bytes = storage.borrow().get(PROFILE_KEY).ok()??;
     serde_json::from_slice(&bytes).ok()
@@ -393,7 +417,14 @@ async fn fetch_messages(core: &mut Core) -> Result<Vec<(String, String)>, String
 /// `client_app::delivery`. Die Schleife fasst den Client-Zustand nie an,
 /// sie zählt nur das Hinweis-Signal hoch; den Abruf stößt ein Effect an,
 /// sobald die Oberfläche frei ist (kein RefCell-Borrow über await).
-fn start_hint_channel(token: String, set_hints: WriteSignal<u64>, set_status: WriteSignal<String>) {
+/// Maschinen-Benachrichtigungen (integrations-Dienst) laufen in eine
+/// eigene Liste, getrennt vom Krypto-Status und vom E2E-Chat.
+fn start_hint_channel(
+    token: String,
+    set_hints: WriteSignal<u64>,
+    set_status: WriteSignal<String>,
+    set_notifications: WriteSignal<Vec<String>>,
+) {
     spawn_local(async move {
         let url = client_app::delivery::ws_url(&delivery_url());
         let mut socket = match WebSocket::open(&url) {
@@ -412,7 +443,7 @@ fn start_hint_channel(token: String, set_hints: WriteSignal<u64>, set_status: Wr
                 Ok(WsMessage::Text(text)) => match parse_ws_event(&text) {
                     Some(WsEvent::MessageWaiting) => set_hints.update(|n| *n += 1),
                     Some(WsEvent::Notification { tenant, title }) => {
-                        set_status.set(format!("[Benachrichtigung von {tenant}] {title}"));
+                        set_notifications.update(|list| list.push(format!("{tenant}: {title}")));
                     }
                     // Unbekannte und unlesbare Frames bewusst still: neue
                     // Server-Events dürfen alte Clients nicht stören.
@@ -500,6 +531,12 @@ fn App() -> impl IntoView {
     let (safety_info, set_safety_info) = signal(Option::<(String, String)>::None);
     // Ergebnis der KT-Selbstprüfung: (bestanden, Meldung).
     let (kt_info, set_kt_info) = signal(Option::<(bool, String)>::None);
+    // Maschinen-Benachrichtigungen vom integrations-Dienst, getrennt vom
+    // Krypto-Status und vom E2E-Chat (design-system.md, Status-Trennung).
+    let (notifications, set_notifications) = signal(Vec::<String>::new());
+    // Gewählter Darstellungs-Modus (system/hell/dunkel/midnight); der
+    // FOUC-Guard in index.html hat ihn beim Laden schon angewandt.
+    let (theme, set_theme) = signal(stored_theme());
 
     // Hydration: einmal beim Start die Ablage öffnen und entscheiden,
     // welches Formular gezeigt wird.
@@ -544,7 +581,12 @@ fn App() -> impl IntoView {
             spawn_local(async move {
                 match onboard(storage, handle.clone(), password).await {
                     Ok(new_core) => {
-                        start_hint_channel(new_core.token.clone(), set_hints, set_status);
+                        start_hint_channel(
+                            new_core.token.clone(),
+                            set_hints,
+                            set_status,
+                            set_notifications,
+                        );
                         *core.borrow_mut() = Some(new_core);
                         set_me.set(handle);
                         set_logged_in.set(true);
@@ -579,7 +621,12 @@ fn App() -> impl IntoView {
             spawn_local(async move {
                 match login(storage, password).await {
                     Ok(new_core) => {
-                        start_hint_channel(new_core.token.clone(), set_hints, set_status);
+                        start_hint_channel(
+                            new_core.token.clone(),
+                            set_hints,
+                            set_status,
+                            set_notifications,
+                        );
                         set_me.set(new_core.handle.clone());
                         *core.borrow_mut() = Some(new_core);
                         set_logged_in.set(true);
@@ -595,9 +642,10 @@ fn App() -> impl IntoView {
         }
     };
 
-    let on_send = {
+    // Der Sende-Ablauf, geteilt zwischen Knopf und Enter-Taste im Textfeld.
+    let run_send = SendWrapper::new(Rc::new({
         let core = core.clone();
-        move |_| {
+        move || {
             if busy.get_untracked() {
                 return;
             }
@@ -634,6 +682,21 @@ fn App() -> impl IntoView {
                 }
                 set_busy.set(false);
             });
+        }
+    }));
+
+    let on_send = {
+        let run_send = run_send.clone();
+        move |_| run_send()
+    };
+    let on_message_key = {
+        let run_send = run_send.clone();
+        move |ev: web_sys::KeyboardEvent| {
+            // Enter sendet, Umschalt-Enter bleibt für einen Zeilenumbruch frei.
+            if ev.key() == "Enter" && !ev.shift_key() {
+                ev.prevent_default();
+                run_send();
+            }
         }
     };
 
@@ -778,134 +841,295 @@ fn App() -> impl IntoView {
     };
 
     view! {
-        <main>
-            <h1>"SecureMessenger"</h1>
-            <p class="warnung">
-                "Geräte-Identität, Sitzungen und Kontakte liegen unverschlüsselt in "
-                "IndexedDB dieses Browser-Profils. Der Browser ist das kryptografisch "
-                "schwächste Glied der Plattform (sicherheit.md)."
-            </p>
-            {move || {
-                if logged_in.get() {
-                    view! {
-                        <p>"Angemeldet als " <strong>{me}</strong></p>
-                        <div class="zeile">
-                            <input
-                                prop:value=peer_input
-                                on:input=move |ev| set_peer_input.set(event_target_value(&ev))
-                                placeholder="Empfänger-Handle"
-                            />
-                        </div>
-                        <div class="zeile">
-                            <input
-                                prop:value=text_input
-                                on:input=move |ev| set_text_input.set(event_target_value(&ev))
-                                placeholder="Nachricht"
-                            />
-                            <button on:click=on_send.clone() disabled=busy>"Senden"</button>
-                            <button on:click=on_fetch.clone() disabled=busy>"Abrufen"</button>
-                        </div>
-                        <div class="zeile">
-                            <button on:click=on_safety.clone() disabled=busy>
-                                "Sicherheitsnummer"
-                            </button>
-                            <button on:click=on_kt_check.clone() disabled=busy>
-                                "Schlüssel prüfen (KT)"
-                            </button>
-                        </div>
-                        {move || {
-                            safety_info
-                                .get()
-                                .map(|(peer, number)| {
-                                    view! {
-                                        <p class="safety">
-                                            <strong>
-                                                {format!("Sicherheitsnummer mit {peer}: ")}
-                                            </strong>
-                                            <code>{number}</code>
-                                            " (über einen zweiten Kanal abgleichen)"
+        <div class="sm-app">
+            <header class="sm-header">
+                <h1>"SecureMessenger"</h1>
+                {move || {
+                    logged_in
+                        .get()
+                        .then(|| {
+                            view! {
+                                <span class="sm-identity">"Angemeldet als " <strong>{me}</strong></span>
+                            }
+                        })
+                }}
+                <div class="sm-theme-switch">
+                    <label for="sm-theme-select">"Darstellung"</label>
+                    <select
+                        id="sm-theme-select"
+                        prop:value=theme
+                        on:change=move |ev| {
+                            let choice = event_target_value(&ev);
+                            apply_theme(&choice);
+                            set_theme.set(choice);
+                        }
+                    >
+                        <option value="system">"System"</option>
+                        <option value="hell">"Hell"</option>
+                        <option value="dunkel">"Dunkel"</option>
+                        <option value="midnight">"Mitternacht"</option>
+                    </select>
+                </div>
+            </header>
+
+            <main class="sm-main">
+                <p class="sm-caution">
+                    "Geräte-Identität, Sitzungen und Kontakte liegen unverschlüsselt in "
+                    "IndexedDB dieses Browser-Profils. Der Browser ist das kryptografisch "
+                    "schwächste Glied der Plattform (sicherheit.md)."
+                </p>
+
+                {move || {
+                    let items = notifications.get();
+                    (!items.is_empty())
+                        .then(|| {
+                            view! {
+                                <section
+                                    class="sm-notify"
+                                    aria-label="Benachrichtigungen"
+                                    aria-live="polite"
+                                >
+                                    <h2>"Benachrichtigungen"</h2>
+                                    <ul>
+                                        {items
+                                            .into_iter()
+                                            .map(|n| view! { <li>{n}</li> })
+                                            .collect_view()}
+                                    </ul>
+                                </section>
+                            }
+                        })
+                }}
+
+                {move || {
+                    if logged_in.get() {
+                        view! {
+                            <section class="sm-card" aria-label="Nachricht verfassen">
+                                <div class="sm-field">
+                                    <label for="sm-peer">"Empfänger-Handle"</label>
+                                    <input
+                                        id="sm-peer"
+                                        prop:value=peer_input
+                                        on:input=move |ev| set_peer_input.set(event_target_value(&ev))
+                                    />
+                                </div>
+                                <div class="sm-field">
+                                    <label for="sm-msg">"Nachricht (Enter sendet)"</label>
+                                    <input
+                                        id="sm-msg"
+                                        prop:value=text_input
+                                        on:input=move |ev| set_text_input.set(event_target_value(&ev))
+                                        on:keydown=on_message_key.clone()
+                                    />
+                                </div>
+                                <div class="sm-row">
+                                    <button
+                                        type="button"
+                                        class="sm-primary"
+                                        on:click=on_send.clone()
+                                        disabled=busy
+                                    >
+                                        "Senden"
+                                    </button>
+                                    <button
+                                        type="button"
+                                        class="sm-secondary"
+                                        on:click=on_fetch.clone()
+                                        disabled=busy
+                                    >
+                                        "Abrufen"
+                                    </button>
+                                </div>
+                            </section>
+
+                            <section class="sm-card" aria-label="Schlüssel prüfen">
+                                <h2>"Schlüssel prüfen"</h2>
+                                <div class="sm-row">
+                                    <button
+                                        type="button"
+                                        class="sm-secondary"
+                                        on:click=on_safety.clone()
+                                        disabled=busy
+                                    >
+                                        "Sicherheitsnummer"
+                                    </button>
+                                    <button
+                                        type="button"
+                                        class="sm-secondary"
+                                        on:click=on_kt_check.clone()
+                                        disabled=busy
+                                    >
+                                        "Schlüssel prüfen (KT)"
+                                    </button>
+                                </div>
+                                {move || {
+                                    safety_info
+                                        .get()
+                                        .map(|(peer, number)| {
+                                            view! {
+                                                <div>
+                                                    <p>
+                                                        <strong>
+                                                            {format!("Sicherheitsnummer mit {peer}")}
+                                                        </strong>
+                                                        " – über einen zweiten Kanal abgleichen:"
+                                                    </p>
+                                                    <p class="sm-fingerprint">{number}</p>
+                                                </div>
+                                            }
+                                        })
+                                }}
+                                {move || {
+                                    kt_info
+                                        .get()
+                                        .map(|(ok, message)| {
+                                            if ok {
+                                                view! { <p class="sm-note sm-ok">{message}</p> }
+                                                    .into_any()
+                                            } else {
+                                                view! {
+                                                    <p class="sm-note sm-warn" role="alert">
+                                                        {message}
+                                                    </p>
+                                                }
+                                                    .into_any()
+                                            }
+                                        })
+                                }}
+                            </section>
+
+                            <ul
+                                class="sm-log"
+                                role="log"
+                                aria-label="Nachrichtenverlauf"
+                                aria-live="polite"
+                            >
+                                {move || {
+                                    let own = me.get();
+                                    messages
+                                        .get()
+                                        .into_iter()
+                                        .map(|(who, text)| {
+                                            let class = if who == own {
+                                                "sm-msg sm-mine"
+                                            } else {
+                                                "sm-msg"
+                                            };
+                                            view! {
+                                                <li class=class>
+                                                    <span class="sm-msg-from">{who}</span>
+                                                    <span class="sm-msg-text">{text}</span>
+                                                </li>
+                                            }
+                                        })
+                                        .collect_view()
+                                }}
+                            </ul>
+                        }
+                            .into_any()
+                    } else {
+                        match boot.get() {
+                            Boot::Loading => {
+                                view! { <p class="sm-status">"Ablage wird geladen ..."</p> }
+                                    .into_any()
+                            }
+                            Boot::Broken(error) => {
+                                view! {
+                                    <p class="sm-note sm-warn" role="alert">
+                                        {format!(
+                                            "Ablage nicht verfügbar: {error}. Ohne IndexedDB (z. B. \
+                                             privates Fenster) kann dieser Client keine Identität \
+                                             halten.",
+                                        )}
+                                    </p>
+                                }
+                                    .into_any()
+                            }
+                            Boot::Known(handle) => {
+                                view! {
+                                    <section class="sm-card" aria-label="Anmelden">
+                                        <h2>
+                                            {format!("Konto '{handle}' auf diesem Gerät gefunden")}
+                                        </h2>
+                                        <div class="sm-field">
+                                            <label for="sm-pass">"Passwort"</label>
+                                            <input
+                                                id="sm-pass"
+                                                type="password"
+                                                prop:value=password_input
+                                                on:input=move |ev| {
+                                                    set_password_input.set(event_target_value(&ev))
+                                                }
+                                            />
+                                        </div>
+                                        <div class="sm-row">
+                                            <button
+                                                type="button"
+                                                class="sm-primary"
+                                                on:click=on_login.clone()
+                                                disabled=busy
+                                            >
+                                                "Anmelden"
+                                            </button>
+                                        </div>
+                                    </section>
+                                }
+                                    .into_any()
+                            }
+                            Boot::Fresh => {
+                                view! {
+                                    <section class="sm-card" aria-label="Konto anlegen">
+                                        <h2>"Konto anlegen"</h2>
+                                        <p class="sm-status">
+                                            "Registrierung, Anmeldung und Prekey-Veröffentlichung "
+                                            "in einem Schritt."
                                         </p>
-                                    }
-                                })
-                        }}
-                        {move || {
-                            kt_info
-                                .get()
-                                .map(|(ok, message)| {
-                                    let klasse = if ok { "status" } else { "warnung" };
-                                    view! { <p class=klasse>{message}</p> }
-                                })
-                        }}
-                        <ul class="chat">
-                            {move || {
-                                let own = me.get();
-                                messages
-                                    .get()
-                                    .into_iter()
-                                    .map(|(who, text)| {
-                                        let eigene = who == own;
-                                        view! {
-                                            <li class:eigene=eigene>
-                                                <strong>{format!("[{who}] ")}</strong>
-                                                {text}
-                                            </li>
-                                        }
-                                    })
-                                    .collect_view()
-                            }}
-                        </ul>
+                                        <div class="sm-field">
+                                            <label for="sm-handle">"Handle (a-z, 0-9, _ . -)"</label>
+                                            <input
+                                                id="sm-handle"
+                                                prop:value=handle_input
+                                                on:input=move |ev| {
+                                                    set_handle_input.set(event_target_value(&ev))
+                                                }
+                                            />
+                                        </div>
+                                        <div class="sm-field">
+                                            <label for="sm-newpass">
+                                                "Passwort (mindestens 12 Zeichen)"
+                                            </label>
+                                            <input
+                                                id="sm-newpass"
+                                                type="password"
+                                                prop:value=password_input
+                                                on:input=move |ev| {
+                                                    set_password_input.set(event_target_value(&ev))
+                                                }
+                                            />
+                                        </div>
+                                        <div class="sm-row">
+                                            <button
+                                                type="button"
+                                                class="sm-primary"
+                                                on:click=on_register.clone()
+                                                disabled=busy
+                                            >
+                                                "Konto anlegen"
+                                            </button>
+                                        </div>
+                                    </section>
+                                }
+                                    .into_any()
+                            }
+                        }
                     }
-                        .into_any()
-                } else {
-                    match boot.get() {
-                        Boot::Loading => view! { <p>"Ablage wird geladen ..."</p> }.into_any(),
-                        Boot::Broken(error) => view! {
-                            <p class="warnung">
-                                {format!(
-                                    "Ablage nicht verfügbar: {error}. Ohne IndexedDB (z. B. \
-                                     privates Fenster) kann dieser Client keine Identität halten.",
-                                )}
-                            </p>
-                        }
-                            .into_any(),
-                        Boot::Known(handle) => view! {
-                            <p>{format!("Konto '{handle}' auf diesem Gerät gefunden. Anmelden:")}</p>
-                            <div class="zeile">
-                                <input
-                                    type="password"
-                                    prop:value=password_input
-                                    on:input=move |ev| set_password_input.set(event_target_value(&ev))
-                                    placeholder="Passwort"
-                                />
-                                <button on:click=on_login.clone() disabled=busy>"Anmelden"</button>
-                            </div>
-                        }
-                            .into_any(),
-                        Boot::Fresh => view! {
-                            <p>"Konto anlegen (Registrierung, Anmeldung und Prekey-Veröffentlichung in einem Schritt):"</p>
-                            <div class="zeile">
-                                <input
-                                    prop:value=handle_input
-                                    on:input=move |ev| set_handle_input.set(event_target_value(&ev))
-                                    placeholder="Handle (a-z, 0-9, _ . -)"
-                                />
-                            </div>
-                            <div class="zeile">
-                                <input
-                                    type="password"
-                                    prop:value=password_input
-                                    on:input=move |ev| set_password_input.set(event_target_value(&ev))
-                                    placeholder="Passwort (mindestens 12 Zeichen)"
-                                />
-                                <button on:click=on_register.clone() disabled=busy>"Konto anlegen"</button>
-                            </div>
-                        }
-                            .into_any(),
-                    }
-                }
-            }}
-            <p class="status">{status}</p>
-        </main>
+                }}
+
+                <p class="sm-status" role="status" aria-live="polite">
+                    {status}
+                </p>
+            </main>
+        </div>
     }
 }
 

@@ -33,6 +33,7 @@ Diese Doku ist eine Übersicht plus die Specs, an denen so ein System steht oder
 | [protokoll.md](protokoll.md) | Krypto im Überblick, mit Verweis auf die tiefen Specs |
 | [sicherheit.md](sicherheit.md) | Threat Model mit Assets und Grenzen (Überblick) |
 | [bedrohungsmodell.md](bedrohungsmodell.md) | Volles STRIDE je Dienst und LINDDUN je Datenfluss, mit Gegenmaßnahmen im Code und Restrisiko-Register |
+| [design-system.md](design-system.md) | Design-Entscheidungen des Web-Clients: Token-Architektur, Modi, WCAG-2.2-AA-Kriterien, Security-UX |
 | [identitaet-und-geraete.md](identitaet-und-geraete.md) | Konten, Handles, Multi-Device, Verifikation |
 | [datenmodell.md](datenmodell.md) | Was der Server speichert, mit Indizes und Partitionierung |
 | [schnittstellen.md](schnittstellen.md) | APIs und Echtzeit-Events |

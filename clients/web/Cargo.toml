@@ -25,7 +25,10 @@ client-core = { path = "../../crates/client-core" }
 leptos = { version = "0.8", features = ["csr"] }
 # Panics landen in der Browser-Konsole statt als stummes "unreachable".
 console_error_panic_hook = "0.1"
-web-sys = { version = "0.3", features = ["Window", "Location"] }
+# Window/Location fuer die Origin-URLs; Document/Element/Storage fuer den
+# Theme-Umschalter (data-theme am <html>, Wahl in localStorage);
+# KeyboardEvent fuer Enter-zum-Senden.
+web-sys = { version = "0.3", features = ["Window", "Location", "Document", "Element", "Storage", "KeyboardEvent"] }
 # Uhrzeit fuer die Credential-Gueltigkeit (js_sys::Date), im Browser gibt es
 # kein std::time::SystemTime.
 js-sys = "0.3"

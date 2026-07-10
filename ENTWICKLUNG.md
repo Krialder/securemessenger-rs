@@ -127,7 +127,7 @@ trunk build     # einmaliger Build nach dist/
 trunk serve     # Dev-Server; proxyt /api/* auf die lokalen Dienste (Trunk.toml)
 ```
 
-Nativ kompiliert `sm-web` nur zu einem erklärenden Stub: der Browser-Code existiert ausschließlich für wasm32, damit `cargo test --workspace` weder Leptos für den Host bauen muss noch an dessen Send-Anforderungen scheitern kann (Begründung in `clients/web/src/main.rs`).
+Nativ kompiliert `sm-web` nur zu einem erklärenden Stub: der Browser-Code existiert ausschließlich für wasm32, damit `cargo test --workspace` weder Leptos für den Host bauen muss noch an dessen Send-Anforderungen scheitern kann (Begründung in `clients/web/src/main.rs`). Eine Ausnahme läuft trotzdem nativ mit: `clients/web/tests/contrast.rs` liest die Design-Tokens aus `clients/web/theme.css` und prüft für jeden Modus (Hell, Dunkel, Midnight) die WCAG-Kontrastwerte nach; so bricht `cargo test --workspace`, wenn eine Farb-Änderung die Barrierefreiheit unterschreitet. Die Oberfläche folgt [dokumentation/design-system.md](dokumentation/design-system.md): dreistufige Token-Architektur, drei Modi plus System-Automatik über `data-theme`, WCAG 2.2 AA.
 
 Ohne lokale Toolchain baut Docker im Container:
 

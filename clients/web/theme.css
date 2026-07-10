@@ -1,0 +1,444 @@
+/*
+  Design-Tokens und Basis-Styles des Web-Clients.
+
+  Drei Ebenen (dokumentation/design-system.md): Primitive (Rohwerte, hier in
+  :root, modusunabhaengig), semantische Alias-Tokens je Modus (in den
+  [data-theme]-Bloecken; nur diese Ebene wechselt beim Moduswechsel) und die
+  Komponenten-Regeln, die ausschliesslich die semantische Ebene benutzen.
+
+  Farb-Rollen als Paar Vordergrund/Hintergrund: --sm-on-surface gehoert auf
+  --sm-surface, --sm-on-primary auf --sm-primary. Die Werte sind so gewaehlt,
+  dass jedes bedeutungstragende Paar die WCAG-2.2-AA-Schwelle haelt (4.5:1
+  Text, 3:1 Nicht-Text) in allen drei Modi; nachgerechnet in
+  clients/web/tests/contrast.rs.
+
+  Reihenfolge ist Absicht: :root (Default = Hell) zuerst, dann die
+  System-Automatik per Media-Query, dann die expliziten [data-theme]-Bloecke
+  zuletzt. Attribut-Selektor und :root haben gleiche Spezifitaet, also
+  gewinnt die spaetere Regel: eine ausdrueckliche Nutzerwahl schlaegt die
+  Systempraeferenz.
+*/
+
+:root {
+  /* Primitive: modusunabhaengige Rohwerte. Keine Komponente nutzt sie direkt. */
+  --sm-font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --sm-font-mono: ui-monospace, "Cascadia Code", "Segoe UI Mono", Consolas, "Liberation Mono", monospace;
+
+  /* Abstands-Raster (4/8px in rem). */
+  --sm-space-1: 0.25rem;
+  --sm-space-2: 0.5rem;
+  --sm-space-3: 0.75rem;
+  --sm-space-4: 1rem;
+  --sm-space-5: 1.5rem;
+  --sm-space-6: 2rem;
+
+  --sm-radius: 0.5rem;
+  --sm-radius-lg: 0.875rem;
+
+  /* Bewegung: kurz und funktional; die Media-Query unten schaltet sie ab. */
+  --sm-motion-fast: 150ms;
+  --sm-motion-base: 250ms;
+
+  /* Semantische Tokens, Default-Modus Hell. */
+  --sm-surface: #fbfbfd;
+  --sm-surface-container: #ffffff;
+  --sm-surface-container-high: #eeeff2;
+  --sm-on-surface: #1b1b1f;
+  --sm-on-surface-muted: #5b5b63;
+  --sm-primary: #0067be;
+  --sm-on-primary: #ffffff;
+  --sm-success: #1a7f37;
+  --sm-danger: #c42b1c;
+  --sm-warning: #8a5a00;
+  --sm-border: #767680;
+  --sm-divider: #e1e1e6;
+  --sm-focus: #0067be;
+  --sm-bubble-in: #eeeff2;
+  --sm-bubble-out: #d6e6fa;
+  --sm-notify-surface: #fff6e0;
+  --sm-notify-on: #5a4300;
+}
+
+/* System-Automatik: ohne ausdrueckliche Wahl (oder bei "System") der
+   OS-Praeferenz folgen. Die dunklen Werte sind mit denen von [data-theme]
+   identisch, damit es nur eine Quelle der Wahrheit je Modus gibt. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]),
+  :root[data-theme="system"] {
+    --sm-surface: #121212;
+    --sm-surface-container: #1e1e1e;
+    --sm-surface-container-high: #282828;
+    --sm-on-surface: #e6e6e6;
+    --sm-on-surface-muted: #a0a0a0;
+    --sm-primary: #4da3ff;
+    --sm-on-primary: #0a0a0a;
+    --sm-success: #5dd48a;
+    --sm-danger: #ff7a6e;
+    --sm-warning: #e0b24d;
+    --sm-border: #6e6e6e;
+    --sm-divider: #2c2c2c;
+    --sm-focus: #4da3ff;
+    --sm-bubble-in: #242424;
+    --sm-bubble-out: #123a5e;
+    --sm-notify-surface: #2a2410;
+    --sm-notify-on: #e0b24d;
+  }
+}
+
+:root[data-theme="hell"] {
+  --sm-surface: #fbfbfd;
+  --sm-surface-container: #ffffff;
+  --sm-surface-container-high: #eeeff2;
+  --sm-on-surface: #1b1b1f;
+  --sm-on-surface-muted: #5b5b63;
+  --sm-primary: #0067be;
+  --sm-on-primary: #ffffff;
+  --sm-success: #1a7f37;
+  --sm-danger: #c42b1c;
+  --sm-warning: #8a5a00;
+  --sm-border: #767680;
+  --sm-divider: #e1e1e6;
+  --sm-focus: #0067be;
+  --sm-bubble-in: #eeeff2;
+  --sm-bubble-out: #d6e6fa;
+  --sm-notify-surface: #fff6e0;
+  --sm-notify-on: #5a4300;
+}
+
+:root[data-theme="dunkel"] {
+  --sm-surface: #121212;
+  --sm-surface-container: #1e1e1e;
+  --sm-surface-container-high: #282828;
+  --sm-on-surface: #e6e6e6;
+  --sm-on-surface-muted: #a0a0a0;
+  --sm-primary: #4da3ff;
+  --sm-on-primary: #0a0a0a;
+  --sm-success: #5dd48a;
+  --sm-danger: #ff7a6e;
+  --sm-warning: #e0b24d;
+  --sm-border: #6e6e6e;
+  --sm-divider: #2c2c2c;
+  --sm-focus: #4da3ff;
+  --sm-bubble-in: #242424;
+  --sm-bubble-out: #123a5e;
+  --sm-notify-surface: #2a2410;
+  --sm-notify-on: #e0b24d;
+}
+
+:root[data-theme="midnight"] {
+  --sm-surface: #0a0a0f;
+  --sm-surface-container: #14141c;
+  --sm-surface-container-high: #1e1e28;
+  --sm-on-surface: #e4e4ec;
+  --sm-on-surface-muted: #9a9aaa;
+  --sm-primary: #6ba8e8;
+  --sm-on-primary: #08080c;
+  --sm-success: #63d28d;
+  --sm-danger: #ff8378;
+  --sm-warning: #ddb65a;
+  --sm-border: #6a6a78;
+  --sm-divider: #232330;
+  --sm-focus: #6ba8e8;
+  --sm-bubble-in: #1a1a24;
+  --sm-bubble-out: #14304e;
+  --sm-notify-surface: #201c30;
+  --sm-notify-on: #ddb65a;
+}
+
+/* ------------------------------------------------------------------ */
+/* Komponenten: benutzen ausschliesslich die semantische Ebene.        */
+/* ------------------------------------------------------------------ */
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--sm-font-sans);
+  font-size: 1rem;
+  line-height: 1.5;
+  color: var(--sm-on-surface);
+  background: var(--sm-surface);
+  /* Farbschema an den Browser melden (Formularelemente, Scrollbars). */
+  color-scheme: light dark;
+}
+
+/* Ein sichtbarer, kraeftiger Fokusring in jedem Modus (SC 2.4.7/2.4.13),
+   nur bei Tastaturfokus (nicht bei Mausklick). Nie ausgeschaltet. */
+:focus-visible {
+  outline: 2px solid var(--sm-focus);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+.sm-app {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.sm-header {
+  display: flex;
+  align-items: center;
+  gap: var(--sm-space-3);
+  flex-wrap: wrap;
+  padding: var(--sm-space-3) var(--sm-space-4);
+  border-block-end: 1px solid var(--sm-divider);
+  background: var(--sm-surface-container);
+}
+
+.sm-header h1 {
+  font-size: 1.25rem;
+  margin: 0;
+  margin-inline-end: auto;
+}
+
+.sm-identity {
+  color: var(--sm-on-surface-muted);
+  font-size: 0.9rem;
+}
+
+.sm-main {
+  width: min(46rem, 100%);
+  margin-inline: auto;
+  padding: var(--sm-space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-4);
+  flex: 1;
+}
+
+/* Formulare und Eingaben. */
+label {
+  display: block;
+  font-size: 0.9rem;
+  margin-block-end: var(--sm-space-1);
+  color: var(--sm-on-surface-muted);
+}
+
+input,
+select,
+textarea {
+  font: inherit;
+  color: var(--sm-on-surface);
+  background: var(--sm-surface-container);
+  border: 1px solid var(--sm-border);
+  border-radius: var(--sm-radius);
+  padding: var(--sm-space-2) var(--sm-space-3);
+  min-block-size: 2.75rem; /* 44px Zielgroesse */
+  inline-size: 100%;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--sm-on-surface-muted);
+}
+
+.sm-field {
+  display: flex;
+  flex-direction: column;
+}
+
+.sm-row {
+  display: flex;
+  gap: var(--sm-space-2);
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+.sm-row > .sm-field {
+  flex: 1;
+  min-inline-size: 12rem;
+}
+
+/* Knoepfe: mindestens 44px, Fokus ueber die globale Regel. */
+button {
+  font: inherit;
+  font-weight: 600;
+  min-block-size: 2.75rem;
+  min-inline-size: 2.75rem;
+  padding: var(--sm-space-2) var(--sm-space-4);
+  border-radius: var(--sm-radius);
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: background var(--sm-motion-fast), opacity var(--sm-motion-fast);
+}
+
+button.sm-primary {
+  background: var(--sm-primary);
+  color: var(--sm-on-primary);
+}
+
+button.sm-secondary {
+  background: var(--sm-surface-container);
+  color: var(--sm-on-surface);
+  border-color: var(--sm-border);
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* Der Verlauf als Log-Region (SC 4.1.3, role="log" traegt implizit
+   aria-live=polite). Blasen unterscheiden Sender/Empfaenger dreifach:
+   Ausrichtung, Name und Farbe (SC 1.4.1). */
+.sm-log {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-2);
+}
+
+.sm-msg {
+  max-inline-size: min(66ch, 85%);
+  padding: var(--sm-space-2) var(--sm-space-3);
+  border-radius: var(--sm-radius-lg);
+  background: var(--sm-bubble-in);
+  align-self: flex-start;
+}
+
+.sm-msg.sm-mine {
+  background: var(--sm-bubble-out);
+  align-self: flex-end;
+}
+
+.sm-msg .sm-msg-from {
+  display: block;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--sm-on-surface-muted);
+  margin-block-end: var(--sm-space-1);
+}
+
+.sm-msg .sm-msg-text {
+  overflow-wrap: anywhere;
+  hyphens: auto;
+}
+
+/* Karten fuer Abschnitte (Anmeldung, Sicherheit). */
+.sm-card {
+  background: var(--sm-surface-container);
+  border: 1px solid var(--sm-divider);
+  border-radius: var(--sm-radius-lg);
+  padding: var(--sm-space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-3);
+}
+
+.sm-card h2 {
+  font-size: 1rem;
+  margin: 0;
+}
+
+/* Status- und Meldungszeilen, dreifach kodiert (Farbe + Icon + Text). Der
+   Icon-Punkt vor dem Text kommt aus dem data-Attribut, nie Farbe allein. */
+.sm-status {
+  min-block-size: 1.5rem;
+  color: var(--sm-on-surface-muted);
+  font-size: 0.9rem;
+}
+
+.sm-note {
+  display: flex;
+  gap: var(--sm-space-2);
+  align-items: flex-start;
+  padding: var(--sm-space-2) var(--sm-space-3);
+  border-radius: var(--sm-radius);
+  border-inline-start: 3px solid var(--sm-border);
+  background: var(--sm-surface-container-high);
+}
+
+.sm-note::before {
+  font-weight: 700;
+  content: "i";
+}
+
+.sm-note.sm-ok {
+  border-inline-start-color: var(--sm-success);
+  color: var(--sm-success);
+}
+.sm-note.sm-ok::before {
+  content: "\2713"; /* Haken */
+}
+
+.sm-note.sm-warn {
+  border-inline-start-color: var(--sm-danger);
+  color: var(--sm-danger);
+}
+.sm-note.sm-warn::before {
+  content: "\26A0"; /* Warndreieck */
+}
+
+.sm-alert {
+  color: var(--sm-danger);
+}
+
+/* Maschinen-Benachrichtigungen (integrations-Dienst): eigene Region,
+   getrennt vom E2E-Chat und vom Krypto-Status. */
+.sm-notify {
+  background: var(--sm-notify-surface);
+  color: var(--sm-notify-on);
+  border-radius: var(--sm-radius);
+  padding: var(--sm-space-2) var(--sm-space-3);
+  border-inline-start: 3px solid var(--sm-notify-on);
+}
+
+.sm-notify h2 {
+  font-size: 0.85rem;
+  margin: 0 0 var(--sm-space-1);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.sm-notify ul {
+  margin: 0;
+  padding-inline-start: var(--sm-space-4);
+}
+
+/* Sicherheitsnummer: monospace, in Fuenfergruppen umbrechbar. */
+.sm-fingerprint {
+  font-family: var(--sm-font-mono);
+  font-size: 0.95rem;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+  background: var(--sm-surface-container-high);
+  padding: var(--sm-space-2) var(--sm-space-3);
+  border-radius: var(--sm-radius);
+}
+
+/* Die schwaechstes-Glied-Warnung des Browser-Clients: sichtbar, nicht
+   kaschiert (sicherheit.md). */
+.sm-caution {
+  font-size: 0.85rem;
+  color: var(--sm-warning);
+  border-inline-start: 3px solid var(--sm-warning);
+  padding-inline-start: var(--sm-space-3);
+}
+
+.sm-theme-switch {
+  display: flex;
+  align-items: center;
+  gap: var(--sm-space-2);
+}
+
+.sm-theme-switch label {
+  margin: 0;
+}
+
+.sm-theme-switch select {
+  inline-size: auto;
+  min-inline-size: 8rem;
+}
+
+/* Bewegung nur, wenn der Nutzer sie nicht abbestellt hat (SC 2.3.3). */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
