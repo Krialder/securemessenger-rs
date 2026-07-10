@@ -40,6 +40,9 @@ js-sys = "0.3"
 send_wrapper = "0.6"
 base64 = { workspace = true }
 rand = { workspace = true }
+# Verschlüsselte Geräte-Ablage: der IndexedDB-Blob wird unter dem
+# Login-Passwort gesealt (Argon2id + ChaCha20-Poly1305).
+keystore = { workspace = true }
 # Zustands-Blob der Ablage und Profil/Kontakte: dasselbe debugbare
 # JSON-Format wie beim CLI.
 serde = { workspace = true }

@@ -14,10 +14,13 @@
 //! Ein Konto je Browser-Profil; ein zweites Konto braucht ein anderes
 //! Browser-Profil. Der Empfang läuft in Echtzeit über den
 //! gloo-net-Hinweiskanal (mit Wiederverbindung nach Abbruch), der
-//! Abruf-Knopf bleibt als Rückfallebene. Der Web-Client ist laut
-//! sicherheit.md das kryptografisch schwächste Glied (kein OS-Keystore,
-//! XSS-Fläche); die Oberfläche sagt das sichtbar an, statt es zu
-//! kaschieren.]
+//! Abruf-Knopf bleibt als Rückfallebene. Die IndexedDB-Ablage ist mit dem
+//! Login-Passwort verschlüsselt (keystore, storage.rs); ein verschlüsseltes
+//! Konto ist beim Start ein eigener Boot-Zustand (`Locked`), weil der
+//! Handle vor dem Entsperren im gesealten Blob steckt. Der Web-Client
+//! bleibt laut sicherheit.md das kryptografisch schwächste Glied (kein
+//! OS-Keystore, XSS-Fläche, Schlüssel im Speicher während der Sitzung); die
+//! Oberfläche sagt das sichtbar an, statt es zu kaschieren.]
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -358,6 +361,10 @@ fn save_counter(storage: &SharedStorage, next_prekey_id: u32) -> Result<(), Stri
 /// Nutzersicht, weil ein frisch angelegtes Konto ohne veröffentlichte
 /// Prekeys nicht erreichbar wäre.
 async fn onboard(storage: SharedStorage, handle: String, password: String) -> Result<Core, String> {
+    // Ab dem ersten Schreibvorgang verschlüsseln: bei der Registrierung
+    // steht das Passwort durch die eigene Wahl fest, es gibt keine
+    // vorhandenen Daten, die ein falsches Passwort gefährden könnte.
+    storage.borrow_mut().adopt_passphrase(&password);
     let mut rng = rand::rng();
     let identity = IdentityKeyPair::generate(&mut rng);
     // libsignal-Registration-IDs sind 14 Bit (1..16380).
@@ -426,11 +433,22 @@ async fn onboard(storage: SharedStorage, handle: String, password: String) -> Re
 /// nur das Passwort muss der Nutzer neu eingeben (Tokens werden bewusst
 /// nicht persistiert, siehe Modulkopf).
 async fn login(storage: SharedStorage, password: String) -> Result<Core, String> {
+    // Eine verschlüsselte Ablage zuerst entsperren; ein falsches Passwort
+    // scheitert hier, noch vor dem Server. Bei Klartext oder frisch ist das
+    // ein No-op.
+    storage
+        .borrow_mut()
+        .unlock(&password)
+        .map_err(|e| format!("Ablage nicht entsperrbar: {e}"))?;
     let profile = load_profile(&storage).ok_or_else(|| "Kein Profil in der Ablage".to_string())?;
     let session = IdentityClient::new(identity_url())
         .login(&profile.handle, &password, &profile.device_id)
         .await
         .map_err(|e| e.to_string())?;
+    // Nach der Server-Bestätigung eine noch unverschlüsselte Ablage
+    // (Migration einer alten Klartext-Ablage) verschlüsseln; bei einer schon
+    // entsperrten gesealten Ablage ist das ein No-op.
+    storage.borrow_mut().adopt_passphrase(&password);
     let next_prekey_id = load_counter(&storage)?;
     let device = Device::with_store(
         &profile.handle,
@@ -716,8 +734,11 @@ enum Boot {
     Loading,
     /// Keine Identität in der Ablage: Registrierungs-Formular.
     Fresh,
-    /// Profil vorhanden: Anmelde-Formular für dieses Handle.
+    /// Klartext-Profil vorhanden (Migration): Anmeldung für dieses Handle.
     Known(String),
+    /// Verschlüsselte Ablage: Anmeldung nötig, aber der Handle ist vor dem
+    /// Passwort unbekannt (der ganze Blob ist gesealt).
+    Locked,
     /// Ablage nicht nutzbar (etwa privates Fenster ohne IndexedDB).
     Broken(String),
 }
@@ -790,12 +811,24 @@ fn App() -> impl IntoView {
             match BrowserStorage::open().await {
                 Ok(storage) => {
                     let storage: SharedStorage = Rc::new(RefCell::new(storage));
-                    let known = load_profile(&storage).map(|p| p.handle);
+                    // Verschlüsselte Ablage: der Handle ist erst nach dem
+                    // Entsperren lesbar (Locked). Klartext (Migration) oder
+                    // frisch: wie bisher entscheiden.
+                    let boot = {
+                        let s = storage.borrow();
+                        if !s.has_state() {
+                            Boot::Fresh
+                        } else if s.is_locked() {
+                            Boot::Locked
+                        } else {
+                            match load_profile(&storage).map(|p| p.handle) {
+                                Some(handle) => Boot::Known(handle),
+                                None => Boot::Fresh,
+                            }
+                        }
+                    };
                     *boot_storage.borrow_mut() = Some(storage);
-                    set_boot.set(match known {
-                        Some(handle) => Boot::Known(handle),
-                        None => Boot::Fresh,
-                    });
+                    set_boot.set(boot);
                 }
                 Err(error) => set_boot.set(Boot::Broken(error)),
             }
@@ -1455,10 +1488,11 @@ fn App() -> impl IntoView {
                                             })
                                     }}
                                     <p class="sm-caution">
-                                        "Geräte-Identität, Sitzungen und Kontakte liegen "
-                                        "unverschlüsselt in IndexedDB dieses Browser-Profils. Der "
-                                        "Browser ist das kryptografisch schwächste Glied der "
-                                        "Plattform (sicherheit.md)."
+                                        "Geräte-Identität, Sitzungen und Kontakte liegen mit dem "
+                                        "Passwort verschlüsselt in IndexedDB (Argon2id plus "
+                                        "ChaCha20-Poly1305). Solange die App offen ist, hält sie den "
+                                        "Schlüssel im Speicher; der Browser bleibt laut sicherheit.md "
+                                        "das schwächste Glied (kein OS-Keystore, XSS-Fläche)."
                                     </p>
                                 </div>
                             </nav>
@@ -1739,6 +1773,39 @@ fn App() -> impl IntoView {
                                                         disabled=busy
                                                     >
                                                         "Anmelden"
+                                                    </button>
+                                                </div>
+                                            </section>
+                                        }
+                                            .into_any()
+                                    }
+                                    Boot::Locked => {
+                                        view! {
+                                            <section class="sm-card" aria-label="Anmelden">
+                                                <h2>"Verschlüsseltes Konto auf diesem Gerät"</h2>
+                                                <p class="sm-status">
+                                                    "Die Ablage ist mit dem Passwort verschlüsselt. "
+                                                    "Zum Entsperren das Passwort eingeben."
+                                                </p>
+                                                <div class="sm-field">
+                                                    <label for="sm-pass">"Passwort"</label>
+                                                    <input
+                                                        id="sm-pass"
+                                                        type="password"
+                                                        prop:value=password_input
+                                                        on:input=move |ev| {
+                                                            set_password_input.set(event_target_value(&ev))
+                                                        }
+                                                    />
+                                                </div>
+                                                <div class="sm-row">
+                                                    <button
+                                                        type="button"
+                                                        class="sm-primary"
+                                                        on:click=on_login.clone()
+                                                        disabled=busy
+                                                    >
+                                                        "Entsperren und anmelden"
                                                     </button>
                                                 </div>
                                             </section>

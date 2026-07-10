@@ -4509,6 +4509,7 @@ dependencies = [
  "gloo-timers",
  "indexed_db_futures",
  "js-sys",
+ "keystore",
  "leptos",
  "rand 0.9.4",
  "send_wrapper",
