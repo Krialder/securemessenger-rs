@@ -8,9 +8,13 @@
 //! damit Prozessgrenzen: `sm send` und `sm recv` setzen den Ratchet dort
 //! fort, wo der letzte Aufruf endete.
 //!
-//! [ANNAHME: Beide Dateien sind unverschlüsseltes JSON, eine
-//! Entwickler-Bequemlichkeit; wer sie hat, hat die Identität. Die
-//! verschlüsselte Geräte-Ablage (Keystore) ist eine eigene Etappe.]
+//! [ANNAHME: Ohne `SM_PASSPHRASE` liegen beide Dateien als Klartext-JSON
+//! vor, eine Entwickler-Bequemlichkeit; wer sie hat, hat die Identität.
+//! Mit gesetzter `SM_PASSPHRASE` verschlüsselt der keystore-Tresor beide
+//! (Konto-Seed, Tokens, Sitzungen, Kontakte), und der blosse Besitz der
+//! Dateien genügt nicht mehr. Die Passphrase kommt über die Umgebung wie
+//! die übrigen Geheimnisse des Projekts; ein echter Desktop-Client nähme
+//! den OS-Keyring, das ist die nächste Stufe.]
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -928,16 +932,40 @@ fn state_path() -> String {
     std::env::var("SM_STATE").unwrap_or_else(|_| "sm-state.json".to_string())
 }
 
+/// Lädt das Profil. Mit gesetzter Passphrase wird eine verschlüsselte
+/// Datei entsiegelt; eine ältere Klartext-Datei wird noch gelesen (und
+/// beim nächsten Speichern verschlüsselt). Ohne Passphrase eine
+/// verschlüsselte Datei zu öffnen, scheitert klar.
 fn load_profile() -> Result<Profile, String> {
     let path = profile_path();
     let data = std::fs::read(&path)
         .map_err(|_| format!("Kein Profil unter {path}. Zuerst 'sm register' ausführen."))?;
-    serde_json::from_slice(&data).map_err(|error| format!("Profil unlesbar: {error}"))
+    let json = match passphrase() {
+        Some(pp) if keystore::is_sealed(&data) => {
+            keystore::Sealer::unlock(&pp, &data)
+                .map_err(|e| format!("Profil: {e}"))?
+                .1
+        }
+        None if keystore::is_sealed(&data) => {
+            return Err("Profil ist verschlüsselt; SM_PASSPHRASE setzen.".to_string())
+        }
+        // Passphrase gesetzt, Datei noch Klartext (Migration), oder gar
+        // keine Passphrase und Klartext-Datei: unverändert lesen.
+        _ => data,
+    };
+    serde_json::from_slice(&json).map_err(|error| format!("Profil unlesbar: {error}"))
 }
 
+/// Speichert das Profil. Mit Passphrase im keystore-Envelope (der
+/// Konto-Seed und die Tokens liegen dann nicht mehr im Klartext), sonst als
+/// Klartext-JSON.
 fn save_profile(profile: &Profile) -> Result<(), String> {
     let path = profile_path();
-    let data = serde_json::to_vec_pretty(profile).map_err(|error| error.to_string())?;
+    let json = serde_json::to_vec_pretty(profile).map_err(|error| error.to_string())?;
+    let data = match passphrase() {
+        Some(pp) => keystore::Sealer::create(&pp).seal(&json),
+        None => json,
+    };
     std::fs::write(&path, data).map_err(|error| format!("Profil nicht schreibbar: {error}"))
 }
 
@@ -948,8 +976,24 @@ fn access_token(profile: &Profile) -> Result<String, String> {
         .ok_or_else(|| "Kein aktives Token. Zuerst 'sm login'.".to_string())
 }
 
+/// Die Ablage-Passphrase aus der Umgebung. Ist `SM_PASSPHRASE` gesetzt,
+/// laufen Profil und Zustand verschlüsselt (keystore); ohne bleibt es
+/// Klartext, damit Tests und der schnelle lokale Betrieb ohne Vorbereitung
+/// funktionieren. [ANNAHME: Passphrase über die Umgebung wie die übrigen
+/// Geheimnisse des Projekts (KT-Schlüssel, OPRF-Schlüssel); ein echter
+/// Desktop-Client nähme den OS-Keyring, das ist eine eigene Etappe.]
+fn passphrase() -> Option<String> {
+    std::env::var("SM_PASSPHRASE")
+        .ok()
+        .filter(|p| !p.is_empty())
+}
+
 fn open_storage() -> Result<SharedStorage, String> {
-    Ok(Rc::new(RefCell::new(FileStorage::open(state_path())?)))
+    let storage = match passphrase() {
+        Some(pp) => FileStorage::open_encrypted(state_path(), &pp)?,
+        None => FileStorage::open(state_path())?,
+    };
+    Ok(Rc::new(RefCell::new(storage)))
 }
 
 /// Öffnet die Zustands-Ablage und baut das Gerät darüber; der

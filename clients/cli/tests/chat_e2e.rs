@@ -61,6 +61,8 @@ struct CliUser {
     identity_url: String,
     directory_url: String,
     delivery_url: String,
+    /// Gesetzt schaltet die verschlüsselte Ablage frei (SM_PASSPHRASE).
+    passphrase: Option<String>,
 }
 
 impl CliUser {
@@ -74,7 +76,20 @@ impl CliUser {
             identity_url: urls.0.clone(),
             directory_url: urls.1.clone(),
             delivery_url: urls.2.clone(),
+            passphrase: None,
         }
+    }
+
+    /// Wie `new`, aber mit verschlüsselter Ablage unter einer Passphrase.
+    fn new_encrypted(
+        dir: &Path,
+        name: &str,
+        urls: &(String, String, String),
+        passphrase: &str,
+    ) -> Self {
+        let mut user = Self::new(dir, name, urls);
+        user.passphrase = Some(passphrase.to_string());
+        user
     }
 
     /// Das echte sm-Binary mit der Umgebung dieses Nutzers, noch nicht
@@ -89,6 +104,9 @@ impl CliUser {
             .env("SM_IDENTITY_URL", &self.identity_url)
             .env("SM_DIRECTORY_URL", &self.directory_url)
             .env("SM_DELIVERY_URL", &self.delivery_url);
+        if let Some(passphrase) = &self.passphrase {
+            command.env("SM_PASSPHRASE", passphrase);
+        }
         command
     }
 
@@ -192,6 +210,63 @@ async fn two_cli_users_chat_across_process_boundaries() {
     );
 
     // Aufräumen ist Komfort, kein Testinhalt.
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Verschlüsselte Ablage: mit SM_PASSPHRASE liegen Profil und Zustand als
+/// keystore-Envelope auf der Platte (nicht als lesbares JSON), der volle
+/// Chat-Rundlauf funktioniert trotzdem über Prozessgrenzen, und eine
+/// falsche Passphrase sperrt den Zugriff.
+#[tokio::test(flavor = "multi_thread")]
+async fn encrypted_storage_roundtrip() {
+    let urls = start_stack().await;
+    let dir = std::env::temp_dir().join(format!("sm-enc-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("Testverzeichnis");
+
+    let carla = CliUser::new_encrypted(&dir, "carla", &urls, "carlas-tresor-passphrase");
+    let dirk = CliUser::new_encrypted(&dir, "dirk", &urls, "dirks-tresor-passphrase");
+
+    carla.run(&["register", "carla", "carlas-langes-passwort"]);
+    carla.run(&["login", "carlas-langes-passwort"]);
+    carla.run(&["publish-keys"]);
+    dirk.run(&["register", "dirk", "dirks-langes-passwort"]);
+    dirk.run(&["login", "dirks-langes-passwort"]);
+    dirk.run(&["publish-keys"]);
+
+    // Der Chat funktioniert über die verschlüsselte Ablage hinweg (jede
+    // Operation entsiegelt, arbeitet, versiegelt neu).
+    carla.run(&["send", "dirk", "verschluesselte ablage, klartext chat"]);
+    let received = dirk.run(&["recv"]);
+    assert!(
+        received.contains("[carla] verschluesselte ablage, klartext chat"),
+        "der Chat muss auch mit Tresor-Ablage laufen, stdout war: {received}"
+    );
+
+    // Beweis auf der Platte: beide Dateien tragen das keystore-Präfix und
+    // sind kein lesbares JSON mehr.
+    for path in [&carla.profile, &carla.state] {
+        let bytes = std::fs::read(path).expect("Datei liegt vor");
+        assert!(
+            bytes.starts_with(b"smks.v1"),
+            "{path} muss ein keystore-Envelope sein"
+        );
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).is_err(),
+            "{path} darf kein lesbares JSON mehr sein"
+        );
+    }
+
+    // Falsche Passphrase: der Zugriff scheitert, kein stiller Klartext.
+    let wrong = CliUser::new_encrypted(&dir, "carla", &urls, "falsche-passphrase");
+    let output = wrong
+        .command(&["whoami"])
+        .output()
+        .expect("sm-Binary startet");
+    assert!(
+        !output.status.success(),
+        "mit falscher Passphrase darf kein Zugriff gelingen"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

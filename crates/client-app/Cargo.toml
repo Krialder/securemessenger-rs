@@ -40,6 +40,9 @@ oprf = { workspace = true }
 franking = { workspace = true }
 # Proof-of-Work-Sybil-Bremse: der Client löst sie beim Registrieren.
 pow = { workspace = true }
+# Verschlüsselte Geräte-Ablage: FileStorage kann den Blob unter einer
+# Passphrase sealen (open_encrypted).
+keystore = { workspace = true }
 # Die persistente Protokoll-Ablage erfuellt libsignals Store-Traits, und
 # die sind mit async_trait(?Send) definiert.
 async-trait = { workspace = true }

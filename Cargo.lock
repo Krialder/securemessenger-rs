@@ -552,6 +552,7 @@ dependencies = [
  "ed25519-dalek",
  "franking",
  "identity",
+ "keystore",
  "kt",
  "kt-format",
  "oprf",
@@ -2170,6 +2171,16 @@ checksum = "f6e3919bbaa2945715f0bb6d3934a173d1e9a59ac23767fbaaef277265a7411b"
 dependencies = [
  "cfg-if",
  "elliptic-curve",
+]
+
+[[package]]
+name = "keystore"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "chacha20poly1305",
+ "rand 0.9.4",
+ "zeroize",
 ]
 
 [[package]]
@@ -4475,6 +4486,7 @@ dependencies = [
  "directory",
  "futures-util",
  "identity",
+ "keystore",
  "rand 0.9.4",
  "sealed-cert",
  "serde",

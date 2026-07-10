@@ -1,0 +1,29 @@
+[package]
+name = "keystore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Verschluesselte Geraete-Ablage (sicherheit.md "Loeschen heisst Schluessel
+# vernichten", ADR-0002-Krypto-Stack). Sealt den gesamten Ablage-Blob der
+# Clients (Identitaet, Sitzungen, Kontakte, Verlaeufe) unter einer
+# Passphrase, damit der blosse Besitz der Datei bzw. des IndexedDB-Eintrags
+# nicht mehr genuegt. Kein Eigenbau: Schluesselableitung ueber Argon2id,
+# authentifizierte Verschluesselung ueber ChaCha20-Poly1305, beide aus den
+# geprueften RustCrypto-Bibliotheken; dieses Crate setzt sie nur zu einem
+# versionierten Envelope zusammen. Geteilt zwischen CLI (Datei) und
+# Web-Client (IndexedDB), damit beide dasselbe Format rechnen; baut auch
+# nach wasm32 (reines Rust).
+
+[dependencies]
+# AEAD: ein Nonce-Missbrauch waere fatal, deshalb erzeugt seal jeden Nonce
+# frisch aus dem OS-CSPRNG; die Poly1305-Pruefung faengt jede Manipulation.
+chacha20poly1305 = "0.10"
+# Passwort-basierte Schluesselableitung; Argon2id ist der Standard gegen
+# Brute-Force auf gestohlene Ablagen (RFC 9106).
+argon2.workspace = true
+# Salt und Nonce aus dem OS-CSPRNG.
+rand.workspace = true
+# Den abgeleiteten Schluessel beim Fallenlassen aus dem Speicher wischen.
+zeroize = "1"

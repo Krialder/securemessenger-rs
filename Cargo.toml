@@ -14,6 +14,7 @@ members = [
     "crates/client-core",
     "crates/common",
     "crates/franking",
+    "crates/keystore",
     "crates/kt-format",
     "crates/oprf",
     "crates/pow",
@@ -91,6 +92,8 @@ sealed-cert = { path = "crates/sealed-cert" }
 # Binary-Transparency-Log (ADR-0007): Mechanismus als Bibliothek plus
 # sm-bt-Werkzeug.
 btlog = { path = "crates/btlog" }
+# Verschlüsselte Geräte-Ablage, geteilt zwischen CLI und Web-Client.
+keystore = { path = "crates/keystore" }
 # Property-Tests (Roadmap Phase 6): zufällig erzeugte Eingaben gegen
 # Invarianten der Parser und der Krypto-Integration.
 proptest = "1"
