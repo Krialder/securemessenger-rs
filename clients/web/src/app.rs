@@ -863,6 +863,70 @@ fn start_hint_channel(
     });
 }
 
+/// Prüft die Geräteschlüssel eines Kontakts gegen das Verzeichnis, wie
+/// `sm keycheck` im CLI: der beim ersten Kontakt gespeicherte
+/// Identitätsschlüssel (TOFU) wird mit dem frischen Bündel verglichen.
+/// Weicht er ab, hat der Kontakt (oder ein Angreifer über den Server) den
+/// Schlüssel getauscht; dann ist `false` im Ergebnis der Alarmfall, analog
+/// zur KT-Prüfung. Ein Gerät ohne gespeicherte Sitzung ist kein Alarm: bei
+/// unbekanntem Kontakt der Erstkontakt, bei bekanntem ein neues Gerät, das
+/// erst die nächste Sitzung pinnt.
+async fn key_check(
+    core: &mut Core,
+    token: ReadSignal<String>,
+    peer: &str,
+) -> Result<(bool, String), String> {
+    let bundles = DirectoryClient::new(directory_url())
+        .bundles(&token.get_untracked(), peer)
+        .await
+        .map_err(|e| e.to_string())?;
+    if bundles.devices.is_empty() {
+        return Err(format!("'{peer}' hat keine gültigen Geräte."));
+    }
+    let mut unchanged = 0usize;
+    let mut fresh = 0usize;
+    let mut changed: Vec<String> = Vec::new();
+    for bundle_json in &bundles.devices {
+        let (_bundle, protocol_device_id) =
+            bundle_from_directory(bundle_json).map_err(|e| e.to_string())?;
+        let address = ProtocolAddress::new(
+            peer.to_string(),
+            device_id_from_u32(protocol_device_id).map_err(|e| e.to_string())?,
+        );
+        let incoming = BASE64
+            .decode(&bundle_json.identity_key)
+            .map_err(|e| format!("Bündel-Schlüssel kein Base64: {e}"))?;
+        match core
+            .device
+            .stored_identity(&address)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            None => fresh += 1,
+            Some(stored) if stored == incoming => unchanged += 1,
+            // Gekürzte Geräte-ID: lesbar in der Statuszeile, eindeutig
+            // genug zum Wiederfinden in der Geräteliste.
+            Some(_) => changed.push(bundle_json.device_id.chars().take(8).collect()),
+        }
+    }
+    if !changed.is_empty() {
+        return Ok((
+            false,
+            format!(
+                "SCHLÜSSEL GEÄNDERT (Gerät {}): Vor dem Weiterschreiben die \
+                 Sicherheitsnummer über einen zweiten Kanal neu abgleichen.",
+                changed.join(", ")
+            ),
+        ));
+    }
+    let message = match (unchanged, fresh) {
+        (0, f) => format!("Noch keine Sitzung ({f} Gerät(e)): der Schlüssel wird beim ersten Senden gespeichert (Erstkontakt)."),
+        (u, 0) => format!("Geräteschlüssel unverändert ({u} Gerät(e))."),
+        (u, f) => format!("{u} Geräteschlüssel unverändert, {f} neue(s) Gerät(e) ohne bisherige Sitzung."),
+    };
+    Ok((true, message))
+}
+
 /// Die KT-Selbstprüfung für das eigene Konto (kt-Modul in client-app):
 /// Commitment aus Konto-Schlüssel und eigener Gerätemenge nachrechnen,
 /// Beweis gegen die signierte Wurzel verifizieren. Alarm (`true` im
@@ -947,6 +1011,10 @@ fn App() -> impl IntoView {
     let (safety_info, set_safety_info) = signal(Option::<(String, String)>::None);
     // Ergebnis der KT-Selbstprüfung: (bestanden, Meldung).
     let (kt_info, set_kt_info) = signal(Option::<(bool, String)>::None);
+    // Ergebnis der Schlüsselwechsel-Prüfung des offenen Chats:
+    // (kein Wechsel, Meldung). Beim Chat-Wechsel zurückgesetzt, die Aussage
+    // gilt nur für den geprüften Kontakt.
+    let (key_info, set_key_info) = signal(Option::<(bool, String)>::None);
     // Maschinen-Benachrichtigungen vom integrations-Dienst, getrennt vom
     // Krypto-Status und vom E2E-Chat (design-system.md, Status-Trennung).
     let (notifications, set_notifications) = signal(Vec::<String>::new());
@@ -1178,6 +1246,7 @@ fn App() -> impl IntoView {
             set_safety_open.set(false);
             set_safety_info.set(None);
             set_kt_info.set(None);
+            set_key_info.set(None);
             set_notifications.set(Vec::new());
             set_password_input.set(String::new());
             set_text_input.set(String::new());
@@ -1345,6 +1414,45 @@ fn App() -> impl IntoView {
         });
     }
 
+    // Prüft die Geräteschlüssel des offenen Chats gegen das Verzeichnis
+    // (Schlüsselwechsel-Warnung, siehe key_check).
+    let on_key_check = {
+        let core = core.clone();
+        move |_| {
+            if busy.get_untracked() {
+                return;
+            }
+            let Some(peer) = selected.get_untracked() else {
+                return;
+            };
+            set_busy.set(true);
+            set_key_info.set(None);
+            let core = core.clone();
+            spawn_local(async move {
+                let taken = core.borrow_mut().take();
+                match taken {
+                    Some(mut active) => {
+                        let result = key_check(&mut active, access_token, &peer).await;
+                        *core.borrow_mut() = Some(active);
+                        match result {
+                            Ok(info) => {
+                                // Nur anzeigen, wenn der Chat noch offen ist:
+                                // die Aussage gehört zu genau diesem Kontakt.
+                                if selected.get_untracked().as_deref() == Some(peer.as_str()) {
+                                    set_key_info.set(Some(info));
+                                }
+                                set_status.set(String::new());
+                            }
+                            Err(error) => set_status.set(format!("Schlüssel-Prüfung: {error}")),
+                        }
+                    }
+                    None => set_status.set("Nicht angemeldet.".to_string()),
+                }
+                set_busy.set(false);
+            });
+        }
+    };
+
     // Blendet die Sicherheitsnummer des offenen Chats ein oder aus. Beim
     // Öffnen wird sie für den ausgewählten Kontakt berechnet.
     let on_safety = {
@@ -1409,6 +1517,7 @@ fn App() -> impl IntoView {
             set_chats.set(mark_read(&storage, &peer));
             set_safety_open.set(false);
             set_safety_info.set(None);
+            set_key_info.set(None);
             set_selected.set(Some(peer));
         }
     };
@@ -1416,6 +1525,7 @@ fn App() -> impl IntoView {
     let on_back = move |_| {
         set_selected.set(None);
         set_safety_open.set(false);
+        set_key_info.set(None);
     };
 
     // "Neuer Chat" bestätigen: Handle in die Liste aufnehmen und öffnen.
@@ -1557,6 +1667,7 @@ fn App() -> impl IntoView {
                     // `on_back` fängt nur Copy-Signale ein und ist selbst Copy,
                     // braucht also keinen Klon.
                     let on_safety = on_safety.clone();
+                    let on_key_check = on_key_check.clone();
                     let on_send = on_send.clone();
                     let on_fetch = on_fetch.clone();
                     let on_message_key = on_message_key.clone();
@@ -1775,7 +1886,39 @@ fn App() -> impl IntoView {
                                                     >
                                                         "Sicherheitsnummer"
                                                     </button>
+                                                    <button
+                                                        type="button"
+                                                        class="sm-secondary"
+                                                        on:click=on_key_check.clone()
+                                                        disabled=busy
+                                                    >
+                                                        "Schlüssel prüfen"
+                                                    </button>
                                                 </div>
+
+                                                {move || {
+                                                    key_info
+                                                        .get()
+                                                        .map(|(ok, message)| {
+                                                            if ok {
+                                                                view! {
+                                                                    <p class="sm-note sm-ok">
+                                                                        <span aria-hidden="true">"✓ "</span>
+                                                                        {message}
+                                                                    </p>
+                                                                }
+                                                                    .into_any()
+                                                            } else {
+                                                                view! {
+                                                                    <p class="sm-note sm-warn" role="alert">
+                                                                        <span aria-hidden="true">"⚠ "</span>
+                                                                        {message}
+                                                                    </p>
+                                                                }
+                                                                    .into_any()
+                                                            }
+                                                        })
+                                                }}
 
                                                 {move || {
                                                     safety_open
