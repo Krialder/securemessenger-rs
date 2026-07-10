@@ -27,8 +27,9 @@ leptos = { version = "0.8", features = ["csr"] }
 console_error_panic_hook = "0.1"
 # Window/Location fuer die Origin-URLs; Document/Element/Storage fuer den
 # Theme-Umschalter (data-theme am <html>, Wahl in localStorage);
-# KeyboardEvent fuer Enter-zum-Senden.
-web-sys = { version = "0.3", features = ["Window", "Location", "Document", "Element", "Storage", "KeyboardEvent"] }
+# KeyboardEvent fuer Enter-zum-Senden; HtmlUListElement fuer den
+# Auto-Scroll des Verlaufs (scrollTop/scrollHeight ueber den NodeRef).
+web-sys = { version = "0.3", features = ["Window", "Location", "Document", "Element", "Storage", "KeyboardEvent", "HtmlUListElement"] }
 # Uhrzeit fuer die Credential-Gueltigkeit (js_sys::Date), im Browser gibt es
 # kein std::time::SystemTime.
 js-sys = "0.3"
@@ -57,3 +58,6 @@ wasm-bindgen-futures = "0.4"
 wasm-bindgen = "0.2"
 # Stream/Sink-Adapter fuer den gloo-net-WebSocket (next/send).
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# Wartezeit (Backoff) zwischen Wiederverbindungsversuchen des Hinweiskanals:
+# sleep als Future, ohne setTimeout von Hand zu kapseln.
+gloo-timers = { version = "0.3", features = ["futures"] }

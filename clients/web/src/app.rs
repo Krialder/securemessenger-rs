@@ -12,13 +12,16 @@
 //! dauerhaft gespeichertes Token im unverschlüsselten Browser-Storage
 //! wäre ein größeres Diebstahlsziel als die erneute Eingabe wert ist.
 //! Ein Konto je Browser-Profil; ein zweites Konto braucht ein anderes
-//! Browser-Profil. Abruf per Knopf; der gloo-net-Hinweiskanal folgt als
-//! nächster Schnitt. Der Web-Client ist laut sicherheit.md das
-//! kryptografisch schwächste Glied (kein OS-Keystore, XSS-Fläche); die
-//! Oberfläche sagt das sichtbar an, statt es zu kaschieren.]
+//! Browser-Profil. Der Empfang läuft in Echtzeit über den
+//! gloo-net-Hinweiskanal (mit Wiederverbindung nach Abbruch), der
+//! Abruf-Knopf bleibt als Rückfallebene. Der Web-Client ist laut
+//! sicherheit.md das kryptografisch schwächste Glied (kein OS-Keystore,
+//! XSS-Fläche); die Oberfläche sagt das sichtbar an, statt es zu
+//! kaschieren.]
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -39,6 +42,7 @@ use client_core::libsignal_protocol::{IdentityKeyPair, ProtocolAddress};
 use client_core::onetoone::Device;
 use futures_util::{SinkExt as _, StreamExt as _};
 use gloo_net::websocket::{futures::WebSocket, Message as WsMessage};
+use gloo_timers::future::sleep;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use send_wrapper::SendWrapper;
@@ -584,59 +588,93 @@ async fn fetch_messages(core: &mut Core) -> Result<Vec<(String, String)>, String
     Ok(received)
 }
 
-/// Hält den Hinweiskanal offen: die Browser-Seite des Vertrags aus
-/// `client_app::delivery`. Die Schleife fasst den Client-Zustand nie an,
-/// sie zählt nur das Hinweis-Signal hoch; den Abruf stößt ein Effect an,
-/// sobald die Oberfläche frei ist (kein RefCell-Borrow über await).
-/// Maschinen-Benachrichtigungen (integrations-Dienst) laufen in eine
-/// eigene Liste, getrennt vom Krypto-Status und vom E2E-Chat.
+/// Hält den Hinweiskanal offen und verbindet nach einem Abbruch neu: die
+/// Browser-Seite des Vertrags aus `client_app::delivery`. Die Schleife
+/// fasst den Client-Zustand nie an, sie zählt nur das Hinweis-Signal hoch;
+/// den Abruf stößt ein Effect an, sobald die Oberfläche frei ist (kein
+/// RefCell-Borrow über await). Maschinen-Benachrichtigungen
+/// (integrations-Dienst) laufen in eine eigene Liste, getrennt vom
+/// Krypto-Status und vom E2E-Chat.
+///
+/// `my_epoch` ist die Kanal-Epoche beim Start; `epoch` die aktuelle. Ein
+/// Abmelden oder eine neue Anmeldung erhöht die Epoche und lässt diese
+/// Schleife beim nächsten Prüfpunkt sauber enden, damit kein toter Kanal
+/// mit altem Token weiterläuft (sonst gäbe es nach dem Konto-Wechsel zwei
+/// konkurrierende Schleifen).
 fn start_hint_channel(
     token: String,
+    epoch: StoredValue<u64>,
+    my_epoch: u64,
     set_hints: WriteSignal<u64>,
     set_status: WriteSignal<String>,
     set_notifications: WriteSignal<Vec<String>>,
     set_connected: WriteSignal<bool>,
 ) {
     spawn_local(async move {
-        let url = client_app::delivery::ws_url(&delivery_url());
-        let mut socket = match WebSocket::open(&url) {
-            Ok(socket) => socket,
-            Err(error) => {
-                set_connected.set(false);
-                set_status.set(format!("Echtzeit-Kanal nicht erreichbar: {error}"));
+        // Wartezeit zwischen Versuchen; nach jeder erfolgreichen Verbindung
+        // zurück auf 1s, gedeckelt bei 30s, damit ein toter Server nicht
+        // dauerhaft angehämmert wird.
+        let mut backoff = 1u64;
+        loop {
+            if epoch.get_value() != my_epoch {
                 return;
             }
-        };
-        if let Err(error) = socket.send(WsMessage::Text(ws_auth_frame(&token))).await {
-            set_connected.set(false);
-            set_status.set(format!("Echtzeit-Kanal: Auth nicht gesendet: {error}"));
-            return;
-        }
-        // Auth gesendet, der Kanal steht bis zum Schliessen oder Fehler.
-        set_connected.set(true);
-        while let Some(frame) = socket.next().await {
-            match frame {
-                Ok(WsMessage::Text(text)) => match parse_ws_event(&text) {
-                    Some(WsEvent::MessageWaiting) => set_hints.update(|n| *n += 1),
-                    Some(WsEvent::Notification { tenant, title }) => {
-                        set_notifications.update(|list| list.push(format!("{tenant}: {title}")));
-                    }
-                    // Unbekannte und unlesbare Frames bewusst still: neue
-                    // Server-Events dürfen alte Clients nicht stören.
-                    Some(WsEvent::Other { .. }) | None => {}
-                },
-                Ok(WsMessage::Bytes(_)) => {}
+            let url = client_app::delivery::ws_url(&delivery_url());
+            let opened = WebSocket::open(&url);
+            let mut socket = match opened {
+                Ok(socket) => socket,
                 Err(error) => {
                     set_connected.set(false);
-                    set_status.set(format!("Echtzeit-Kanal gestört: {error}"));
+                    set_status.set(format!("Echtzeit-Kanal nicht erreichbar: {error}"));
+                    sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(30);
+                    continue;
+                }
+            };
+            if let Err(error) = socket.send(WsMessage::Text(ws_auth_frame(&token))).await {
+                set_connected.set(false);
+                set_status.set(format!("Echtzeit-Kanal: Auth nicht gesendet: {error}"));
+                sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(30);
+                continue;
+            }
+            // Verbunden. Backoff zurücksetzen und einmal abholen, damit
+            // während der Trennung eingegangene Nachrichten nicht fehlen
+            // (der Hinweis dafür kam ja über den geschlossenen Kanal nicht).
+            set_connected.set(true);
+            set_status.set(String::new());
+            backoff = 1;
+            set_hints.update(|n| *n += 1);
+            while let Some(frame) = socket.next().await {
+                if epoch.get_value() != my_epoch {
                     return;
                 }
+                match frame {
+                    Ok(WsMessage::Text(text)) => match parse_ws_event(&text) {
+                        Some(WsEvent::MessageWaiting) => set_hints.update(|n| *n += 1),
+                        Some(WsEvent::Notification { tenant, title }) => {
+                            set_notifications
+                                .update(|list| list.push(format!("{tenant}: {title}")));
+                        }
+                        // Unbekannte und unlesbare Frames bewusst still: neue
+                        // Server-Events dürfen alte Clients nicht stören.
+                        Some(WsEvent::Other { .. }) | None => {}
+                    },
+                    Ok(WsMessage::Bytes(_)) => {}
+                    // Fehler: innere Schleife verlassen und neu verbinden.
+                    Err(_) => break,
+                }
             }
+            // Kanal zu (Server-Close oder Fehler): getrennt melden und, wenn
+            // die Schleife noch aktuell ist, mit Backoff neu verbinden.
+            if epoch.get_value() != my_epoch {
+                return;
+            }
+            set_connected.set(false);
+            set_status.set("Echtzeit-Kanal getrennt, neuer Verbindungsversuch ...".to_string());
+            sleep(Duration::from_secs(backoff)).await;
+            backoff = (backoff * 2).min(30);
         }
-        // [ANNAHME: kein automatischer Wiederverbinder, wie beim CLI; der
-        // Abruf-Knopf bleibt als Rückfallebene sichtbar.]
-        set_connected.set(false);
-        set_status.set("Echtzeit-Kanal geschlossen; Abrufen weiter per Knopf.".to_string());
     });
 }
 
@@ -729,6 +767,13 @@ fn App() -> impl IntoView {
     let (theme, set_theme) = signal(stored_theme());
     // Fokusziel beim Chat-Wechsel: der Kontaktname im Chat-Kopf (SC 2.4.3).
     let chat_name_ref = NodeRef::<leptos::html::H2>::new();
+    // Der Verlauf-Container, für den Auto-Scroll ans Ende bei neuen
+    // Nachrichten und beim Öffnen eines Chats.
+    let log_ref = NodeRef::<leptos::html::Ul>::new();
+    // Epoche des Echtzeit-Kanals: erhöht sich bei Anmeldung, Registrierung
+    // und Abmeldung; eine laufende Kanal-Schleife endet, sobald ihre Epoche
+    // veraltet ist (siehe start_hint_channel).
+    let channel_epoch = StoredValue::new(0u64);
 
     // Die Ablage des aktiven Cores, für die synchronen Listen-Handler
     // (Auswahl, Neuer Chat) außerhalb der async-Abläufe.
@@ -780,8 +825,11 @@ fn App() -> impl IntoView {
             spawn_local(async move {
                 match onboard(storage, handle.clone(), password).await {
                     Ok(new_core) => {
+                        channel_epoch.update_value(|e| *e += 1);
                         start_hint_channel(
                             new_core.token.clone(),
+                            channel_epoch,
+                            channel_epoch.get_value(),
                             set_hints,
                             set_status,
                             set_notifications,
@@ -823,8 +871,11 @@ fn App() -> impl IntoView {
             spawn_local(async move {
                 match login(storage, password).await {
                     Ok(new_core) => {
+                        channel_epoch.update_value(|e| *e += 1);
                         start_hint_channel(
                             new_core.token.clone(),
+                            channel_epoch,
+                            channel_epoch.get_value(),
                             set_hints,
                             set_status,
                             set_notifications,
@@ -844,6 +895,44 @@ fn App() -> impl IntoView {
                 }
                 set_busy.set(false);
             });
+        }
+    };
+
+    // Abmelden: die Session beim Dienst best-effort widerrufen, den lebenden
+    // Zustand verwerfen und zur Anmeldemaske zurückkehren. Die Ablage
+    // (Identität, Sitzungen, Kontakte, Verläufe) bleibt, damit man sich mit
+    // dem Passwort wieder anmelden kann; nur die flüchtige Session endet.
+    let on_logout = {
+        let core = core.clone();
+        let boot_storage = boot_storage.clone();
+        move |_| {
+            // Die Kanal-Schleife veralten lassen (kein toter Kanal mit
+            // altem Token) und den Verbindungszustand zurücksetzen.
+            channel_epoch.update_value(|e| *e += 1);
+            set_connected.set(false);
+            if let Some(active) = core.borrow_mut().take() {
+                let handle = active.handle.clone();
+                let token = active.token.clone();
+                *boot_storage.borrow_mut() = Some(active.storage.clone());
+                // Best effort: das Token beim Dienst widerrufen. Ein Fehler
+                // hier ist unkritisch, lokal ist die Session schon beendet.
+                spawn_local(async move {
+                    let _ = IdentityClient::new(identity_url()).logout(&token).await;
+                });
+                set_boot.set(Boot::Known(handle));
+            }
+            set_logged_in.set(false);
+            set_selected.set(None);
+            set_messages.set(Vec::new());
+            set_chats.set(Vec::new());
+            set_new_chat_open.set(false);
+            set_safety_open.set(false);
+            set_safety_info.set(None);
+            set_kt_info.set(None);
+            set_notifications.set(Vec::new());
+            set_password_input.set(String::new());
+            set_text_input.set(String::new());
+            set_status.set("Abgemeldet.".to_string());
         }
     };
 
@@ -1110,6 +1199,20 @@ fn App() -> impl IntoView {
         }
     });
 
+    // Auto-Scroll ans Ende des Verlaufs: läuft neu bei jeder Änderung von
+    // `messages` (neue Nachricht, Chat gewechselt) und scrollt nach dem
+    // Render ganz nach unten, damit die neueste Nachricht sichtbar ist.
+    Effect::new(move |_| {
+        // Abhängigkeit anmelden, ohne den Wert zu brauchen.
+        let _ = messages.get();
+        let log_ref = log_ref;
+        request_animation_frame(move || {
+            if let Some(el) = log_ref.get_untracked() {
+                el.set_scroll_top(el.scroll_height());
+            }
+        });
+    });
+
     let on_kt_check = {
         let core = core.clone();
         move |_| {
@@ -1151,15 +1254,28 @@ fn App() -> impl IntoView {
         <div class="sm-app" class=("has-selection", move || selected.get().is_some())>
             <header class="sm-header" role="banner">
                 <h1>"SecureMessenger"</h1>
-                {move || {
-                    logged_in
-                        .get()
-                        .then(|| {
-                            view! {
-                                <span class="sm-identity">"Angemeldet als " <strong>{me}</strong></span>
-                            }
-                        })
-                }}
+                {
+                    let on_logout = on_logout.clone();
+                    move || {
+                        let on_logout = on_logout.clone();
+                        logged_in
+                            .get()
+                            .then(|| {
+                                view! {
+                                    <span class="sm-identity">
+                                        "Angemeldet als " <strong>{me}</strong>
+                                    </span>
+                                    <button
+                                        type="button"
+                                        class="sm-secondary sm-logout"
+                                        on:click=on_logout
+                                    >
+                                        "Abmelden"
+                                    </button>
+                                }
+                            })
+                    }
+                }
                 <div class="sm-theme-switch">
                     <label for="sm-theme-select">"Darstellung"</label>
                     <select
@@ -1449,6 +1565,7 @@ fn App() -> impl IntoView {
 
                                                 <ul
                                                     class="sm-log"
+                                                    node_ref=log_ref
                                                     role="log"
                                                     aria-label="Nachrichtenverlauf"
                                                     aria-live="polite"
@@ -1493,15 +1610,19 @@ fn App() -> impl IntoView {
 
                                                 <div class="sm-composer">
                                                     <div class="sm-field">
-                                                        <label for="sm-msg">"Nachricht (Enter sendet)"</label>
-                                                        <input
+                                                        <label for="sm-msg">
+                                                            "Nachricht (Enter sendet, Umschalt-Enter neue Zeile)"
+                                                        </label>
+                                                        <textarea
                                                             id="sm-msg"
+                                                            class="sm-composer-input"
+                                                            rows="1"
                                                             prop:value=text_input
                                                             on:input=move |ev| {
                                                                 set_text_input.set(event_target_value(&ev))
                                                             }
                                                             on:keydown=on_message_key.clone()
-                                                        />
+                                                        ></textarea>
                                                     </div>
                                                     <div class="sm-field">
                                                         <label for="sm-ttl">"Frist"</label>

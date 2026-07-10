@@ -553,6 +553,12 @@ button:disabled {
   flex: 1;
   display: grid;
   grid-template-columns: var(--sm-sidebar-width) 1fr;
+  /* Eine fensterfuellende Zeile mit minmax(0, 1fr): ohne die Zeilenangabe
+     waere die implizite Grid-Zeile inhaltshoch, der Thread bliebe so hoch
+     wie sein Inhalt, und der Verlauf (flex:1 mit overflow) kollabierte auf
+     eine Zeile statt innen zu scrollen. Das 0-Minimum erlaubt das
+     Schrumpfen unter die Inhaltshoehe, damit overflow-y ueberhaupt greift. */
+  grid-template-rows: minmax(0, 1fr);
   min-block-size: 0;
 }
 
@@ -781,6 +787,25 @@ button:disabled {
   min-inline-size: 8rem;
 }
 
+/* Mehrzeiliges Eingabefeld: startet einzeilig, waechst mit dem Inhalt
+   (field-sizing wird von aktuellen Browsern unterstuetzt und degradiert
+   sonst auf die per rows=1 gesetzte Hoehe plus Ziehgriff). Enter sendet,
+   Umschalt-Enter erzeugt eine neue Zeile. */
+.sm-composer-input {
+  min-block-size: 2.75rem;
+  max-block-size: 8rem;
+  resize: vertical;
+  field-sizing: content;
+  line-height: 1.4;
+}
+
+/* Abmelden-Knopf in der Kopfleiste: kompakter als die 44px-Zielgroesse
+   der Haupt-Aktionen, aber weiterhin gut treffbar. */
+.sm-logout {
+  min-block-size: 2.25rem;
+  padding-block: var(--sm-space-1);
+}
+
 /* Sicherheits-Badges und Verbindungsanzeige im Chat-Kopf: dreifach kodiert
    (Symbol + Wort + Farbe), nie Farbe allein. */
 .sm-badge {
@@ -864,6 +889,30 @@ button:disabled {
   }
   .sm-back {
     display: inline-flex;
+  }
+
+  /* Kompaktere Kopfleiste, damit sie auf einem Telefon nicht die halbe
+     Hoehe frisst (sie umbrach sonst auf mehrere Zeilen). */
+  .sm-header {
+    padding-block: var(--sm-space-2);
+    gap: var(--sm-space-2);
+  }
+  .sm-header h1 {
+    font-size: 1.05rem;
+  }
+  /* Das Wort "Darstellung" bleibt ueber das <label for> fuer Screenreader
+     erhalten, nimmt visuell aber keinen Platz mehr; das Auswahlfeld selbst
+     traegt die Bedeutung. Standard-Muster fuer visuell-verborgen. */
+  .sm-theme-switch label {
+    position: absolute;
+    inline-size: 1px;
+    block-size: 1px;
+    margin: -1px;
+    padding: 0;
+    border: 0;
+    clip-path: inset(50%);
+    overflow: hidden;
+    white-space: nowrap;
   }
 }
 
