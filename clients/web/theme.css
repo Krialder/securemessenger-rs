@@ -765,6 +765,19 @@ button:disabled {
   color: var(--sm-on-surface);
 }
 
+/* Sealed-Umschalter im Composer: beschriftete Checkbox in der
+   Werkzeugzeile. --sm-on-surface gegen den Flaechen-Grund ist ein im
+   Kontrast-Test verankertes Paar; die Checkbox selbst traegt den Zustand
+   (nicht nur Farbe, SC 1.4.1). */
+.sm-sealed-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sm-space-1);
+  font-size: 0.8rem;
+  color: var(--sm-on-surface);
+  align-self: center;
+}
+
 /* Melden-Aktion in der Empfangs-Blase: bewusst leise (Text-Knopf), damit
    sie den Verlauf nicht dominiert. Transparenter Hintergrund erbt die
    Blase, --sm-on-surface ist gegen beide Blasen im Kontrast-Test

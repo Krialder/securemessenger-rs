@@ -573,6 +573,11 @@ fn start_token_refresh(
 /// den Verzeichnis-Bündeln auf und merkt sich die Geräte des Kontakts in
 /// der Ablage (gleicher Fluss und gleiches Format wie im CLI).
 ///
+/// `sealed` versiegelt die Nachricht (Sealed Sender): der Absender steht
+/// nur mitverschlüsselt in der Hülle (Zertifikat), das Framing trägt kein
+/// from-Feld, und die Zustellung läuft absichtlich ohne Token, weil ein
+/// Bearer den Absender gegenüber dem Dienst identifizieren würde.
+///
 /// Nimmt das Token als Signal statt als Wert: zwischen Bündel-Abruf und
 /// Zustellung kann die Erneuerung rotieren, und der Dienst entwertet das
 /// alte Token dabei sofort. Jeder Request liest deshalb unmittelbar vorher
@@ -583,6 +588,7 @@ async fn send_message(
     peer: &str,
     text: &str,
     expires_at: Option<u64>,
+    sealed: bool,
 ) -> Result<(), String> {
     let contact_key = format!("contact/{peer}");
     let known: Vec<ContactDevice> = match core
@@ -636,19 +642,37 @@ async fn send_message(
     // als Tag an der Hülle. Dieselben Werte für alle Zielgeräte.
     let franked = client_app::franking::frank(text.as_bytes());
     let franking_tag = BASE64.encode(&franked.commitment);
+    // Für versiegelten Versand einmal das Absender-Zertifikat besorgen
+    // (gecacht in der Ablage, siehe sender_certificate_cached).
+    let certificate = if sealed {
+        Some(sender_certificate_cached(token, &core.storage).await?)
+    } else {
+        None
+    };
     let mut envelopes = Vec::new();
     for target in &devices {
         let address = ProtocolAddress::new(
             peer.to_string(),
             device_id_from_u32(target.protocol_device_id).map_err(|e| e.to_string())?,
         );
-        let message = core
-            .device
-            .encrypt(&address, &franked.payload)
-            .await
-            .map_err(|e| format!("Verschlüsselung: {e}"))?;
-        let envelope =
-            wire::seal(&core.handle, PROTOCOL_DEVICE_ID, &message).map_err(|e| e.to_string())?;
+        let envelope = match &certificate {
+            Some(certificate) => {
+                let blob = core
+                    .device
+                    .seal_message(&address, certificate, &franked.payload)
+                    .await
+                    .map_err(|e| format!("Versiegeln: {e}"))?;
+                wire::seal_sealed(&blob).map_err(|e| e.to_string())?
+            }
+            None => {
+                let message = core
+                    .device
+                    .encrypt(&address, &franked.payload)
+                    .await
+                    .map_err(|e| format!("Verschlüsselung: {e}"))?;
+                wire::seal(&core.handle, PROTOCOL_DEVICE_ID, &message).map_err(|e| e.to_string())?
+            }
+        };
         envelopes.push(OutgoingEnvelope {
             id: new_uuid(),
             recipient: peer.to_string(),
@@ -658,11 +682,123 @@ async fn send_message(
             expires_at,
         });
     }
-    DeliveryClient::new(delivery_url())
-        .submit(&token.get_untracked(), &envelopes)
-        .await
-        .map_err(|e| e.to_string())?;
+    let delivery = DeliveryClient::new(delivery_url());
+    if sealed {
+        delivery
+            .submit_sealed(&envelopes)
+            .await
+            .map_err(|e| e.to_string())?;
+    } else {
+        delivery
+            .submit(&token.get_untracked(), &envelopes)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
+}
+
+/// Der Trust Root zum Entsiegeln, gepinnt in der Ablage
+/// (`sealed/trust_root`): der erste Abruf vertraut dem identity-Dienst
+/// (Trust-on-first-use wie beim KT-Schlüssel und im CLI), danach liegt der
+/// Anker lokal fest. Ein später ausgetauschter Root fällt auf, weil jedes
+/// Entsiegeln scheitert.
+async fn sealed_trust_root_cached(storage: &SharedStorage) -> Result<Vec<u8>, String> {
+    const KEY: &str = "sealed/trust_root";
+    if let Some(root) = storage.borrow().get(KEY).map_err(|e| e.to_string())? {
+        return Ok(root);
+    }
+    let root = IdentityClient::new(identity_url())
+        .sealed_sender_trust_root()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("der identity-Dienst stellt keine Sealed-Sender-Zertifikate aus")?;
+    storage
+        .borrow_mut()
+        .put(KEY, &root)
+        .map_err(|e| e.to_string())?;
+    Ok(root)
+}
+
+/// Das Sealed-Sender-Zertifikat des eigenen Geräts, gecacht in der Ablage
+/// (`sealed/certificate`): erst wenn es fehlt oder in unter fünf Minuten
+/// abläuft, stellt der identity-Dienst ein frisches aus (wie im CLI; das
+/// Zertifikat gilt 24 h, ein Abruf je Nachricht wäre Verschwendung).
+async fn sender_certificate_cached(
+    token: ReadSignal<String>,
+    storage: &SharedStorage,
+) -> Result<Vec<u8>, String> {
+    const KEY: &str = "sealed/certificate";
+    let cached = storage.borrow().get(KEY).map_err(|e| e.to_string())?;
+    if let Some(bytes) = cached {
+        if let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            let fresh_until = (now_unix() + 300) * 1000;
+            if record["expires_at_millis"].as_u64().unwrap_or(0) > fresh_until {
+                if let Some(cert) = record["certificate"]
+                    .as_str()
+                    .and_then(|b64| BASE64.decode(b64).ok())
+                {
+                    return Ok(cert);
+                }
+            }
+        }
+    }
+    let issued = IdentityClient::new(identity_url())
+        .sender_certificate(&token.get_untracked(), PROTOCOL_DEVICE_ID)
+        .await
+        .map_err(|e| format!("Absender-Zertifikat: {e}"))?;
+    let record = serde_json::json!({
+        "certificate": BASE64.encode(&issued.certificate),
+        "expires_at_millis": issued.expires_at_millis,
+    });
+    storage
+        .borrow_mut()
+        .put(
+            KEY,
+            &serde_json::to_vec(&record).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(issued.certificate)
+}
+
+/// Entrahmt einen entschlüsselten Payload (K_f vorangestellt, Message
+/// Franking), legt das Melde-Material ab (`franking/<id>`, Format wie im
+/// CLI) und liefert (Klartext, Melde-ID). Ältere, ungefrankte Nachrichten
+/// fallen auf die rohe Anzeige zurück, ohne Melde-ID; schlägt das Ablegen
+/// fehl, bleibt die Nachricht lesbar, nur das Melden fällt für sie aus.
+fn open_payload(
+    storage: &SharedStorage,
+    message_id: &str,
+    payload: &[u8],
+) -> (String, Option<String>) {
+    match client_app::franking::unfrank(payload) {
+        Ok(opened) => {
+            let record = serde_json::json!({
+                "key": BASE64.encode(&opened.franking_key),
+                "message": BASE64.encode(&opened.message),
+            });
+            let stored = serde_json::to_vec(&record)
+                .map_err(|e| e.to_string())
+                .and_then(|json| {
+                    storage
+                        .borrow_mut()
+                        .put(&format!("franking/{message_id}"), &json)
+                });
+            let report_id = match stored {
+                Ok(()) => Some(message_id.to_string()),
+                Err(error) => {
+                    leptos::logging::warn!(
+                        "Franking-Material zu {message_id} nicht abgelegt: {error}"
+                    );
+                    None
+                }
+            };
+            (
+                String::from_utf8_lossy(&opened.message).to_string(),
+                report_id,
+            )
+        }
+        Err(_) => (String::from_utf8_lossy(payload).to_string(), None),
+    }
 }
 
 /// Holt wartende Hüllen ab, entschlüsselt und bestätigt sie; liefert
@@ -682,6 +818,34 @@ async fn fetch_messages(
     let mut received = Vec::new();
     let mut acked = Vec::new();
     for message in &waiting {
+        // Sealed-Sender-Hüllen zuerst: sie tragen keinen Absender im
+        // Framing, der kommt erst aus der geprüften Zertifikatskette
+        // (wire::classify unterscheidet die Framings eindeutig).
+        if matches!(wire::classify(&message.envelope), wire::Framed::Sealed) {
+            let blob = match wire::open_sealed(&message.envelope) {
+                Ok(blob) => blob,
+                Err(error) => {
+                    leptos::logging::warn!("Hülle {} übersprungen: {error}", message.id);
+                    continue;
+                }
+            };
+            let trust_root = sealed_trust_root_cached(&core.storage).await?;
+            match core.device.unseal_message(&trust_root, &blob).await {
+                Ok(unsealed) => {
+                    let (text, report_id) =
+                        open_payload(&core.storage, &message.id, &unsealed.plaintext);
+                    received.push((unsealed.sender.clone(), text, report_id));
+                    acked.push(message.id.clone());
+                }
+                Err(error) => {
+                    leptos::logging::warn!("Hülle {} nicht entsiegelbar: {error}", message.id);
+                    // Bestätigen wie unten: ein erneuter Abruf scheitert am
+                    // selben Fehler, die Hülle bliebe für immer liegen.
+                    acked.push(message.id.clone());
+                }
+            }
+            continue;
+        }
         let opened = match wire::open(&message.envelope) {
             Ok(opened) => opened,
             Err(error) => {
@@ -696,44 +860,7 @@ async fn fetch_messages(
         );
         match core.device.decrypt(&address, &opened.message).await {
             Ok(payload) => {
-                // Payload ist gefrankt (K_f vorangestellt); entrahmen, sonst
-                // roh anzeigen (ältere, ungefrankte Nachrichten).
-                let (text, report_id) = match client_app::franking::unfrank(&payload) {
-                    Ok(opened_msg) => {
-                        // Franking-Material fürs spätere Melden ablegen
-                        // (dasselbe Format wie im CLI): ohne K_f und
-                        // Klartext lässt sich das Commitment beim Dienst
-                        // nicht öffnen, ein Melden wäre unmöglich.
-                        let record = serde_json::json!({
-                            "key": BASE64.encode(&opened_msg.franking_key),
-                            "message": BASE64.encode(&opened_msg.message),
-                        });
-                        let stored = serde_json::to_vec(&record)
-                            .map_err(|e| e.to_string())
-                            .and_then(|json| {
-                                core.storage
-                                    .borrow_mut()
-                                    .put(&format!("franking/{}", message.id), &json)
-                            });
-                        let report_id = match stored {
-                            Ok(()) => Some(message.id.clone()),
-                            // Ablage voll oder kaputt: Nachricht trotzdem
-                            // zeigen, nur das Melden fällt für sie aus.
-                            Err(error) => {
-                                leptos::logging::warn!(
-                                    "Franking-Material zu {} nicht abgelegt: {error}",
-                                    message.id
-                                );
-                                None
-                            }
-                        };
-                        (
-                            String::from_utf8_lossy(&opened_msg.message).to_string(),
-                            report_id,
-                        )
-                    }
-                    Err(_) => (String::from_utf8_lossy(&payload).to_string(), None),
-                };
+                let (text, report_id) = open_payload(&core.storage, &message.id, &payload);
                 received.push((opened.from.clone(), text, report_id));
                 acked.push(message.id.clone());
             }
@@ -1035,6 +1162,11 @@ fn App() -> impl IntoView {
     let (messages, set_messages) = signal(Vec::<StoredLine>::new());
     // Frist-Auswahl des Composers in Sekunden (0 = aus); setzt expires_at.
     let (ttl_choice, set_ttl_choice) = signal(0u64);
+    // Versiegelt senden (Sealed Sender): der Dienst sieht den Absender
+    // nicht mehr im Klartext. Bewusst eine Wahl je Sitzung, kein Zwang:
+    // der Empfang braucht eine bestehende Sitzung, Erstkontakt bleibt
+    // deshalb unversiegelt sinnvoll.
+    let (sealed_choice, set_sealed_choice) = signal(false);
     // "Neuer Chat": ob das Handle-Feld offen ist und sein Inhalt.
     let (new_chat_open, set_new_chat_open) = signal(false);
     let (new_chat_input, set_new_chat_input) = signal(String::new());
@@ -1317,6 +1449,7 @@ fn App() -> impl IntoView {
             }
             let ttl = ttl_choice.get_untracked();
             let expires_at = (ttl > 0).then(|| now_unix() + ttl);
+            let sealed = sealed_choice.get_untracked();
             set_busy.set(true);
             set_status.set("Wird gesendet ...".to_string());
             let core = core.clone();
@@ -1330,8 +1463,15 @@ fn App() -> impl IntoView {
                     Some(mut active) => {
                         let storage = active.storage.clone();
                         let who = active.handle.clone();
-                        let result =
-                            send_message(&mut active, access_token, &peer, &text, expires_at).await;
+                        let result = send_message(
+                            &mut active,
+                            access_token,
+                            &peer,
+                            &text,
+                            expires_at,
+                            sealed,
+                        )
+                        .await;
                         *core.borrow_mut() = Some(active);
                         match result {
                             Ok(()) => {
@@ -2252,6 +2392,17 @@ fn App() -> impl IntoView {
                                                             <option value="604800">"1 Woche"</option>
                                                         </select>
                                                     </div>
+                                                    <label class="sm-sealed-toggle">
+                                                        <input
+                                                            type="checkbox"
+                                                            prop:checked=sealed_choice
+                                                            on:change=move |ev| {
+                                                                set_sealed_choice
+                                                                    .set(event_target_checked(&ev));
+                                                            }
+                                                        />
+                                                        "Versiegelt (Server sieht den Absender nicht)"
+                                                    </label>
                                                     <button
                                                         type="button"
                                                         class="sm-primary"
