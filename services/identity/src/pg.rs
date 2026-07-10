@@ -85,6 +85,7 @@ fn row_to_device(row: &sqlx::postgres::PgRow) -> Device {
     let credential_blob: Vec<u8> = row.get("credential_blob");
     let not_after: i64 = row.get("not_after");
     let revoked: bool = row.get("revoked");
+    let protocol_device_id: i16 = row.get("protocol_device_id");
     Device {
         id: id.to_string(),
         name: row.get("name"),
@@ -95,6 +96,8 @@ fn row_to_device(row: &sqlx::postgres::PgRow) -> Device {
         // Vergangenheit statt in der fernen Zukunft.
         not_after: u64::try_from(not_after).unwrap_or(0),
         revoked,
+        // SMALLINT ist i16; die Vergabe hält 1..255, also passt es in u16.
+        protocol_device_id: u16::try_from(protocol_device_id).unwrap_or(0),
     }
 }
 
@@ -123,9 +126,11 @@ impl AccountStore for PgAccountStore {
         .execute(&mut *tx)
         .await
         .map_err(map_conflict)?;
+        // Das erste Gerät ist Nummer 1 (kein anderes existiert).
         sqlx::query(
-            "INSERT INTO devices (id, account_id, name, identity_key, credential_blob, not_after) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO devices \
+                 (id, account_id, name, identity_key, credential_blob, not_after, protocol_device_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, 1)",
         )
         .bind(device_id)
         .bind(account_id)
@@ -161,35 +166,61 @@ impl AccountStore for PgAccountStore {
         }))
     }
 
-    async fn add_device(&self, handle: &str, device: Device) -> Result<(), StoreError> {
+    async fn add_device(&self, handle: &str, device: Device) -> Result<u16, StoreError> {
         let device_key = decode_checked(&device.public_key, "Geräteschlüssel")?;
         let credential = decode_checked(&device.credential, "Credential")?;
         let device_id = parse_device_id(&device.id)?;
-        // INSERT über SELECT: ein Statement löst Konto-Lookup und Einfügen,
-        // rows_affected 0 heißt Konto weg (AccountMissing).
-        let result = sqlx::query(
-            "INSERT INTO devices (id, account_id, name, identity_key, credential_blob, not_after) \
-             SELECT $1, a.id, $3, $4, $5, $6 FROM accounts a WHERE a.handle = $2",
+        // Transaktion mit Zeilensperre auf dem Konto: die Nummernvergabe
+        // (max + 1) und das Einfügen dürfen sich mit einem parallelen
+        // add_device desselben Kontos nicht überschneiden, sonst bekämen
+        // zwei Geräte dieselbe Nummer.
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let account_row = sqlx::query("SELECT id FROM accounts WHERE handle = $1 FOR UPDATE")
+            .bind(handle)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(backend)?;
+        let Some(account_row) = account_row else {
+            return Err(StoreError::AccountMissing);
+        };
+        let account_id: Uuid = account_row.get("id");
+        // Max über ALLE Geräte des Kontos, auch revozierte: ihre Nummern
+        // bleiben gesperrt (revozieren gibt die Nummer nicht frei).
+        let next_row = sqlx::query(
+            "SELECT COALESCE(MAX(protocol_device_id), 0) + 1 AS next \
+             FROM devices WHERE account_id = $1",
+        )
+        .bind(account_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(backend)?;
+        let next: i32 = next_row.get("next");
+        if next > i32::from(crate::domain::MAX_PROTOCOL_DEVICE_ID) {
+            return Err(StoreError::TooManyDevices);
+        }
+        sqlx::query(
+            "INSERT INTO devices \
+                 (id, account_id, name, identity_key, credential_blob, not_after, protocol_device_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(device_id)
-        .bind(handle)
+        .bind(account_id)
         .bind(&device.name)
         .bind(&device_key)
         .bind(&credential)
         .bind(device.not_after as i64)
-        .execute(&self.pool)
+        .bind(next as i16)
+        .execute(&mut *tx)
         .await
         .map_err(map_conflict)?;
-        if result.rows_affected() == 0 {
-            return Err(StoreError::AccountMissing);
-        }
-        Ok(())
+        tx.commit().await.map_err(backend)?;
+        Ok(next as u16)
     }
 
     async fn devices(&self, handle: &str) -> Result<Vec<Device>, StoreError> {
         let rows = sqlx::query(
             "SELECT d.id, d.name, d.identity_key, d.credential_blob, d.not_after, \
-                    (d.revoked_at IS NOT NULL) AS revoked \
+                    d.protocol_device_id, (d.revoked_at IS NOT NULL) AS revoked \
              FROM devices d JOIN accounts a ON a.id = d.account_id \
              WHERE a.handle = $1 ORDER BY d.added_at",
         )
@@ -212,7 +243,7 @@ impl AccountStore for PgAccountStore {
         };
         let row = sqlx::query(
             "SELECT d.id, d.name, d.identity_key, d.credential_blob, d.not_after, \
-                    (d.revoked_at IS NOT NULL) AS revoked \
+                    d.protocol_device_id, (d.revoked_at IS NOT NULL) AS revoked \
              FROM devices d JOIN accounts a ON a.id = d.account_id \
              WHERE a.handle = $1 AND d.id = $2",
         )

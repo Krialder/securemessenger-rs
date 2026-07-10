@@ -365,6 +365,18 @@ struct AccountResponse {
     /// Bestätigt die registrierte Geräte-ID; bei einem Mehr-Feld-POST soll
     /// der Client sehen, was der Server wirklich angelegt hat.
     device_id: String,
+    /// Die vom Server vergebene libsignal-Gerätenummer des ersten Geräts
+    /// (immer 1); der Client übernimmt sie als seinen ProtocolAddress-Teil.
+    protocol_device_id: u16,
+}
+
+/// Antwort auf `POST /devices`: bestätigt die Geräte-ID und nennt die
+/// vergebene Gerätenummer, die der Client als seinen ProtocolAddress-Teil
+/// braucht (er kann sie nicht selbst wählen, der Server hält sie eindeutig).
+#[derive(Serialize)]
+struct AddDeviceResponse {
+    device_id: String,
+    protocol_device_id: u16,
 }
 
 #[derive(Serialize)]
@@ -373,6 +385,9 @@ struct DeviceResponse {
     name: String,
     public_key: String,
     not_after: u64,
+    /// Die libsignal-Gerätenummer (ProtocolAddress-Teil), damit ein Client
+    /// nach Verlust des lokalen Zustands seine eigene Nummer wiederfindet.
+    protocol_device_id: u16,
 }
 
 #[derive(Deserialize)]
@@ -695,6 +710,8 @@ async fn register(State(st): State<AppState>, Json(req): Json<RegisterRequest>) 
         handle: req.handle.clone(),
         display_name: display_name.clone(),
         device_id: req.device.id.clone(),
+        // Das erste Gerät ist immer Nummer 1 (die Ablage vergibt sie so).
+        protocol_device_id: 1,
     };
     let account = Account {
         id: uuid::Uuid::new_v4().to_string(),
@@ -746,6 +763,9 @@ fn device_from_request(req: DeviceRequest) -> Device {
         credential: req.credential,
         not_after: req.not_after,
         revoked: false,
+        // 0 = noch nicht vergeben; die Ablage setzt die Nummer (1 beim
+        // ersten Gerät, sonst max + 1).
+        protocol_device_id: 0,
     }
 }
 
@@ -948,6 +968,7 @@ async fn list_devices(State(st): State<AppState>, headers: HeaderMap) -> Respons
             name: d.name,
             public_key: d.public_key,
             not_after: d.not_after,
+            protocol_device_id: d.protocol_device_id,
         })
         .collect();
     (StatusCode::OK, Json(devices)).into_response()
@@ -990,20 +1011,33 @@ async fn add_device(
     ) {
         return credential_error_response(error);
     }
+    let device_id = req.id.clone();
     match st
         .store
         .add_device(&who.handle, device_from_request(req))
         .await
     {
-        Ok(()) => {
+        Ok(protocol_device_id) => {
             // Gerät dazu = neue Schlüsselmenge im Verzeichnis.
             notify_kt(&st, &who.handle);
-            StatusCode::CREATED.into_response()
+            (
+                StatusCode::CREATED,
+                Json(AddDeviceResponse {
+                    device_id,
+                    protocol_device_id,
+                }),
+            )
+                .into_response()
         }
         Err(StoreError::DeviceIdTaken) => api_error(
             StatusCode::CONFLICT,
             "device_id_taken",
             "Geräte-ID ist bereits vergeben",
+        ),
+        Err(StoreError::TooManyDevices) => api_error(
+            StatusCode::CONFLICT,
+            "too_many_devices",
+            "Das Konto hat die Hoechstzahl an Geraeten erreicht",
         ),
         Err(error) => store_failure(error),
     }

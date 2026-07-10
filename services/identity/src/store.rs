@@ -45,6 +45,10 @@ pub enum StoreError {
     AccountMissing,
     /// Gerät nicht gefunden oder bereits revoziert.
     DeviceNotFound,
+    /// Das Konto hat die Höchstzahl an Geräten erreicht (Nummernraum 1..255
+    /// erschöpft, auch durch revozierte Geräte, deren Nummern nicht
+    /// wiederverwendet werden).
+    TooManyDevices,
     /// Ablage nicht erreichbar oder Abfrage fehlgeschlagen. Der Text ist
     /// für Logs, nie für API-Antworten.
     Backend(String),
@@ -55,12 +59,16 @@ pub enum StoreError {
 #[async_trait]
 pub trait AccountStore: Send + Sync {
     /// Legt ein Konto samt erstem Gerät an. Atomar: entweder entstehen
-    /// beide oder keines.
+    /// beide oder keines. Das erste Gerät bekommt die Protokollnummer 1; die
+    /// Ablage setzt sie, der übergebene Wert im Gerät wird ignoriert.
     async fn create(&self, account: Account, first_device: Device) -> Result<(), StoreError>;
     /// Liest ein Konto anhand des Handles, falls vorhanden.
     async fn get(&self, handle: &str) -> Result<Option<Account>, StoreError>;
-    /// Fügt einem Konto ein weiteres Gerät hinzu.
-    async fn add_device(&self, handle: &str, device: Device) -> Result<(), StoreError>;
+    /// Fügt einem Konto ein weiteres Gerät hinzu und vergibt ihm die
+    /// nächste freie Protokollnummer (max der vorhandenen, auch revozierter,
+    /// plus 1). Liefert die vergebene Nummer zurück, damit der Client sie
+    /// als seinen ProtocolAddress-Teil übernehmen kann.
+    async fn add_device(&self, handle: &str, device: Device) -> Result<u16, StoreError>;
     /// Alle Geräte des Kontos, auch revozierte; das Flag steht im Gerät.
     /// Leer, wenn das Konto nicht existiert (über die API nicht erreichbar).
     async fn devices(&self, handle: &str) -> Result<Vec<Device>, StoreError>;
@@ -124,6 +132,9 @@ impl AccountStore for InMemoryStore {
             Entry::Occupied(_) => Err(StoreError::HandleTaken),
             Entry::Vacant(slot) => {
                 let device_id = first_device.id.clone();
+                // Das erste Gerät ist definitionsgemäß Nummer 1.
+                let mut first_device = first_device;
+                first_device.protocol_device_id = 1;
                 slot.insert(Record {
                     account,
                     devices: vec![first_device],
@@ -144,7 +155,7 @@ impl AccountStore for InMemoryStore {
             .map(|r| r.account.clone()))
     }
 
-    async fn add_device(&self, handle: &str, device: Device) -> Result<(), StoreError> {
+    async fn add_device(&self, handle: &str, device: Device) -> Result<u16, StoreError> {
         let mut inner = self.inner.write().expect("Store-Lock nicht vergiftet");
         if inner.device_ids.contains(&device.id) {
             return Err(StoreError::DeviceIdTaken);
@@ -153,10 +164,24 @@ impl AccountStore for InMemoryStore {
             .records
             .get_mut(handle)
             .ok_or(StoreError::AccountMissing)?;
+        // Nächste Nummer: max der vorhandenen (auch revozierter) plus 1.
+        // Revozierte zählen mit, damit eine Nummer nie wiederkehrt.
+        let next = record
+            .devices
+            .iter()
+            .map(|d| d.protocol_device_id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        if next > crate::domain::MAX_PROTOCOL_DEVICE_ID {
+            return Err(StoreError::TooManyDevices);
+        }
         let device_id = device.id.clone();
+        let mut device = device;
+        device.protocol_device_id = next;
         record.devices.push(device);
         inner.device_ids.insert(device_id);
-        Ok(())
+        Ok(next)
     }
 
     async fn devices(&self, handle: &str) -> Result<Vec<Device>, StoreError> {
@@ -245,6 +270,7 @@ mod tests {
             credential: "sig".into(),
             not_after: i64::MAX as u64,
             revoked: false,
+            protocol_device_id: 0,
         }
     }
 
@@ -307,6 +333,22 @@ mod tests {
             store.revoke_device("alice", "d2").await,
             Err(StoreError::DeviceNotFound)
         );
+    }
+
+    #[tokio::test]
+    async fn protocol_device_ids_are_assigned_monotonically() {
+        let store = InMemoryStore::default();
+        store.create(account("alice"), device("d1")).await.unwrap();
+        // Erstes Gerät ist Nummer 1, unabhängig vom übergebenen Platzhalter.
+        assert_eq!(
+            store.devices("alice").await.unwrap()[0].protocol_device_id,
+            1
+        );
+        assert_eq!(store.add_device("alice", device("d2")).await, Ok(2));
+        assert_eq!(store.add_device("alice", device("d3")).await, Ok(3));
+        // Revozieren gibt die Nummer NICHT frei: das nächste Gerät ist 4.
+        store.revoke_device("alice", "d3").await.unwrap();
+        assert_eq!(store.add_device("alice", device("d4")).await, Ok(4));
     }
 
     #[tokio::test]

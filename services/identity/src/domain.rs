@@ -61,4 +61,18 @@ pub struct Device {
     /// Revoziert = aus der gültigen Menge entfernt. Eintrag bleibt wegen
     /// der ID-Sperre erhalten.
     pub revoked: bool,
+    /// Kleine, kontoweit eindeutige libsignal-Gerätenummer (1..255), vom
+    /// Server bei der Anlage vergeben. Sie ist der Geräteteil der
+    /// ProtocolAddress: zwei Geräte eines Kontos brauchen verschiedene
+    /// Nummern, damit ein Absender getrennte Sitzungen zu ihnen hält. Der
+    /// Server vergibt sie monoton (max + 1, revozierte Nummern werden nicht
+    /// wiederverwendet), weil eine wiederbenutzte Nummer eine gecachte
+    /// Sitzung zum alten Gerät stillschweigend auf das neue umleiten würde.
+    /// `0` ist der Platzhalter vor der Vergabe (die Ablage setzt den Wert).
+    pub protocol_device_id: u16,
 }
+
+/// Obergrenze der Gerätenummer: die libsignal-`DeviceId` und die
+/// Bündel-Blobs führen sie als ein Byte (client-app `device_id_from_u32`),
+/// mehr als 255 Geräte je Konto sind ohnehin absurd.
+pub const MAX_PROTOCOL_DEVICE_ID: u16 = 255;

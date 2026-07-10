@@ -59,6 +59,7 @@ fn device(seed: u8) -> Device {
         credential: b64(seed.wrapping_add(1)),
         not_after: i64::MAX as u64,
         revoked: false,
+        protocol_device_id: 0,
     }
 }
 
@@ -106,7 +107,11 @@ async fn device_lifecycle() {
     store.create(account(&handle), first.clone()).await.unwrap();
 
     let second = device(21);
-    store.add_device(&handle, second.clone()).await.unwrap();
+    // Server vergibt die Protokollnummer: erstes Gerät 1, zweites 2.
+    assert_eq!(store.add_device(&handle, second.clone()).await, Ok(2));
+    let after_add = store.devices(&handle).await.unwrap();
+    assert_eq!(after_add[0].protocol_device_id, 1);
+    assert_eq!(after_add[1].protocol_device_id, 2);
 
     // Unbekanntes Konto ist ein eigener Fehler, kein stiller Erfolg.
     let err = store
