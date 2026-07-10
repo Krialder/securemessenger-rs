@@ -142,6 +142,81 @@ const PAIRS: &[Pair] = &[
         min: 4.5,
         reason: "Benachrichtigungstext",
     },
+    // Konversationsliste und Auswahl (Text, SC 1.4.3, 4.5:1).
+    Pair {
+        fg: "on-selected",
+        bg: "selected",
+        min: 4.5,
+        reason: "Name auf ausgewählter Zeile",
+    },
+    Pair {
+        fg: "on-selected-muted",
+        bg: "selected",
+        min: 4.5,
+        reason: "Auszug/Zeit auf ausgewählter Zeile",
+    },
+    Pair {
+        fg: "on-unread-badge",
+        bg: "unread-badge",
+        min: 4.5,
+        reason: "Zahl in der Ungelesen-Pille",
+    },
+    // Sicherheits-Badges im Chat-Kopf (Text auf der Kopfleiste).
+    Pair {
+        fg: "verified",
+        bg: "surface-container",
+        min: 4.5,
+        reason: "Status verglichen",
+    },
+    Pair {
+        fg: "unverified",
+        bg: "surface-container",
+        min: 4.5,
+        reason: "Status nicht verglichen",
+    },
+    Pair {
+        fg: "ttl",
+        bg: "surface-container",
+        min: 4.5,
+        reason: "Frist-Anzeige",
+    },
+    // Avatar-Initialen auf den sechs Palettenfarben (Text, 4.5:1).
+    Pair {
+        fg: "avatar-1",
+        bg: "avatar-on",
+        min: 4.5,
+        reason: "Avatar-Initiale 1",
+    },
+    Pair {
+        fg: "avatar-2",
+        bg: "avatar-on",
+        min: 4.5,
+        reason: "Avatar-Initiale 2",
+    },
+    Pair {
+        fg: "avatar-3",
+        bg: "avatar-on",
+        min: 4.5,
+        reason: "Avatar-Initiale 3",
+    },
+    Pair {
+        fg: "avatar-4",
+        bg: "avatar-on",
+        min: 4.5,
+        reason: "Avatar-Initiale 4",
+    },
+    Pair {
+        fg: "avatar-5",
+        bg: "avatar-on",
+        min: 4.5,
+        reason: "Avatar-Initiale 5",
+    },
+    Pair {
+        fg: "avatar-6",
+        bg: "avatar-on",
+        min: 4.5,
+        reason: "Avatar-Initiale 6",
+    },
     // Nicht-Text (SC 1.4.11, 3:1).
     Pair {
         fg: "border",
@@ -154,6 +229,31 @@ const PAIRS: &[Pair] = &[
         bg: "surface",
         min: 3.0,
         reason: "Fokusring",
+    },
+    Pair {
+        fg: "sealed",
+        bg: "surface-container",
+        min: 3.0,
+        reason: "Sealed-Symbol (dekorativ)",
+    },
+    // Ungelesen-Pille als Grafik gegen alle drei Zeilenzustände (3:1).
+    Pair {
+        fg: "unread-badge",
+        bg: "surface-container",
+        min: 3.0,
+        reason: "Pille auf normaler Zeile",
+    },
+    Pair {
+        fg: "unread-badge",
+        bg: "list-hover",
+        min: 3.0,
+        reason: "Pille auf Hover-Zeile",
+    },
+    Pair {
+        fg: "unread-badge",
+        bg: "selected",
+        min: 3.0,
+        reason: "Pille auf ausgewählter Zeile",
     },
 ];
 

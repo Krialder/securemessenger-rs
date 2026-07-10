@@ -35,6 +35,9 @@
   --sm-radius: 0.5rem;
   --sm-radius-lg: 0.875rem;
 
+  /* Feste Breite der Seitenleiste im Zweispalter (modusunabhaengig). */
+  --sm-sidebar-width: 20rem;
+
   /* Bewegung: kurz und funktional; die Media-Query unten schaltet sie ab. */
   --sm-motion-fast: 150ms;
   --sm-motion-base: 250ms;
@@ -57,6 +60,31 @@
   --sm-bubble-out: #d6e6fa;
   --sm-notify-surface: #fff6e0;
   --sm-notify-on: #5a4300;
+  /* Liste, Auswahl, Ungelesen, Sicherheits-Badges (Hell). */
+  --sm-selected: #d6e6fa;
+  --sm-on-selected: #1b1b1f;
+  --sm-on-selected-muted: #4a4a52;
+  --sm-list-hover: #eeeff2;
+  --sm-unread-badge: #0067be;
+  --sm-on-unread-badge: #ffffff;
+  --sm-verified: #1a7f37;
+  --sm-unverified: #5b5b63;
+  --sm-sealed: #5b5b63;
+  --sm-ttl: #5a4300;
+  /* Avatar-Palette: modusunabhaengig, jede Farbe >= 4.5:1 gegen weisse
+     Initialen (--sm-avatar-on). avatar-on ist bewusst in allen Modi weiss:
+     eine je Modus wechselnde Textfarbe zwaenge die Palette in ein winziges
+     Luminanz-Band (gegen Weiss UND Schwarz gleichzeitig >= 4.5:1), was nur
+     muddy Mitteltoene zuliesse. Weisse Initialen auf gesaettigten dunklen
+     Kreisen sind lesbarer und in jedem Modus gleich. Der Kreis selbst ist
+     dekorativ (aria-hidden), der Name steht als Text daneben. */
+  --sm-avatar-on: #ffffff;
+  --sm-avatar-1: #1a56b0;
+  --sm-avatar-2: #8a5a00;
+  --sm-avatar-3: #0f6f52;
+  --sm-avatar-4: #9a3b12;
+  --sm-avatar-5: #6a3fb0;
+  --sm-avatar-6: #a01f6e;
 }
 
 /* System-Automatik: ohne ausdrueckliche Wahl (oder bei "System") der
@@ -82,6 +110,23 @@
     --sm-bubble-out: #123a5e;
     --sm-notify-surface: #2a2410;
     --sm-notify-on: #e0b24d;
+    --sm-selected: #123a5e;
+    --sm-on-selected: #e6e6e6;
+    --sm-on-selected-muted: #b4b4b4;
+    --sm-list-hover: #282828;
+    --sm-unread-badge: #4da3ff;
+    --sm-on-unread-badge: #0a0a0a;
+    --sm-verified: #5dd48a;
+    --sm-unverified: #a0a0a0;
+    --sm-sealed: #a0a0a0;
+    --sm-ttl: #e0b24d;
+    --sm-avatar-on: #ffffff;
+    --sm-avatar-1: #1a56b0;
+    --sm-avatar-2: #8a5a00;
+    --sm-avatar-3: #0f6f52;
+    --sm-avatar-4: #9a3b12;
+    --sm-avatar-5: #6a3fb0;
+    --sm-avatar-6: #a01f6e;
   }
 }
 
@@ -103,6 +148,23 @@
   --sm-bubble-out: #d6e6fa;
   --sm-notify-surface: #fff6e0;
   --sm-notify-on: #5a4300;
+  --sm-selected: #d6e6fa;
+  --sm-on-selected: #1b1b1f;
+  --sm-on-selected-muted: #4a4a52;
+  --sm-list-hover: #eeeff2;
+  --sm-unread-badge: #0067be;
+  --sm-on-unread-badge: #ffffff;
+  --sm-verified: #1a7f37;
+  --sm-unverified: #5b5b63;
+  --sm-sealed: #5b5b63;
+  --sm-ttl: #5a4300;
+  --sm-avatar-on: #ffffff;
+  --sm-avatar-1: #1a56b0;
+  --sm-avatar-2: #8a5a00;
+  --sm-avatar-3: #0f6f52;
+  --sm-avatar-4: #9a3b12;
+  --sm-avatar-5: #6a3fb0;
+  --sm-avatar-6: #a01f6e;
 }
 
 :root[data-theme="dunkel"] {
@@ -123,6 +185,23 @@
   --sm-bubble-out: #123a5e;
   --sm-notify-surface: #2a2410;
   --sm-notify-on: #e0b24d;
+  --sm-selected: #123a5e;
+  --sm-on-selected: #e6e6e6;
+  --sm-on-selected-muted: #b4b4b4;
+  --sm-list-hover: #282828;
+  --sm-unread-badge: #4da3ff;
+  --sm-on-unread-badge: #0a0a0a;
+  --sm-verified: #5dd48a;
+  --sm-unverified: #a0a0a0;
+  --sm-sealed: #a0a0a0;
+  --sm-ttl: #e0b24d;
+  --sm-avatar-on: #ffffff;
+  --sm-avatar-1: #1a56b0;
+  --sm-avatar-2: #8a5a00;
+  --sm-avatar-3: #0f6f52;
+  --sm-avatar-4: #9a3b12;
+  --sm-avatar-5: #6a3fb0;
+  --sm-avatar-6: #a01f6e;
 }
 
 :root[data-theme="midnight"] {
@@ -143,6 +222,23 @@
   --sm-bubble-out: #14304e;
   --sm-notify-surface: #201c30;
   --sm-notify-on: #ddb65a;
+  --sm-selected: #14304e;
+  --sm-on-selected: #e4e4ec;
+  --sm-on-selected-muted: #b8b8c0;
+  --sm-list-hover: #1e1e28;
+  --sm-unread-badge: #6ba8e8;
+  --sm-on-unread-badge: #08080c;
+  --sm-verified: #63d28d;
+  --sm-unverified: #9a9aaa;
+  --sm-sealed: #9a9aaa;
+  --sm-ttl: #ddb65a;
+  --sm-avatar-on: #ffffff;
+  --sm-avatar-1: #1a56b0;
+  --sm-avatar-2: #8a5a00;
+  --sm-avatar-3: #0f6f52;
+  --sm-avatar-4: #9a3b12;
+  --sm-avatar-5: #6a3fb0;
+  --sm-avatar-6: #a01f6e;
 }
 
 /* ------------------------------------------------------------------ */
@@ -173,9 +269,12 @@ body {
 }
 
 .sm-app {
-  min-height: 100vh;
+  /* Volle Fensterhoehe, damit Seitenleiste und Verlauf INNEN scrollen und
+     die sticky-Koepfe halten, statt dass die ganze Seite scrollt. */
+  block-size: 100dvh;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 .sm-header {
@@ -199,6 +298,7 @@ body {
   font-size: 0.9rem;
 }
 
+/* Vor der Anmeldung: eine zentrierte Spalte (Registrieren/Anmelden). */
 .sm-main {
   width: min(46rem, 100%);
   margin-inline: auto;
@@ -207,6 +307,7 @@ body {
   flex-direction: column;
   gap: var(--sm-space-4);
   flex: 1;
+  overflow-y: auto;
 }
 
 /* Formulare und Eingaben. */
@@ -306,11 +407,17 @@ button:disabled {
   align-self: flex-end;
 }
 
+/* Absendername und Zeitstempel nutzen --sm-on-surface, NICHT den
+   gedaempften Ton: der gedaempfte Ton faellt auf der Sende-Blase
+   (--sm-bubble-out) in Dunkel auf 4.48:1 und reisst damit SC 1.4.3. Die
+   Hierarchie tragen Schriftgroesse und -gewicht, nicht ein niedrigerer
+   Kontrast. --sm-on-surface gegen beide Blasen ist im Kontrast-Test bereits
+   verankert und haelt in allen Modi ueber 9:1. */
 .sm-msg .sm-msg-from {
   display: block;
   font-size: 0.8rem;
   font-weight: 600;
-  color: var(--sm-on-surface-muted);
+  color: var(--sm-on-surface);
   margin-block-end: var(--sm-space-1);
 }
 
@@ -433,6 +540,331 @@ button:disabled {
 .sm-theme-switch select {
   inline-size: auto;
   min-inline-size: 8rem;
+}
+
+/* ------------------------------------------------------------------ */
+/* Konversationsliste + Thread (die neue Informationsarchitektur).      */
+/* ------------------------------------------------------------------ */
+
+/* Shell: Seitenleiste + Thread. Ab 840px (52.5rem) zweispaltig; darunter
+   kollabiert der Grid und die .has-selection-Klasse am .sm-app entscheidet,
+   welches der beiden Panels sichtbar ist (rein CSS, kein JS-Media-Signal). */
+.sm-shell {
+  flex: 1;
+  display: grid;
+  grid-template-columns: var(--sm-sidebar-width) 1fr;
+  min-block-size: 0;
+}
+
+.sm-sidebar {
+  display: flex;
+  flex-direction: column;
+  min-block-size: 0;
+  border-inline-end: 1px solid var(--sm-divider);
+  background: var(--sm-surface);
+}
+
+.sm-sidebar-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sm-space-2);
+  padding: var(--sm-space-3);
+  border-block-end: 1px solid var(--sm-divider);
+}
+
+.sm-sidebar-head h2 {
+  font-size: 1.05rem;
+  margin: 0;
+  margin-inline-end: auto;
+}
+
+.sm-convos {
+  list-style: none;
+  margin: 0;
+  padding: var(--sm-space-1);
+  overflow-y: auto;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sm-sidebar-foot {
+  border-block-start: 1px solid var(--sm-divider);
+  padding: var(--sm-space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-2);
+}
+
+/* Eine Konversationszeile: die ganze Flaeche ist EIN Button. */
+.sm-convo {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  grid-template-rows: auto auto;
+  column-gap: var(--sm-space-3);
+  align-items: center;
+  inline-size: 100%;
+  text-align: start;
+  min-block-size: 3.5rem;
+  padding: var(--sm-space-2) var(--sm-space-3);
+  border: 1px solid transparent;
+  border-radius: var(--sm-radius);
+  background: transparent;
+  color: var(--sm-on-surface);
+  font-weight: 400;
+}
+
+.sm-convo:hover {
+  background: var(--sm-list-hover);
+}
+
+.sm-convo[aria-current="true"] {
+  background: var(--sm-selected);
+  color: var(--sm-on-selected);
+}
+
+.sm-convo .sm-avatar {
+  grid-row: 1 / 3;
+}
+
+.sm-convo-name {
+  grid-column: 2;
+  grid-row: 1;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sm-convo.sm-has-unread .sm-convo-name {
+  font-weight: 700;
+}
+
+.sm-convo-time {
+  grid-column: 3;
+  grid-row: 1;
+  font-size: 0.78rem;
+  color: var(--sm-on-surface-muted);
+}
+
+.sm-convo[aria-current="true"] .sm-convo-time {
+  color: var(--sm-on-selected-muted);
+}
+
+.sm-convo-snippet {
+  grid-column: 2;
+  grid-row: 2;
+  font-size: 0.85rem;
+  color: var(--sm-on-surface-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sm-convo[aria-current="true"] .sm-convo-snippet {
+  color: var(--sm-on-selected-muted);
+}
+
+/* Ungelesen-Pille: Zahl (nicht nur Farbe), >= 3:1 gegen alle Zeilenzustaende. */
+.sm-unread {
+  grid-column: 3;
+  grid-row: 2;
+  justify-self: end;
+  min-inline-size: 1.35rem;
+  padding-inline: 0.4rem;
+  border-radius: 999px;
+  background: var(--sm-unread-badge);
+  color: var(--sm-on-unread-badge);
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-align: center;
+  line-height: 1.35rem;
+}
+
+/* Avatar: Initialen-Kreis, Hintergrund aus der kontrastgepruesften Palette.
+   Dekorativ (aria-hidden), der Name steht als Text daneben. */
+.sm-avatar {
+  inline-size: 2.5rem;
+  block-size: 2.5rem;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  color: var(--sm-avatar-on);
+  font-weight: 700;
+  font-size: 0.95rem;
+  flex: none;
+}
+
+/* Thread (die ausgewaehlte Unterhaltung). */
+.sm-thread {
+  display: flex;
+  flex-direction: column;
+  min-block-size: 0;
+  min-inline-size: 0;
+  background: var(--sm-surface-container-high);
+}
+
+.sm-chat-head {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: var(--sm-space-3);
+  flex-wrap: wrap;
+  padding: var(--sm-space-2) var(--sm-space-3);
+  border-block-end: 1px solid var(--sm-divider);
+  background: var(--sm-surface-container);
+}
+
+.sm-chat-name {
+  font-size: 1.05rem;
+  font-weight: 700;
+  margin: 0;
+  margin-inline-end: auto;
+}
+
+/* Der Kontaktname ist beim Chat-Wechsel das Fokusziel (tabindex=-1). */
+.sm-chat-name:focus-visible {
+  outline: 2px solid var(--sm-focus);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+.sm-back {
+  display: none;
+}
+
+.sm-thread .sm-log {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--sm-space-3);
+  /* Sticky-Kopf und -Composer duerfen den fokussierten Treffer nicht
+     verdecken (SC 2.4.11): Scroll-Polster in ihrer Hoehe. */
+  scroll-padding-block-start: 3.5rem;
+  scroll-padding-block-end: 5rem;
+}
+
+.sm-thread .sm-msg {
+  scroll-margin-block: 4rem;
+}
+
+.sm-msg-time {
+  display: inline-block;
+  margin-inline-start: var(--sm-space-2);
+  font-size: 0.72rem;
+  /* Wie .sm-msg-from: --sm-on-surface, damit die Zeit auch auf der
+     Sende-Blase in Dunkel die 4.5:1-Textschwelle haelt (SC 1.4.3). */
+  color: var(--sm-on-surface);
+}
+
+.sm-composer {
+  position: sticky;
+  inset-block-end: 0;
+  display: flex;
+  gap: var(--sm-space-2);
+  align-items: flex-end;
+  flex-wrap: wrap;
+  padding: var(--sm-space-2) var(--sm-space-3);
+  border-block-start: 1px solid var(--sm-divider);
+  background: var(--sm-surface-container);
+}
+
+.sm-composer .sm-field {
+  flex: 1;
+  min-inline-size: 10rem;
+}
+
+.sm-composer .sm-ttl {
+  inline-size: auto;
+  min-inline-size: 8rem;
+}
+
+/* Sicherheits-Badges und Verbindungsanzeige im Chat-Kopf: dreifach kodiert
+   (Symbol + Wort + Farbe), nie Farbe allein. */
+.sm-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sm-space-1);
+  font-size: 0.8rem;
+}
+
+.sm-badge svg,
+.sm-conn svg {
+  inline-size: 1rem;
+  block-size: 1rem;
+  flex: none;
+}
+
+.sm-badge-verified {
+  color: var(--sm-verified);
+}
+.sm-badge-unverified {
+  color: var(--sm-unverified);
+}
+.sm-badge-ttl {
+  color: var(--sm-ttl);
+}
+
+.sm-conn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sm-space-1);
+  font-size: 0.8rem;
+}
+.sm-conn.sm-on {
+  color: var(--sm-success);
+}
+.sm-conn.sm-off {
+  color: var(--sm-warning);
+}
+
+/* Aufklappbare Sicherheitsnummer im Thread. */
+.sm-safety {
+  margin: var(--sm-space-3);
+  padding: var(--sm-space-3);
+  background: var(--sm-surface-container-high);
+  border: 1px solid var(--sm-divider);
+  border-radius: var(--sm-radius);
+}
+
+/* Leer-, Lade- und Fehlerzustaende des Threads. */
+.sm-empty {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  text-align: center;
+  padding: var(--sm-space-6);
+  color: var(--sm-on-surface-muted);
+}
+
+.sm-empty p {
+  max-inline-size: 30rem;
+}
+
+/* Benachrichtigungszentrale als eigene Landmarke am unteren Rand. */
+.sm-app > .sm-notify {
+  margin: 0;
+  border-radius: 0;
+  border-inline-start: none;
+  border-block-start: 3px solid var(--sm-notify-on);
+}
+
+/* Schmallayout (< 840px): eine Spalte, Umschaltung ueber .has-selection. */
+@media (max-width: 52.4375rem) {
+  .sm-shell {
+    grid-template-columns: 1fr;
+  }
+  .sm-app:not(.has-selection) .sm-thread {
+    display: none;
+  }
+  .sm-app.has-selection .sm-sidebar {
+    display: none;
+  }
+  .sm-back {
+    display: inline-flex;
+  }
 }
 
 /* Bewegung nur, wenn der Nutzer sie nicht abbestellt hat (SC 2.3.3). */

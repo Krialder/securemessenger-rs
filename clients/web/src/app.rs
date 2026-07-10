@@ -51,6 +51,173 @@ const CREDENTIAL_TTL_SECONDS: u64 = 60 * 60 * 24 * 365;
 /// Ablage-Schlüssel, identisch zum CLI (Zähler) bzw. web-eigen (Profil).
 const COUNTER_KEY: &str = "counter/next_prekey_id";
 const PROFILE_KEY: &str = "profile/v1";
+/// Index aller Unterhaltungen (jüngste zuerst) samt Auszug und
+/// Ungelesen-Zahl. Ein eigener Schlüssel, weil der Storage-Trait bewusst
+/// kein Auflisten kennt (die persistenten Backends bräuchten sonst
+/// Prefix-Scans). Die Verläufe selbst liegen je Kontakt getrennt.
+const CHATS_INDEX_KEY: &str = "chats/index";
+/// Höchstens so viele Nachrichten je Unterhaltung in der Ablage; ältere
+/// fallen vorn heraus. Ein Referenzclient braucht keinen unbegrenzten
+/// Verlauf, und die Ablage schreibt bei jeder Änderung den Wert neu.
+const HISTORY_LIMIT: usize = 200;
+
+fn history_key(peer: &str) -> String {
+    format!("history/{peer}")
+}
+
+/// Eine Zeile im Verlauf: Absender-Handle, Klartext, Zeitstempel
+/// (Unix-Sekunden). Der eigene Handle markiert ausgehende Nachrichten.
+#[derive(Serialize, Deserialize, Clone)]
+struct StoredLine {
+    from: String,
+    text: String,
+    at: u64,
+}
+
+/// Die Zusammenfassung einer Unterhaltung für die Seitenleiste: mit wem,
+/// der letzte Auszug und wie viele ungelesen sind.
+#[derive(Serialize, Deserialize, Clone)]
+struct ChatSummary {
+    peer: String,
+    snippet: String,
+    unread: u32,
+}
+
+fn load_summaries(storage: &SharedStorage) -> Vec<ChatSummary> {
+    storage
+        .borrow()
+        .get(CHATS_INDEX_KEY)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_summaries(storage: &SharedStorage, summaries: &[ChatSummary]) {
+    if let Ok(json) = serde_json::to_vec(summaries) {
+        let _ = storage.borrow_mut().put(CHATS_INDEX_KEY, &json);
+    }
+}
+
+fn load_history(storage: &SharedStorage, peer: &str) -> Vec<StoredLine> {
+    storage
+        .borrow()
+        .get(&history_key(peer))
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Hängt eine Zeile an die Anzeige-Liste an und hält sie auf dieselbe
+/// Obergrenze wie die Ablage (`save_history`); sonst wüchse das reaktive
+/// Signal unbegrenzt und spränge nach einem Neuladen auf die gekappten 200
+/// zurück (sichtbar inkonsistent zur Ablage).
+fn push_capped(list: &mut Vec<StoredLine>, line: StoredLine) {
+    list.push(line);
+    if list.len() > HISTORY_LIMIT {
+        let excess = list.len() - HISTORY_LIMIT;
+        list.drain(0..excess);
+    }
+}
+
+fn save_history(storage: &SharedStorage, peer: &str, history: &[StoredLine]) {
+    let capped = if history.len() > HISTORY_LIMIT {
+        &history[history.len() - HISTORY_LIMIT..]
+    } else {
+        history
+    };
+    if let Ok(json) = serde_json::to_vec(capped) {
+        let _ = storage.borrow_mut().put(&history_key(peer), &json);
+    }
+}
+
+/// Legt eine Nachricht in Verlauf und Zusammenfassung ab und liefert die
+/// neue, nach Aktualität sortierte Liste zurück. `bump_unread` zählt eine
+/// eingehende Nachricht als ungelesen, solange der Chat nicht offen ist.
+fn record_message(
+    storage: &SharedStorage,
+    peer: &str,
+    line: StoredLine,
+    bump_unread: bool,
+) -> Vec<ChatSummary> {
+    let mut history = load_history(storage, peer);
+    let snippet = line.text.clone();
+    history.push(line);
+    save_history(storage, peer, &history);
+
+    let mut summaries = load_summaries(storage);
+    if let Some(pos) = summaries.iter().position(|s| s.peer == peer) {
+        let mut summary = summaries.remove(pos);
+        summary.snippet = snippet;
+        if bump_unread {
+            summary.unread += 1;
+        }
+        summaries.insert(0, summary);
+    } else {
+        summaries.insert(
+            0,
+            ChatSummary {
+                peer: peer.to_string(),
+                snippet,
+                unread: u32::from(bump_unread),
+            },
+        );
+    }
+    save_summaries(storage, &summaries);
+    summaries
+}
+
+/// Stellt sicher, dass eine (auch leere) Unterhaltung im Index steht,
+/// damit ein neu begonnener Chat sofort in der Liste auftaucht.
+fn ensure_chat(storage: &SharedStorage, peer: &str) -> Vec<ChatSummary> {
+    let mut summaries = load_summaries(storage);
+    if !summaries.iter().any(|s| s.peer == peer) {
+        summaries.insert(
+            0,
+            ChatSummary {
+                peer: peer.to_string(),
+                snippet: String::new(),
+                unread: 0,
+            },
+        );
+        save_summaries(storage, &summaries);
+    }
+    summaries
+}
+
+/// Setzt die Ungelesen-Zahl einer Unterhaltung auf null (Chat geöffnet).
+fn mark_read(storage: &SharedStorage, peer: &str) -> Vec<ChatSummary> {
+    let mut summaries = load_summaries(storage);
+    if let Some(summary) = summaries.iter_mut().find(|s| s.peer == peer) {
+        summary.unread = 0;
+        save_summaries(storage, &summaries);
+    }
+    summaries
+}
+
+/// Die Initiale für den Avatar: der erste Buchstabe des Handles, groß.
+fn avatar_initial(handle: &str) -> String {
+    handle
+        .chars()
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// Wählt eine der sechs kontrastgeprüften Avatar-Farben stabil aus dem
+/// Handle (gleicher Kontakt, gleiche Farbe).
+fn avatar_style(handle: &str) -> String {
+    let sum: u32 = handle.bytes().map(u32::from).sum();
+    format!("background-color: var(--sm-avatar-{})", sum % 6 + 1)
+}
+
+/// Formatiert einen Unix-Zeitstempel als lokale Uhrzeit (HH:MM) über die
+/// JavaScript-Uhr des Browsers.
+fn format_time(at: u64) -> String {
+    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64((at as f64) * 1000.0));
+    format!("{:02}:{:02}", date.get_hours(), date.get_minutes())
+}
 
 type SharedStorage = Rc<RefCell<BrowserStorage>>;
 type WebDevice = Device<PersistentProtocolStore<BrowserStorage>>;
@@ -279,7 +446,12 @@ async fn login(storage: SharedStorage, password: String) -> Result<Core, String>
 /// Sendet eine Nachricht; baut beim ersten Kontakt die PQXDH-Sitzungen aus
 /// den Verzeichnis-Bündeln auf und merkt sich die Geräte des Kontakts in
 /// der Ablage (gleicher Fluss und gleiches Format wie im CLI).
-async fn send_message(core: &mut Core, peer: &str, text: &str) -> Result<(), String> {
+async fn send_message(
+    core: &mut Core,
+    peer: &str,
+    text: &str,
+    expires_at: Option<u64>,
+) -> Result<(), String> {
     let contact_key = format!("contact/{peer}");
     let known: Vec<ContactDevice> = match core
         .storage
@@ -351,8 +523,7 @@ async fn send_message(core: &mut Core, peer: &str, text: &str) -> Result<(), Str
             device_id: target.server_device_id.clone(),
             envelope,
             franking_tag: Some(franking_tag.clone()),
-            // Disappearing-Messages-TTL folgt mit einem eigenen UI-Schnitt.
-            expires_at: None,
+            expires_at,
         });
     }
     DeliveryClient::new(delivery_url())
@@ -424,20 +595,25 @@ fn start_hint_channel(
     set_hints: WriteSignal<u64>,
     set_status: WriteSignal<String>,
     set_notifications: WriteSignal<Vec<String>>,
+    set_connected: WriteSignal<bool>,
 ) {
     spawn_local(async move {
         let url = client_app::delivery::ws_url(&delivery_url());
         let mut socket = match WebSocket::open(&url) {
             Ok(socket) => socket,
             Err(error) => {
+                set_connected.set(false);
                 set_status.set(format!("Echtzeit-Kanal nicht erreichbar: {error}"));
                 return;
             }
         };
         if let Err(error) = socket.send(WsMessage::Text(ws_auth_frame(&token))).await {
+            set_connected.set(false);
             set_status.set(format!("Echtzeit-Kanal: Auth nicht gesendet: {error}"));
             return;
         }
+        // Auth gesendet, der Kanal steht bis zum Schliessen oder Fehler.
+        set_connected.set(true);
         while let Some(frame) = socket.next().await {
             match frame {
                 Ok(WsMessage::Text(text)) => match parse_ws_event(&text) {
@@ -451,6 +627,7 @@ fn start_hint_channel(
                 },
                 Ok(WsMessage::Bytes(_)) => {}
                 Err(error) => {
+                    set_connected.set(false);
                     set_status.set(format!("Echtzeit-Kanal gestört: {error}"));
                     return;
                 }
@@ -458,6 +635,7 @@ fn start_hint_channel(
         }
         // [ANNAHME: kein automatischer Wiederverbinder, wie beim CLI; der
         // Abruf-Knopf bleibt als Rückfallebene sichtbar.]
+        set_connected.set(false);
         set_status.set("Echtzeit-Kanal geschlossen; Abrufen weiter per Knopf.".to_string());
     });
 }
@@ -519,10 +697,22 @@ fn App() -> impl IntoView {
     let (me, set_me) = signal(String::new());
     let (handle_input, set_handle_input) = signal(String::new());
     let (password_input, set_password_input) = signal(String::new());
-    let (peer_input, set_peer_input) = signal(String::new());
     let (text_input, set_text_input) = signal(String::new());
-    // (Absender, Text); der eigene Handle markiert ausgehende Nachrichten.
-    let (messages, set_messages) = signal(Vec::<(String, String)>::new());
+    // Die Unterhaltungen der Seitenleiste (jüngste zuerst) und der offene
+    // Chat. Der Verlauf des offenen Chats liegt in `messages`.
+    let (chats, set_chats) = signal(Vec::<ChatSummary>::new());
+    let (selected, set_selected) = signal(Option::<String>::None);
+    // Der Verlauf des offenen Chats; beim Wechsel aus der Ablage geladen.
+    let (messages, set_messages) = signal(Vec::<StoredLine>::new());
+    // Frist-Auswahl des Composers in Sekunden (0 = aus); setzt expires_at.
+    let (ttl_choice, set_ttl_choice) = signal(0u64);
+    // "Neuer Chat": ob das Handle-Feld offen ist und sein Inhalt.
+    let (new_chat_open, set_new_chat_open) = signal(false);
+    let (new_chat_input, set_new_chat_input) = signal(String::new());
+    // Ob die Sicherheitsnummer im Thread aufgeklappt ist.
+    let (safety_open, set_safety_open) = signal(false);
+    // Bleibender Verbindungszustand des Echtzeit-Kanals (Chat-Kopf).
+    let (connected, set_connected) = signal(false);
     // Zähler der message.waiting-Hinweise vom Echtzeit-Kanal; der Effect
     // weiter unten holt ab, sobald die Oberfläche frei ist.
     let (hints, set_hints) = signal(0u64);
@@ -537,6 +727,15 @@ fn App() -> impl IntoView {
     // Gewählter Darstellungs-Modus (system/hell/dunkel/midnight); der
     // FOUC-Guard in index.html hat ihn beim Laden schon angewandt.
     let (theme, set_theme) = signal(stored_theme());
+    // Fokusziel beim Chat-Wechsel: der Kontaktname im Chat-Kopf (SC 2.4.3).
+    let chat_name_ref = NodeRef::<leptos::html::H2>::new();
+
+    // Die Ablage des aktiven Cores, für die synchronen Listen-Handler
+    // (Auswahl, Neuer Chat) außerhalb der async-Abläufe.
+    let current_storage = {
+        let core = core.clone();
+        move || core.borrow().as_ref().map(|c| c.storage.clone())
+    };
 
     // Hydration: einmal beim Start die Ablage öffnen und entscheiden,
     // welches Formular gezeigt wird.
@@ -586,8 +785,11 @@ fn App() -> impl IntoView {
                             set_hints,
                             set_status,
                             set_notifications,
+                            set_connected,
                         );
+                        let storage = new_core.storage.clone();
                         *core.borrow_mut() = Some(new_core);
+                        set_chats.set(load_summaries(&storage));
                         set_me.set(handle);
                         set_logged_in.set(true);
                         set_status.set("Bereit.".to_string());
@@ -626,9 +828,12 @@ fn App() -> impl IntoView {
                             set_hints,
                             set_status,
                             set_notifications,
+                            set_connected,
                         );
                         set_me.set(new_core.handle.clone());
+                        let storage = new_core.storage.clone();
                         *core.borrow_mut() = Some(new_core);
+                        set_chats.set(load_summaries(&storage));
                         set_logged_in.set(true);
                         set_status.set("Bereit; Sitzungen aus der Ablage geladen.".to_string());
                         // Was schon wartet, kündigt kein Hinweis mehr an:
@@ -643,18 +848,24 @@ fn App() -> impl IntoView {
     };
 
     // Der Sende-Ablauf, geteilt zwischen Knopf und Enter-Taste im Textfeld.
+    // Sendet an den offenen Chat und legt die Nachricht in dessen Verlauf ab.
     let run_send = SendWrapper::new(Rc::new({
         let core = core.clone();
         move || {
             if busy.get_untracked() {
                 return;
             }
-            let peer = peer_input.get_untracked();
+            let Some(peer) = selected.get_untracked() else {
+                set_status.set("Zuerst links einen Chat wählen.".to_string());
+                return;
+            };
             let text = text_input.get_untracked();
-            if peer.is_empty() || text.is_empty() {
-                set_status.set("Empfänger und Text angeben.".to_string());
+            if text.is_empty() {
+                set_status.set("Text angeben.".to_string());
                 return;
             }
+            let ttl = ttl_choice.get_untracked();
+            let expires_at = (ttl > 0).then(|| now_unix() + ttl);
             set_busy.set(true);
             set_status.set("Wird gesendet ...".to_string());
             let core = core.clone();
@@ -666,13 +877,29 @@ fn App() -> impl IntoView {
                 let taken = core.borrow_mut().take();
                 match taken {
                     Some(mut active) => {
-                        let result = send_message(&mut active, &peer, &text).await;
+                        let storage = active.storage.clone();
                         let who = active.handle.clone();
+                        let result = send_message(&mut active, &peer, &text, expires_at).await;
                         *core.borrow_mut() = Some(active);
                         match result {
                             Ok(()) => {
-                                set_messages.update(|list| list.push((who, text)));
-                                set_text_input.set(String::new());
+                                let line = StoredLine {
+                                    from: who,
+                                    text: text.clone(),
+                                    at: now_unix(),
+                                };
+                                let summaries =
+                                    record_message(&storage, &peer, line.clone(), false);
+                                set_chats.set(summaries);
+                                // Anzeige und Composer nur berühren, wenn der
+                                // Chat noch offen ist: der Nutzer kann während
+                                // des Sendens gewechselt und einen neuen
+                                // Entwurf getippt haben, der nicht verloren
+                                // gehen darf.
+                                if selected.get_untracked().as_deref() == Some(peer.as_str()) {
+                                    set_messages.update(|list| push_capped(list, line));
+                                    set_text_input.set(String::new());
+                                }
                                 set_status.set(String::new());
                             }
                             Err(error) => set_status.set(format!("Senden fehlgeschlagen: {error}")),
@@ -715,6 +942,7 @@ fn App() -> impl IntoView {
                 let taken = core.borrow_mut().take();
                 match taken {
                     Some(mut active) => {
+                        let storage = active.storage.clone();
                         let result = fetch_messages(&mut active).await;
                         *core.borrow_mut() = Some(active);
                         match result {
@@ -722,7 +950,30 @@ fn App() -> impl IntoView {
                                 set_status.set("Keine neuen Nachrichten.".to_string());
                             }
                             Ok(received) => {
-                                set_messages.update(|list| list.extend(received));
+                                let open = selected.get_untracked();
+                                let mut summaries = None;
+                                for (sender, text) in received {
+                                    let for_open = open.as_deref() == Some(sender.as_str());
+                                    let line = StoredLine {
+                                        from: sender.clone(),
+                                        text,
+                                        at: now_unix(),
+                                    };
+                                    // Nur eine noch nicht offene Unterhaltung
+                                    // zählt ungelesen hoch.
+                                    summaries = Some(record_message(
+                                        &storage,
+                                        &sender,
+                                        line.clone(),
+                                        !for_open,
+                                    ));
+                                    if for_open {
+                                        set_messages.update(|list| push_capped(list, line));
+                                    }
+                                }
+                                if let Some(summaries) = summaries {
+                                    set_chats.set(summaries);
+                                }
                                 set_status.set(String::new());
                             }
                             Err(error) => set_status.set(format!("Abruf fehlgeschlagen: {error}")),
@@ -755,17 +1006,21 @@ fn App() -> impl IntoView {
         });
     }
 
+    // Blendet die Sicherheitsnummer des offenen Chats ein oder aus. Beim
+    // Öffnen wird sie für den ausgewählten Kontakt berechnet.
     let on_safety = {
         let core = core.clone();
         move |_| {
+            if safety_open.get_untracked() {
+                set_safety_open.set(false);
+                return;
+            }
             if busy.get_untracked() {
                 return;
             }
-            let peer = peer_input.get_untracked();
-            if peer.is_empty() {
-                set_status.set("Empfänger-Handle angeben.".to_string());
+            let Some(peer) = selected.get_untracked() else {
                 return;
-            }
+            };
             set_busy.set(true);
             let core = core.clone();
             spawn_local(async move {
@@ -787,12 +1042,13 @@ fn App() -> impl IntoView {
                         match result {
                             Ok(Some(number)) => {
                                 set_safety_info.set(Some((peer, group_safety_number(&number))));
+                                set_safety_open.set(true);
                                 set_status.set(String::new());
                             }
-                            Ok(None) => set_status.set(format!(
-                                "Noch keine Sitzung mit '{peer}': erst eine Nachricht \
-                                 senden oder empfangen."
-                            )),
+                            Ok(None) => {
+                                set_safety_info.set(None);
+                                set_safety_open.set(true);
+                            }
                             Err(error) => set_status.set(format!("Sicherheitsnummer: {error}")),
                         }
                     }
@@ -802,6 +1058,57 @@ fn App() -> impl IntoView {
             });
         }
     };
+
+    // Einen Chat öffnen: Verlauf laden, ungelesen zurücksetzen, auswählen.
+    let open_chat = {
+        let current_storage = current_storage.clone();
+        move |peer: String| {
+            let Some(storage) = current_storage() else {
+                return;
+            };
+            set_messages.set(load_history(&storage, &peer));
+            set_chats.set(mark_read(&storage, &peer));
+            set_safety_open.set(false);
+            set_safety_info.set(None);
+            set_selected.set(Some(peer));
+        }
+    };
+
+    let on_back = move |_| {
+        set_selected.set(None);
+        set_safety_open.set(false);
+    };
+
+    // "Neuer Chat" bestätigen: Handle in die Liste aufnehmen und öffnen.
+    let on_new_chat_confirm = {
+        let open_chat = open_chat.clone();
+        let current_storage = current_storage.clone();
+        move || {
+            let peer = new_chat_input.get_untracked().trim().to_string();
+            if peer.is_empty() {
+                return;
+            }
+            if let Some(storage) = current_storage() {
+                set_chats.set(ensure_chat(&storage, &peer));
+            }
+            set_new_chat_input.set(String::new());
+            set_new_chat_open.set(false);
+            open_chat(peer);
+        }
+    };
+
+    // Fokus-Mitführung beim Chat-Wechsel (SC 2.4.3): der Kontaktname im
+    // Chat-Kopf. Erst nach dem Render, sonst zeigt der NodeRef ins Leere.
+    Effect::new(move |_| {
+        if selected.get().is_some() {
+            let name_ref = chat_name_ref;
+            request_animation_frame(move || {
+                if let Some(el) = name_ref.get_untracked() {
+                    let _ = el.focus();
+                }
+            });
+        }
+    });
 
     let on_kt_check = {
         let core = core.clone();
@@ -841,8 +1148,8 @@ fn App() -> impl IntoView {
     };
 
     view! {
-        <div class="sm-app">
-            <header class="sm-header">
+        <div class="sm-app" class=("has-selection", move || selected.get().is_some())>
+            <header class="sm-header" role="banner">
                 <h1>"SecureMessenger"</h1>
                 {move || {
                     logged_in
@@ -872,87 +1179,140 @@ fn App() -> impl IntoView {
                 </div>
             </header>
 
-            <main class="sm-main">
-                <p class="sm-caution">
-                    "Geräte-Identität, Sitzungen und Kontakte liegen unverschlüsselt in "
-                    "IndexedDB dieses Browser-Profils. Der Browser ist das kryptografisch "
-                    "schwächste Glied der Plattform (sicherheit.md)."
-                </p>
-
-                {move || {
-                    let items = notifications.get();
-                    (!items.is_empty())
-                        .then(|| {
-                            view! {
-                                <section
-                                    class="sm-notify"
-                                    aria-label="Benachrichtigungen"
-                                    aria-live="polite"
-                                >
-                                    <h2>"Benachrichtigungen"</h2>
-                                    <ul>
-                                        {items
-                                            .into_iter()
-                                            .map(|n| view! { <li>{n}</li> })
-                                            .collect_view()}
-                                    </ul>
-                                </section>
-                            }
-                        })
-                }}
-
-                {move || {
-                    if logged_in.get() {
-                        view! {
-                            <section class="sm-card" aria-label="Nachricht verfassen">
-                                <div class="sm-field">
-                                    <label for="sm-peer">"Empfänger-Handle"</label>
-                                    <input
-                                        id="sm-peer"
-                                        prop:value=peer_input
-                                        on:input=move |ev| set_peer_input.set(event_target_value(&ev))
-                                    />
-                                </div>
-                                <div class="sm-field">
-                                    <label for="sm-msg">"Nachricht (Enter sendet)"</label>
-                                    <input
-                                        id="sm-msg"
-                                        prop:value=text_input
-                                        on:input=move |ev| set_text_input.set(event_target_value(&ev))
-                                        on:keydown=on_message_key.clone()
-                                    />
-                                </div>
-                                <div class="sm-row">
+            {move || {
+                if logged_in.get() {
+                    let open_chat_list = open_chat.clone();
+                    let confirm_click = on_new_chat_confirm.clone();
+                    let confirm_key = on_new_chat_confirm.clone();
+                    // Frische Klone der Thread-Handler: die innere, auf `selected`
+                    // reagierende Closure besitzt eigene Kopien, die äußere
+                    // Closure behält ihre Originale für den nächsten Lauf.
+                    // `on_back` fängt nur Copy-Signale ein und ist selbst Copy,
+                    // braucht also keinen Klon.
+                    let on_safety = on_safety.clone();
+                    let on_send = on_send.clone();
+                    let on_fetch = on_fetch.clone();
+                    let on_message_key = on_message_key.clone();
+                    view! {
+                        <div class="sm-shell">
+                            <nav class="sm-sidebar" aria-label="Konversationen">
+                                <div class="sm-sidebar-head">
+                                    <h2>"Chats"</h2>
                                     <button
                                         type="button"
                                         class="sm-primary"
-                                        on:click=on_send.clone()
-                                        disabled=busy
+                                        on:click=move |_| {
+                                            set_new_chat_open.update(|open| *open = !*open)
+                                        }
                                     >
-                                        "Senden"
-                                    </button>
-                                    <button
-                                        type="button"
-                                        class="sm-secondary"
-                                        on:click=on_fetch.clone()
-                                        disabled=busy
-                                    >
-                                        "Abrufen"
+                                        "Neuer Chat"
                                     </button>
                                 </div>
-                            </section>
-
-                            <section class="sm-card" aria-label="Schlüssel prüfen">
-                                <h2>"Schlüssel prüfen"</h2>
-                                <div class="sm-row">
-                                    <button
-                                        type="button"
-                                        class="sm-secondary"
-                                        on:click=on_safety.clone()
-                                        disabled=busy
-                                    >
-                                        "Sicherheitsnummer"
-                                    </button>
+                                {move || {
+                                    new_chat_open
+                                        .get()
+                                        .then(|| {
+                                            let confirm_click = confirm_click.clone();
+                                            let confirm_key = confirm_key.clone();
+                                            view! {
+                                                <div class="sm-sidebar-head">
+                                                    <div class="sm-field">
+                                                        <label for="sm-newchat">"Handle des Kontakts"</label>
+                                                        <input
+                                                            id="sm-newchat"
+                                                            prop:value=new_chat_input
+                                                            on:input=move |ev| {
+                                                                set_new_chat_input
+                                                                    .set(event_target_value(&ev))
+                                                            }
+                                                            on:keydown=move |ev: web_sys::KeyboardEvent| {
+                                                                if ev.key() == "Enter" {
+                                                                    ev.prevent_default();
+                                                                    (confirm_key)();
+                                                                }
+                                                            }
+                                                        />
+                                                    </div>
+                                                    <button
+                                                        type="button"
+                                                        class="sm-secondary"
+                                                        on:click=move |_| (confirm_click)()
+                                                    >
+                                                        "Öffnen"
+                                                    </button>
+                                                </div>
+                                            }
+                                        })
+                                }}
+                                <ul class="sm-convos">
+                                    {move || {
+                                        let sel = selected.get();
+                                        let list = chats.get();
+                                        if list.is_empty() {
+                                            view! {
+                                                <li class="sm-empty">
+                                                    <p>
+                                                        "Noch keine Unterhaltungen. Mit "
+                                                        "'Neuer Chat' die erste beginnen."
+                                                    </p>
+                                                </li>
+                                            }
+                                                .into_any()
+                                        } else {
+                                            let open_chat_list = open_chat_list.clone();
+                                            list.into_iter()
+                                                .map(|chat| {
+                                                    let peer = chat.peer.clone();
+                                                    let is_sel = sel.as_deref() == Some(peer.as_str());
+                                                    let has_unread = chat.unread > 0;
+                                                    let unread = chat.unread;
+                                                    let open = open_chat_list.clone();
+                                                    let click_peer = peer.clone();
+                                                    view! {
+                                                        <li>
+                                                            <button
+                                                                type="button"
+                                                                class="sm-convo"
+                                                                class=("sm-has-unread", has_unread)
+                                                                aria-current=if is_sel { "true" } else { "false" }
+                                                                on:click=move |_| open(click_peer.clone())
+                                                            >
+                                                                <span
+                                                                    class="sm-avatar"
+                                                                    aria-hidden="true"
+                                                                    style=avatar_style(&peer)
+                                                                >
+                                                                    {avatar_initial(&peer)}
+                                                                </span>
+                                                                <span class="sm-convo-name">
+                                                                    {peer.clone()}
+                                                                </span>
+                                                                <span class="sm-convo-snippet">
+                                                                    {chat.snippet.clone()}
+                                                                </span>
+                                                                {has_unread
+                                                                    .then(|| {
+                                                                        view! {
+                                                                            <span
+                                                                                class="sm-unread"
+                                                                                aria-label=format!(
+                                                                                    "{unread} ungelesene Nachrichten",
+                                                                                )
+                                                                            >
+                                                                                {unread}
+                                                                            </span>
+                                                                        }
+                                                                    })}
+                                                            </button>
+                                                        </li>
+                                                    }
+                                                })
+                                                .collect_view()
+                                                .into_any()
+                                        }
+                                    }}
+                                </ul>
+                                <div class="sm-sidebar-foot">
                                     <button
                                         type="button"
                                         class="sm-secondary"
@@ -961,174 +1321,362 @@ fn App() -> impl IntoView {
                                     >
                                         "Schlüssel prüfen (KT)"
                                     </button>
+                                    {move || {
+                                        kt_info
+                                            .get()
+                                            .map(|(ok, message)| {
+                                                if ok {
+                                                    view! { <p class="sm-note sm-ok">{message}</p> }
+                                                        .into_any()
+                                                } else {
+                                                    view! {
+                                                        <p class="sm-note sm-warn" role="alert">
+                                                            {message}
+                                                        </p>
+                                                    }
+                                                        .into_any()
+                                                }
+                                            })
+                                    }}
+                                    <p class="sm-caution">
+                                        "Geräte-Identität, Sitzungen und Kontakte liegen "
+                                        "unverschlüsselt in IndexedDB dieses Browser-Profils. Der "
+                                        "Browser ist das kryptografisch schwächste Glied der "
+                                        "Plattform (sicherheit.md)."
+                                    </p>
                                 </div>
+                            </nav>
+
+                            <main class="sm-thread" aria-label="Unterhaltung">
                                 {move || {
-                                    safety_info
-                                        .get()
-                                        .map(|(peer, number)| {
+                                    match selected.get() {
+                                        None => {
                                             view! {
-                                                <div>
+                                                <div class="sm-empty">
                                                     <p>
-                                                        <strong>
-                                                            {format!("Sicherheitsnummer mit {peer}")}
-                                                        </strong>
-                                                        " – über einen zweiten Kanal abgleichen:"
+                                                        "Links eine Unterhaltung wählen oder mit "
+                                                        "'Neuer Chat' eine neue beginnen. Alle "
+                                                        "Nachrichten sind Ende-zu-Ende verschlüsselt."
                                                     </p>
-                                                    <p class="sm-fingerprint">{number}</p>
                                                 </div>
                                             }
-                                        })
-                                }}
-                                {move || {
-                                    kt_info
-                                        .get()
-                                        .map(|(ok, message)| {
-                                            if ok {
-                                                view! { <p class="sm-note sm-ok">{message}</p> }
-                                                    .into_any()
-                                            } else {
-                                                view! {
-                                                    <p class="sm-note sm-warn" role="alert">
-                                                        {message}
-                                                    </p>
-                                                }
-                                                    .into_any()
-                                            }
-                                        })
-                                }}
-                            </section>
-
-                            <ul
-                                class="sm-log"
-                                role="log"
-                                aria-label="Nachrichtenverlauf"
-                                aria-live="polite"
-                            >
-                                {move || {
-                                    let own = me.get();
-                                    messages
-                                        .get()
-                                        .into_iter()
-                                        .map(|(who, text)| {
-                                            let class = if who == own {
-                                                "sm-msg sm-mine"
-                                            } else {
-                                                "sm-msg"
-                                            };
+                                                .into_any()
+                                        }
+                                        Some(peer) => {
                                             view! {
-                                                <li class=class>
-                                                    <span class="sm-msg-from">{who}</span>
-                                                    <span class="sm-msg-text">{text}</span>
-                                                </li>
-                                            }
-                                        })
-                                        .collect_view()
-                                }}
-                            </ul>
-                        }
-                            .into_any()
-                    } else {
-                        match boot.get() {
-                            Boot::Loading => {
-                                view! { <p class="sm-status">"Ablage wird geladen ..."</p> }
-                                    .into_any()
-                            }
-                            Boot::Broken(error) => {
-                                view! {
-                                    <p class="sm-note sm-warn" role="alert">
-                                        {format!(
-                                            "Ablage nicht verfügbar: {error}. Ohne IndexedDB (z. B. \
-                                             privates Fenster) kann dieser Client keine Identität \
-                                             halten.",
-                                        )}
-                                    </p>
-                                }
-                                    .into_any()
-                            }
-                            Boot::Known(handle) => {
-                                view! {
-                                    <section class="sm-card" aria-label="Anmelden">
-                                        <h2>
-                                            {format!("Konto '{handle}' auf diesem Gerät gefunden")}
-                                        </h2>
-                                        <div class="sm-field">
-                                            <label for="sm-pass">"Passwort"</label>
-                                            <input
-                                                id="sm-pass"
-                                                type="password"
-                                                prop:value=password_input
-                                                on:input=move |ev| {
-                                                    set_password_input.set(event_target_value(&ev))
-                                                }
-                                            />
-                                        </div>
-                                        <div class="sm-row">
-                                            <button
-                                                type="button"
-                                                class="sm-primary"
-                                                on:click=on_login.clone()
-                                                disabled=busy
-                                            >
-                                                "Anmelden"
-                                            </button>
-                                        </div>
-                                    </section>
-                                }
-                                    .into_any()
-                            }
-                            Boot::Fresh => {
-                                view! {
-                                    <section class="sm-card" aria-label="Konto anlegen">
-                                        <h2>"Konto anlegen"</h2>
-                                        <p class="sm-status">
-                                            "Registrierung, Anmeldung und Prekey-Veröffentlichung "
-                                            "in einem Schritt."
-                                        </p>
-                                        <div class="sm-field">
-                                            <label for="sm-handle">"Handle (a-z, 0-9, _ . -)"</label>
-                                            <input
-                                                id="sm-handle"
-                                                prop:value=handle_input
-                                                on:input=move |ev| {
-                                                    set_handle_input.set(event_target_value(&ev))
-                                                }
-                                            />
-                                        </div>
-                                        <div class="sm-field">
-                                            <label for="sm-newpass">
-                                                "Passwort (mindestens 12 Zeichen)"
-                                            </label>
-                                            <input
-                                                id="sm-newpass"
-                                                type="password"
-                                                prop:value=password_input
-                                                on:input=move |ev| {
-                                                    set_password_input.set(event_target_value(&ev))
-                                                }
-                                            />
-                                        </div>
-                                        <div class="sm-row">
-                                            <button
-                                                type="button"
-                                                class="sm-primary"
-                                                on:click=on_register.clone()
-                                                disabled=busy
-                                            >
-                                                "Konto anlegen"
-                                            </button>
-                                        </div>
-                                    </section>
-                                }
-                                    .into_any()
-                            }
-                        }
-                    }
-                }}
+                                                <div class="sm-chat-head">
+                                                    <button
+                                                        type="button"
+                                                        class="sm-back sm-secondary"
+                                                        aria-label="Zurück zur Liste"
+                                                        on:click=on_back
+                                                    >
+                                                        "Zurück"
+                                                    </button>
+                                                    <h2
+                                                        class="sm-chat-name"
+                                                        tabindex="-1"
+                                                        node_ref=chat_name_ref
+                                                    >
+                                                        {peer.clone()}
+                                                    </h2>
+                                                    {move || {
+                                                        if connected.get() {
+                                                            view! {
+                                                                <span class="sm-conn sm-on">
+                                                                    <span aria-hidden="true">"●"</span>
+                                                                    "Verbunden"
+                                                                </span>
+                                                            }
+                                                                .into_any()
+                                                        } else {
+                                                            view! {
+                                                                <span class="sm-conn sm-off">
+                                                                    <span aria-hidden="true">"○"</span>
+                                                                    "Getrennt, Abrufen weiter per Knopf."
+                                                                </span>
+                                                            }
+                                                                .into_any()
+                                                        }
+                                                    }}
+                                                    <button
+                                                        type="button"
+                                                        class="sm-secondary"
+                                                        on:click=on_safety.clone()
+                                                        disabled=busy
+                                                    >
+                                                        "Sicherheitsnummer"
+                                                    </button>
+                                                </div>
 
-                <p class="sm-status" role="status" aria-live="polite">
-                    {status}
-                </p>
-            </main>
+                                                {move || {
+                                                    safety_open
+                                                        .get()
+                                                        .then(|| {
+                                                            match safety_info.get() {
+                                                                Some((contact, number)) => {
+                                                                    view! {
+                                                                        <div
+                                                                            class="sm-safety"
+                                                                            role="group"
+                                                                            aria-label="Sicherheitsnummer"
+                                                                        >
+                                                                            <p>
+                                                                                "Diese Nummer über einen zweiten Kanal mit "
+                                                                                <strong>{contact}</strong>
+                                                                                " vergleichen. Stimmt sie, ist die Verbindung "
+                                                                                "nicht umgeleitet."
+                                                                            </p>
+                                                                            <p class="sm-fingerprint">{number}</p>
+                                                                        </div>
+                                                                    }
+                                                                        .into_any()
+                                                                }
+                                                                None => {
+                                                                    view! {
+                                                                        <div class="sm-safety">
+                                                                            <p>
+                                                                                "Die Sicherheitsnummer entsteht mit der "
+                                                                                "ersten gesendeten oder empfangenen Nachricht."
+                                                                            </p>
+                                                                        </div>
+                                                                    }
+                                                                        .into_any()
+                                                                }
+                                                            }
+                                                        })
+                                                }}
+
+                                                <ul
+                                                    class="sm-log"
+                                                    role="log"
+                                                    aria-label="Nachrichtenverlauf"
+                                                    aria-live="polite"
+                                                    aria-relevant="additions"
+                                                    aria-atomic="false"
+                                                >
+                                                    {move || {
+                                                        let own = me.get();
+                                                        let msgs = messages.get();
+                                                        if msgs.is_empty() {
+                                                            view! {
+                                                                <li class="sm-status">
+                                                                    "Ende-zu-Ende verschlüsselt. Vor der ersten "
+                                                                    "Nachricht die Sicherheitsnummer vergleichen, "
+                                                                    "damit die Verbindung nicht umgeleitet ist."
+                                                                </li>
+                                                            }
+                                                                .into_any()
+                                                        } else {
+                                                            msgs.into_iter()
+                                                                .map(|line| {
+                                                                    let class = if line.from == own {
+                                                                        "sm-msg sm-mine"
+                                                                    } else {
+                                                                        "sm-msg"
+                                                                    };
+                                                                    view! {
+                                                                        <li class=class>
+                                                                            <span class="sm-msg-from">{line.from}</span>
+                                                                            <span class="sm-msg-text">{line.text}</span>
+                                                                            <span class="sm-msg-time">
+                                                                                {format_time(line.at)}
+                                                                            </span>
+                                                                        </li>
+                                                                    }
+                                                                })
+                                                                .collect_view()
+                                                                .into_any()
+                                                        }
+                                                    }}
+                                                </ul>
+
+                                                <div class="sm-composer">
+                                                    <div class="sm-field">
+                                                        <label for="sm-msg">"Nachricht (Enter sendet)"</label>
+                                                        <input
+                                                            id="sm-msg"
+                                                            prop:value=text_input
+                                                            on:input=move |ev| {
+                                                                set_text_input.set(event_target_value(&ev))
+                                                            }
+                                                            on:keydown=on_message_key.clone()
+                                                        />
+                                                    </div>
+                                                    <div class="sm-field">
+                                                        <label for="sm-ttl">"Frist"</label>
+                                                        <select
+                                                            id="sm-ttl"
+                                                            class="sm-ttl"
+                                                            prop:value=move || ttl_choice.get().to_string()
+                                                            on:change=move |ev| {
+                                                                let secs = event_target_value(&ev)
+                                                                    .parse::<u64>()
+                                                                    .unwrap_or(0);
+                                                                set_ttl_choice.set(secs);
+                                                            }
+                                                        >
+                                                            <option value="0">"Aus"</option>
+                                                            <option value="300">"5 Minuten"</option>
+                                                            <option value="3600">"1 Stunde"</option>
+                                                            <option value="86400">"1 Tag"</option>
+                                                            <option value="604800">"1 Woche"</option>
+                                                        </select>
+                                                    </div>
+                                                    <button
+                                                        type="button"
+                                                        class="sm-primary"
+                                                        on:click=on_send.clone()
+                                                        disabled=busy
+                                                    >
+                                                        "Senden"
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        class="sm-secondary"
+                                                        on:click=on_fetch.clone()
+                                                        disabled=busy
+                                                    >
+                                                        "Abrufen"
+                                                    </button>
+                                                </div>
+                                            }
+                                                .into_any()
+                                        }
+                                    }
+                                }}
+                                <p class="sm-status" role="status" aria-live="polite">{status}</p>
+                            </main>
+                        </div>
+
+                        {move || {
+                            let items = notifications.get();
+                            (!items.is_empty())
+                                .then(|| {
+                                    view! {
+                                        <aside
+                                            class="sm-notify"
+                                            role="complementary"
+                                            aria-label="Benachrichtigungen"
+                                            aria-live="polite"
+                                        >
+                                            <h2>"Benachrichtigungen"</h2>
+                                            <ul>
+                                                {items
+                                                    .into_iter()
+                                                    .map(|n| view! { <li>{n}</li> })
+                                                    .collect_view()}
+                                            </ul>
+                                        </aside>
+                                    }
+                                })
+                        }}
+                    }
+                        .into_any()
+                } else {
+                    view! {
+                        <main class="sm-main">
+                            {match boot.get() {
+                                    Boot::Loading => {
+                                        view! { <p class="sm-status">"Ablage wird geladen ..."</p> }
+                                            .into_any()
+                                    }
+                                    Boot::Broken(error) => {
+                                        view! {
+                                            <p class="sm-note sm-warn" role="alert">
+                                                {format!(
+                                                    "Ablage nicht verfügbar: {error}. Ohne IndexedDB (z. B. \
+                                                     privates Fenster) kann dieser Client keine Identität \
+                                                     halten.",
+                                                )}
+                                            </p>
+                                        }
+                                            .into_any()
+                                    }
+                                    Boot::Known(handle) => {
+                                        view! {
+                                            <section class="sm-card" aria-label="Anmelden">
+                                                <h2>
+                                                    {format!("Konto '{handle}' auf diesem Gerät gefunden")}
+                                                </h2>
+                                                <div class="sm-field">
+                                                    <label for="sm-pass">"Passwort"</label>
+                                                    <input
+                                                        id="sm-pass"
+                                                        type="password"
+                                                        prop:value=password_input
+                                                        on:input=move |ev| {
+                                                            set_password_input.set(event_target_value(&ev))
+                                                        }
+                                                    />
+                                                </div>
+                                                <div class="sm-row">
+                                                    <button
+                                                        type="button"
+                                                        class="sm-primary"
+                                                        on:click=on_login.clone()
+                                                        disabled=busy
+                                                    >
+                                                        "Anmelden"
+                                                    </button>
+                                                </div>
+                                            </section>
+                                        }
+                                            .into_any()
+                                    }
+                                    Boot::Fresh => {
+                                        view! {
+                                            <section class="sm-card" aria-label="Konto anlegen">
+                                                <h2>"Konto anlegen"</h2>
+                                                <p class="sm-status">
+                                                    "Registrierung, Anmeldung und Prekey-Veröffentlichung "
+                                                    "in einem Schritt."
+                                                </p>
+                                                <div class="sm-field">
+                                                    <label for="sm-handle">"Handle (a-z, 0-9, _ . -)"</label>
+                                                    <input
+                                                        id="sm-handle"
+                                                        prop:value=handle_input
+                                                        on:input=move |ev| {
+                                                            set_handle_input.set(event_target_value(&ev))
+                                                        }
+                                                    />
+                                                </div>
+                                                <div class="sm-field">
+                                                    <label for="sm-newpass">
+                                                        "Passwort (mindestens 12 Zeichen)"
+                                                    </label>
+                                                    <input
+                                                        id="sm-newpass"
+                                                        type="password"
+                                                        prop:value=password_input
+                                                        on:input=move |ev| {
+                                                            set_password_input.set(event_target_value(&ev))
+                                                        }
+                                                    />
+                                                </div>
+                                                <div class="sm-row">
+                                                    <button
+                                                        type="button"
+                                                        class="sm-primary"
+                                                        on:click=on_register.clone()
+                                                        disabled=busy
+                                                    >
+                                                        "Konto anlegen"
+                                                    </button>
+                                                </div>
+                                            </section>
+                                        }
+                                            .into_any()
+                                    }
+                                }
+                            }
+                            <p class="sm-status" role="status" aria-live="polite">{status}</p>
+                        </main>
+                    }
+                        .into_any()
+                }
+            }}
         </div>
     }
 }

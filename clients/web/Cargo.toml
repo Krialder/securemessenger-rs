@@ -52,5 +52,8 @@ indexed_db_futures = "0.6"
 gloo-net = { version = "0.7", features = ["websocket"] }
 # Der Flush und die Socket-Schleife laufen als spawn_local-Tasks.
 wasm-bindgen-futures = "0.4"
+# JsValue fuer den Date-Konstruktor (Zeitstempel je Nachricht -> lokale
+# Uhrzeit); Version wird mit js-sys/web-sys vereinheitlicht.
+wasm-bindgen = "0.2"
 # Stream/Sink-Adapter fuer den gloo-net-WebSocket (next/send).
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
