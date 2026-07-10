@@ -778,6 +778,69 @@ button:disabled {
   align-self: center;
 }
 
+/* Geräteverwaltung in der Seitenleiste: die Gerätemenge und das
+   Freischalt-Feld. Ruhig gehalten, damit sie den Chat nicht dominiert. */
+.sm-devices {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-2);
+  margin-block-start: var(--sm-space-2);
+}
+
+.sm-device-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-1);
+}
+
+.sm-device {
+  display: flex;
+  align-items: center;
+  gap: var(--sm-space-2);
+  font-size: 0.85rem;
+  color: var(--sm-on-surface);
+}
+
+.sm-device-num {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.sm-device-name {
+  flex: 1 1 auto;
+  overflow-wrap: anywhere;
+}
+
+.sm-device-own {
+  font-size: 0.75rem;
+  color: var(--sm-on-surface-variant);
+  white-space: nowrap;
+}
+
+/* Entfernen ist eine zerstörende Aktion, deshalb der Fehler-Ton statt der
+   ruhigen Sekundärfarbe; --sm-error ist gegen den Flächen-Grund im
+   Kontrast-Test verankert. Der Text (nicht nur die Farbe) trägt die
+   Bedeutung (SC 1.4.1). */
+.sm-device-revoke {
+  padding: 0;
+  border: none;
+  background: transparent;
+  font-size: 0.8rem;
+  color: var(--sm-error);
+  text-decoration: underline;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.sm-link-field span {
+  font-size: 0.8rem;
+  color: var(--sm-on-surface);
+}
+
 /* Melden-Aktion in der Empfangs-Blase: bewusst leise (Text-Knopf), damit
    sie den Verlauf nicht dominiert. Transparenter Hintergrund erbt die
    Blase, --sm-on-surface ist gegen beide Blasen im Kontrast-Test

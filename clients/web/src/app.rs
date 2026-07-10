@@ -33,6 +33,7 @@ use client_app::delivery::{
     parse_ws_event, ws_auth_frame, DeliveryClient, OutgoingEnvelope, WsEvent,
 };
 use client_app::directory::DirectoryClient;
+use client_app::identity::DeviceEnrollment;
 use client_app::kt::KtClient;
 use client_app::prekeys::{
     bundle_from_directory, device_id_from_u32, new_uuid, publication_from_bundle,
@@ -253,6 +254,25 @@ struct Profile {
 struct ContactDevice {
     server_device_id: String,
     protocol_device_id: u32,
+}
+
+/// Der Kopplungs-Antrag eines neuen Geräts, Format identisch zum CLI
+/// (`sm link` gibt genau diese Base64-Zeile aus): Geräte-ID und
+/// öffentlicher Geräteschlüssel. Der Web-Client als Erstgerät schaltet ihn
+/// mit `approve` frei.
+#[derive(Serialize, Deserialize)]
+struct LinkRequest {
+    device_id: String,
+    device_public_key: String,
+}
+
+/// Eine Zeile der Geräteverwaltung: was die Oberfläche je Gerät zeigt.
+#[derive(Clone)]
+struct DeviceRow {
+    id: String,
+    name: String,
+    protocol_device_id: u16,
+    is_own: bool,
 }
 
 /// Der lebende Client-Zustand hinter der Oberfläche. In einem
@@ -1124,6 +1144,72 @@ async fn kt_self_check(core: &Core, token: &str) -> Result<String, (bool, String
     }
 }
 
+/// Lädt die eigene Gerätemenge (`GET /devices`) und formt sie in
+/// Anzeige-Zeilen; das eigene Gerät wird über die Profil-Geräte-ID markiert.
+async fn load_device_rows(storage: &SharedStorage, token: &str) -> Result<Vec<DeviceRow>, String> {
+    let own_id = load_profile(storage)
+        .map(|p| p.device_id)
+        .unwrap_or_default();
+    let list = IdentityClient::new(identity_url())
+        .devices(token)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(list
+        .into_iter()
+        .map(|d| DeviceRow {
+            is_own: d.id == own_id,
+            name: d.name.unwrap_or_else(|| "Gerät".to_string()),
+            protocol_device_id: d.protocol_device_id,
+            id: d.id,
+        })
+        .collect())
+}
+
+/// Schaltet ein neues Gerät frei (`sm approve`-Gegenstück im Web): decodiert
+/// den Kopplungs-Antrag, signiert dessen Credential mit dem Konto-Wurzel-
+/// schlüssel aus dem Profil und ruft `add_device`. Ohne Wurzelschlüssel
+/// (ein gekoppeltes Zweitgerät wäre so eins) geht das nicht.
+async fn approve_device(
+    storage: &SharedStorage,
+    token: &str,
+    payload: &str,
+) -> Result<u16, String> {
+    let profile = load_profile(storage).ok_or("Kein Profil in der Ablage".to_string())?;
+    if profile.account_seed.is_empty() {
+        return Err(
+            "Dieses Gerät hat keinen Konto-Wurzelschlüssel; Freischalten nur auf dem Erstgerät."
+                .to_string(),
+        );
+    }
+    let seed: [u8; 32] = BASE64
+        .decode(&profile.account_seed)
+        .map_err(|e| format!("Konto-Seed unlesbar: {e}"))?
+        .try_into()
+        .map_err(|_| "Konto-Seed hat die falsche Länge".to_string())?;
+    let account_key = IdentityKeypair::from_seed(&seed);
+    let request: LinkRequest = serde_json::from_slice(
+        &BASE64
+            .decode(payload.trim())
+            .map_err(|_| "Antrag ist kein Base64".to_string())?,
+    )
+    .map_err(|e| format!("Antrag unlesbar: {e}"))?;
+    let outcome = IdentityClient::new(identity_url())
+        .add_device(
+            token,
+            &DeviceEnrollment {
+                account_key: &account_key,
+                handle: &profile.handle,
+                device_public_key: &request.device_public_key,
+                device_id: &request.device_id,
+                name: None,
+                not_after: now_unix() + CREDENTIAL_TTL_SECONDS,
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(outcome.protocol_device_id)
+}
+
 /// Startzustand der Oberfläche, Ergebnis der Ablage-Hydration.
 #[derive(Clone, PartialEq)]
 enum Boot {
@@ -1190,6 +1276,11 @@ fn App() -> impl IntoView {
     // die Liste nach dem Chat-Öffnen vom Dienst geladen ist; der Knopf
     // erscheint erst dann, damit er nie den falschen Zustand anbietet.
     let (blocked, set_blocked) = signal(Option::<bool>::None);
+    // Geräteverwaltung: ob das Panel offen ist, die geladene Gerätemenge
+    // und der eingefügte Kopplungs-Antrag eines neuen Geräts.
+    let (devices_open, set_devices_open) = signal(false);
+    let (device_rows, set_device_rows) = signal(Vec::<DeviceRow>::new());
+    let (link_input, set_link_input) = signal(String::new());
     // Maschinen-Benachrichtigungen vom integrations-Dienst, getrennt vom
     // Krypto-Status und vom E2E-Chat (design-system.md, Status-Trennung).
     let (notifications, set_notifications) = signal(Vec::<String>::new());
@@ -1915,6 +2006,96 @@ fn App() -> impl IntoView {
         }
     };
 
+    // Geteilter Nachlade-Ablauf der Gerätemenge, von mehreren Handlern
+    // genutzt (Öffnen, Freischalten, Entfernen).
+    let refresh_devices = {
+        let current_storage = current_storage.clone();
+        SendWrapper::new(Rc::new(move || {
+            let Some(storage) = current_storage() else {
+                return;
+            };
+            spawn_local(async move {
+                match load_device_rows(&storage, &access_token.get_untracked()).await {
+                    Ok(rows) => set_device_rows.set(rows),
+                    Err(error) => set_status.set(format!("Geräte laden: {error}")),
+                }
+            });
+        }))
+    };
+
+    // Geräte-Panel auf/zu; beim Öffnen die Menge frisch laden.
+    let on_devices_toggle = {
+        let refresh_devices = refresh_devices.clone();
+        move |_| {
+            let open = !devices_open.get_untracked();
+            set_devices_open.set(open);
+            if open {
+                refresh_devices();
+            }
+        }
+    };
+
+    // Ein neues Gerät freischalten (Web als Erstgerät).
+    let on_approve = {
+        let current_storage = current_storage.clone();
+        let refresh_devices = refresh_devices.clone();
+        move |_| {
+            if busy.get_untracked() {
+                return;
+            }
+            let payload = link_input.get_untracked();
+            if payload.trim().is_empty() {
+                set_status.set("Kopplungs-Antrag des neuen Geräts einfügen.".to_string());
+                return;
+            }
+            let Some(storage) = current_storage() else {
+                set_status.set("Nicht angemeldet.".to_string());
+                return;
+            };
+            set_busy.set(true);
+            let refresh_devices = refresh_devices.clone();
+            spawn_local(async move {
+                match approve_device(&storage, &access_token.get_untracked(), &payload).await {
+                    Ok(number) => {
+                        set_link_input.set(String::new());
+                        set_status.set(format!(
+                            "Gerät freigeschaltet als Nummer {number}. Auf dem neuen Gerät abschließen."
+                        ));
+                        refresh_devices();
+                    }
+                    Err(error) => set_status.set(format!("Freischalten: {error}")),
+                }
+                set_busy.set(false);
+            });
+        }
+    };
+
+    // Ein Gerät entfernen (Revocation). Nimmt die Geräte-ID; das eigene
+    // Gerät bietet die Oberfläche gar nicht zum Entfernen an.
+    let on_revoke = {
+        let refresh_devices = refresh_devices.clone();
+        SendWrapper::new(Rc::new(move |device_id: String| {
+            if busy.get_untracked() {
+                return;
+            }
+            set_busy.set(true);
+            let refresh_devices = refresh_devices.clone();
+            spawn_local(async move {
+                let result = IdentityClient::new(identity_url())
+                    .remove_device(&access_token.get_untracked(), &device_id)
+                    .await;
+                match result {
+                    Ok(()) => {
+                        set_status.set("Gerät entfernt.".to_string());
+                        refresh_devices();
+                    }
+                    Err(error) => set_status.set(format!("Entfernen: {error}")),
+                }
+                set_busy.set(false);
+            });
+        }))
+    };
+
     view! {
         <div class="sm-app" class=("has-selection", move || selected.get().is_some())>
             <header class="sm-header" role="banner">
@@ -2121,6 +2302,104 @@ fn App() -> impl IntoView {
                                                 }
                                             })
                                     }}
+                                    <button
+                                        type="button"
+                                        class="sm-secondary"
+                                        on:click=on_devices_toggle.clone()
+                                        aria-expanded=move || devices_open.get().to_string()
+                                    >
+                                        {move || {
+                                            if devices_open.get() {
+                                                "Geräte ausblenden"
+                                            } else {
+                                                "Geräte verwalten"
+                                            }
+                                        }}
+                                    </button>
+                                    {
+                                        let on_revoke_outer = on_revoke.clone();
+                                        let on_approve_outer = on_approve.clone();
+                                        move || {
+                                            let on_revoke = on_revoke_outer.clone();
+                                            let on_approve = on_approve_outer.clone();
+                                            devices_open
+                                                .get()
+                                                .then(move || {
+                                                    view! {
+                                                        <div
+                                                            class="sm-devices"
+                                                            role="group"
+                                                            aria-label="Geräte des Kontos"
+                                                        >
+                                                            <ul class="sm-device-list">
+                                                                {move || {
+                                                                    let on_revoke = on_revoke.clone();
+                                                                    device_rows
+                                                                        .get()
+                                                                        .into_iter()
+                                                                        .map(|d| {
+                                                                            let revoke = on_revoke.clone();
+                                                                            let id = d.id.clone();
+                                                                            view! {
+                                                                                <li class="sm-device">
+                                                                                    <span class="sm-device-num">
+                                                                                        {format!("Nr. {}", d.protocol_device_id)}
+                                                                                    </span>
+                                                                                    <span class="sm-device-name">
+                                                                                        {d.name.clone()}
+                                                                                    </span>
+                                                                                    {if d.is_own {
+                                                                                        view! {
+                                                                                            <span class="sm-device-own">
+                                                                                                "dieses Gerät"
+                                                                                            </span>
+                                                                                        }
+                                                                                            .into_any()
+                                                                                    } else {
+                                                                                        view! {
+                                                                                            <button
+                                                                                                type="button"
+                                                                                                class="sm-device-revoke"
+                                                                                                on:click=move |_| revoke(id.clone())
+                                                                                                disabled=busy
+                                                                                            >
+                                                                                                "Entfernen"
+                                                                                            </button>
+                                                                                        }
+                                                                                            .into_any()
+                                                                                    }}
+                                                                                </li>
+                                                                            }
+                                                                        })
+                                                                        .collect_view()
+                                                                }}
+                                                            </ul>
+                                                            <label class="sm-field sm-link-field">
+                                                                <span>
+                                                                    "Neues Gerät koppeln: Antrag aus 'sm link' einfügen"
+                                                                </span>
+                                                                <textarea
+                                                                    class="sm-composer-input"
+                                                                    rows="2"
+                                                                    prop:value=link_input
+                                                                    on:input=move |ev| {
+                                                                        set_link_input.set(event_target_value(&ev))
+                                                                    }
+                                                                ></textarea>
+                                                            </label>
+                                                            <button
+                                                                type="button"
+                                                                class="sm-secondary"
+                                                                on:click=on_approve
+                                                                disabled=busy
+                                                            >
+                                                                "Freischalten"
+                                                            </button>
+                                                        </div>
+                                                    }
+                                                })
+                                        }
+                                    }
                                     <p class="sm-caution">
                                         "Geräte-Identität, Sitzungen und Kontakte liegen mit dem "
                                         "Passwort verschlüsselt in IndexedDB (Argon2id plus "
