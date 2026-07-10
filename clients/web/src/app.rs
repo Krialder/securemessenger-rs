@@ -43,8 +43,9 @@ use client_app::storage::KeyValueStorage as _;
 use client_app::{wire, ClientError, IdentityClient, NewAccount};
 use client_core::libsignal_protocol::{IdentityKeyPair, ProtocolAddress};
 use client_core::onetoone::Device;
+use futures_util::future::{select, Either};
 use futures_util::{SinkExt as _, StreamExt as _};
-use gloo_net::websocket::{futures::WebSocket, Message as WsMessage};
+use gloo_net::websocket::{futures::WebSocket, Message as WsMessage, WebSocketError};
 use gloo_timers::future::sleep;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -257,8 +258,18 @@ struct ContactDevice {
 struct Core {
     device: WebDevice,
     handle: String,
-    token: String,
     storage: SharedStorage,
+}
+
+/// Was eine erfolgreiche An- oder Neuanmeldung liefert: das Gerät und das
+/// frische Token-Paar samt Laufzeit. Der Zugriffstoken wandert in ein
+/// app-weites Signal (damit WS-Kanal und Anfragen immer den aktuellen
+/// nutzen), der Refresh-Token in die Rotation.
+struct Onboarded {
+    core: Core,
+    access_token: String,
+    refresh_token: String,
+    expires_in: u64,
 }
 
 type SharedCore = SendWrapper<Rc<RefCell<Option<Core>>>>;
@@ -360,7 +371,11 @@ fn save_counter(storage: &SharedStorage, next_prekey_id: u32) -> Result<(), Stri
 /// veröffentlichen, Profil und Zähler verankern. Ein Schritt aus
 /// Nutzersicht, weil ein frisch angelegtes Konto ohne veröffentlichte
 /// Prekeys nicht erreichbar wäre.
-async fn onboard(storage: SharedStorage, handle: String, password: String) -> Result<Core, String> {
+async fn onboard(
+    storage: SharedStorage,
+    handle: String,
+    password: String,
+) -> Result<Onboarded, String> {
     // Ab dem ersten Schreibvorgang verschlüsseln: bei der Registrierung
     // steht das Passwort durch die eigene Wahl fest, es gibt keine
     // vorhandenen Daten, die ein falsches Passwort gefährden könnte.
@@ -420,11 +435,15 @@ async fn onboard(storage: SharedStorage, handle: String, password: String) -> Re
         },
     )?;
 
-    Ok(Core {
-        device,
-        handle,
-        token: session.access_token,
-        storage,
+    Ok(Onboarded {
+        core: Core {
+            device,
+            handle,
+            storage,
+        },
+        access_token: session.access_token,
+        refresh_token: session.refresh_token,
+        expires_in: session.expires_in,
     })
 }
 
@@ -432,7 +451,7 @@ async fn onboard(storage: SharedStorage, handle: String, password: String) -> Re
 /// Geräte-Identität und alle Sitzungen liegen schon im Protokoll-Store;
 /// nur das Passwort muss der Nutzer neu eingeben (Tokens werden bewusst
 /// nicht persistiert, siehe Modulkopf).
-async fn login(storage: SharedStorage, password: String) -> Result<Core, String> {
+async fn login(storage: SharedStorage, password: String) -> Result<Onboarded, String> {
     // Eine verschlüsselte Ablage zuerst entsperren; ein falsches Passwort
     // scheitert hier, noch vor dem Server. Bei Klartext oder frisch ist das
     // ein No-op.
@@ -457,19 +476,104 @@ async fn login(storage: SharedStorage, password: String) -> Result<Core, String>
         next_prekey_id,
     )
     .map_err(|e| e.to_string())?;
-    Ok(Core {
-        device,
-        handle: profile.handle,
-        token: session.access_token,
-        storage,
+    Ok(Onboarded {
+        core: Core {
+            device,
+            handle: profile.handle,
+            storage,
+        },
+        access_token: session.access_token,
+        refresh_token: session.refresh_token,
+        expires_in: session.expires_in,
     })
+}
+
+/// Wartezeit bis zur nächsten Erneuerung: 60 s vor dem Ablauf, aber nie
+/// länger als die halbe Laufzeit (sonst wäre ein kurzes Entwicklungs-Token
+/// schon vor der ersten Erneuerung tot) und mindestens 1 s gegen eine enge
+/// Schleife bei absurden Laufzeiten.
+fn refresh_wait(expires_in: u64) -> u64 {
+    expires_in.saturating_sub(60).max(expires_in / 2).max(1)
+}
+
+/// Erneuert das Zugriffstoken vor dem Ablauf und rotiert dabei den
+/// Refresh-Token, damit lange Sitzungen nicht nach 15 Minuten stillstehen.
+/// Läuft als eigene Schleife: schlafen bis kurz vor Ablauf, erneuern, das
+/// app-weite Token-Signal aktualisieren (WS-Kanal und Anfragen lesen es),
+/// wiederholen. Die Token-Epoche beendet die Schleife bei Abmeldung oder
+/// Konto-Wechsel. Fehler beim Erneuern sind nach Art getrennt: einen
+/// Transportfehler (Netz weg, Standby, Dienst kurz nicht da) wiederholt die
+/// Schleife mit Backoff, der Refresh-Token gilt ja weiter und die Sitzung
+/// heilt nach der Netz-Rückkehr von selbst; ein 401 (Session widerrufen
+/// oder Reuse erkannt) ist endgültig, dann endet die Schleife mit
+/// sichtbarer Meldung statt still, damit die Neuanmeldung nicht erst am
+/// nächsten gescheiterten Senden auffällt.
+fn start_token_refresh(
+    epoch: StoredValue<u64>,
+    my_epoch: u64,
+    refresh_token: StoredValue<String>,
+    set_token: WriteSignal<String>,
+    set_status: WriteSignal<String>,
+    expires_in: u64,
+) {
+    spawn_local(async move {
+        let mut wait = refresh_wait(expires_in);
+        let mut backoff = 1u64;
+        loop {
+            sleep(Duration::from_secs(wait)).await;
+            if epoch.get_value() != my_epoch {
+                return;
+            }
+            let current = refresh_token.get_value();
+            match IdentityClient::new(identity_url()).refresh(&current).await {
+                Ok(session) => {
+                    if epoch.get_value() != my_epoch {
+                        // Abmeldung während des Roundtrips: der Logout hat
+                        // das ALTE Token widerrufen, das der Server beim
+                        // Rotieren aber schon entwertet hatte (No-op). Das
+                        // frische Paar darf die Abmeldung nicht überleben,
+                        // deshalb hier widerrufen statt es nur zu verwerfen.
+                        let _ = IdentityClient::new(identity_url())
+                            .logout(&session.access_token)
+                            .await;
+                        return;
+                    }
+                    set_token.set(session.access_token);
+                    refresh_token.set_value(session.refresh_token);
+                    wait = refresh_wait(session.expires_in);
+                    backoff = 1;
+                }
+                // 401: der Dienst kennt den Refresh-Token nicht mehr
+                // (widerrufen oder Reuse erkannt). Endgültig; 5xx und
+                // andere Status fallen bewusst in den Wiederholungs-Arm,
+                // ein kurzer Datenbank-Ausfall darf die Sitzung nicht
+                // beenden.
+                Err(ClientError::Api { status: 401, .. }) => {
+                    set_status.set(
+                        "Sitzung abgelaufen: Erneuerung abgelehnt, bitte neu anmelden.".to_string(),
+                    );
+                    return;
+                }
+                Err(_) => {
+                    wait = backoff;
+                    backoff = (backoff * 2).min(30);
+                }
+            }
+        }
+    });
 }
 
 /// Sendet eine Nachricht; baut beim ersten Kontakt die PQXDH-Sitzungen aus
 /// den Verzeichnis-Bündeln auf und merkt sich die Geräte des Kontakts in
 /// der Ablage (gleicher Fluss und gleiches Format wie im CLI).
+///
+/// Nimmt das Token als Signal statt als Wert: zwischen Bündel-Abruf und
+/// Zustellung kann die Erneuerung rotieren, und der Dienst entwertet das
+/// alte Token dabei sofort. Jeder Request liest deshalb unmittelbar vorher
+/// den aktuellen Stand.
 async fn send_message(
     core: &mut Core,
+    token: ReadSignal<String>,
     peer: &str,
     text: &str,
     expires_at: Option<u64>,
@@ -488,7 +592,7 @@ async fn send_message(
     };
     let devices = if known.is_empty() {
         let bundles = DirectoryClient::new(directory_url())
-            .bundles(&core.token, peer)
+            .bundles(&token.get_untracked(), peer)
             .await
             .map_err(|e| e.to_string())?;
         if bundles.devices.is_empty() {
@@ -549,18 +653,23 @@ async fn send_message(
         });
     }
     DeliveryClient::new(delivery_url())
-        .submit(&core.token, &envelopes)
+        .submit(&token.get_untracked(), &envelopes)
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
 }
 
 /// Holt wartende Hüllen ab, entschlüsselt und bestätigt sie; liefert
-/// (Absender, Klartext) je Nachricht.
-async fn fetch_messages(core: &mut Core) -> Result<Vec<(String, String)>, String> {
+/// (Absender, Klartext) je Nachricht. Token als Signal aus demselben Grund
+/// wie bei `send_message`: zwischen fetch und ack liegt die Entschlüsselung,
+/// in der die Erneuerung rotieren kann.
+async fn fetch_messages(
+    core: &mut Core,
+    token: ReadSignal<String>,
+) -> Result<Vec<(String, String)>, String> {
     let delivery = DeliveryClient::new(delivery_url());
     let waiting = delivery
-        .fetch(&core.token)
+        .fetch(&token.get_untracked())
         .await
         .map_err(|e| e.to_string())?;
     let mut received = Vec::new();
@@ -598,10 +707,17 @@ async fn fetch_messages(core: &mut Core) -> Result<Vec<(String, String)>, String
         }
     }
     if !acked.is_empty() {
-        delivery
-            .ack(&core.token, &acked)
-            .await
-            .map_err(|e| e.to_string())?;
+        // Ein Fehler beim Bestätigen darf die Nachrichten nicht verwerfen:
+        // die Entschlüsselung hat den Ratchet schon fortgeschaltet, beim
+        // nächsten Abruf wären dieselben Hüllen unlesbar und die Inhalte
+        // endgültig verloren. Also nur warnen; die unbestätigten Hüllen
+        // räumt der nächste Abruf über den Unlesbar-Pfad oben ab.
+        if let Err(error) = delivery.ack(&token.get_untracked(), &acked).await {
+            leptos::logging::warn!(
+                "Bestätigen von {} Hüllen fehlgeschlagen: {error}",
+                acked.len()
+            );
+        }
     }
     Ok(received)
 }
@@ -620,7 +736,7 @@ async fn fetch_messages(core: &mut Core) -> Result<Vec<(String, String)>, String
 /// mit altem Token weiterläuft (sonst gäbe es nach dem Konto-Wechsel zwei
 /// konkurrierende Schleifen).
 fn start_hint_channel(
-    token: String,
+    token: ReadSignal<String>,
     epoch: StoredValue<u64>,
     my_epoch: u64,
     set_hints: WriteSignal<u64>,
@@ -633,6 +749,12 @@ fn start_hint_channel(
         // zurück auf 1s, gedeckelt bei 30s, damit ein toter Server nicht
         // dauerhaft angehämmert wird.
         let mut backoff = 1u64;
+        // Aufeinanderfolgende Auth-Abweisungen (Server-Close 4401). Eine
+        // einzelne kann ein harmloses Rennen mit der Token-Erneuerung sein
+        // (der Reconnect las das Signal, bevor die Rotation es fortschrieb),
+        // die zweite in Folge heißt: das Token ist wirklich tot, weiter zu
+        // hämmern wäre sinnlos.
+        let mut auth_rejected = 0u32;
         loop {
             if epoch.get_value() != my_epoch {
                 return;
@@ -649,7 +771,10 @@ fn start_hint_channel(
                     continue;
                 }
             };
-            if let Err(error) = socket.send(WsMessage::Text(ws_auth_frame(&token))).await {
+            // Das jeweils aktuelle Token lesen: nach einer Token-Erneuerung
+            // (start_token_refresh) verbindet ein Reconnect mit dem frischen.
+            let auth = ws_auth_frame(&token.get_untracked());
+            if let Err(error) = socket.send(WsMessage::Text(auth)).await {
                 set_connected.set(false);
                 set_status.set(format!("Echtzeit-Kanal: Auth nicht gesendet: {error}"));
                 sleep(Duration::from_secs(backoff)).await;
@@ -663,22 +788,64 @@ fn start_hint_channel(
             set_status.set(String::new());
             backoff = 1;
             set_hints.update(|n| *n += 1);
-            while let Some(frame) = socket.next().await {
+            loop {
+                // Höchstens 5 s auf das nächste Frame warten: ein stiller,
+                // offener Socket würde sonst unbegrenzt parken und der
+                // Epochen-Check nie laufen. Die Abmeldung könnte den Kanal
+                // dann nicht beenden, das Gerät bliebe serverseitig als
+                // online gemeldet und nach einer Neuanmeldung liefen zwei
+                // Kanäle parallel.
+                let frame = match select(socket.next(), sleep(Duration::from_secs(5))).await {
+                    Either::Left((frame, _)) => frame,
+                    Either::Right(((), _)) => {
+                        if epoch.get_value() != my_epoch {
+                            // Der Socket fällt hier aus dem Scope und wird
+                            // damit geschlossen.
+                            return;
+                        }
+                        // Verbindung lebt seit 5 s: die Auth war gültig.
+                        auth_rejected = 0;
+                        continue;
+                    }
+                };
+                let Some(frame) = frame else {
+                    // Stream zu Ende: neu verbinden (äußere Schleife).
+                    break;
+                };
                 if epoch.get_value() != my_epoch {
                     return;
                 }
                 match frame {
-                    Ok(WsMessage::Text(text)) => match parse_ws_event(&text) {
-                        Some(WsEvent::MessageWaiting) => set_hints.update(|n| *n += 1),
-                        Some(WsEvent::Notification { tenant, title }) => {
-                            set_notifications
-                                .update(|list| list.push(format!("{tenant}: {title}")));
+                    Ok(WsMessage::Text(text)) => {
+                        auth_rejected = 0;
+                        match parse_ws_event(&text) {
+                            Some(WsEvent::MessageWaiting) => set_hints.update(|n| *n += 1),
+                            Some(WsEvent::Notification { tenant, title }) => {
+                                set_notifications
+                                    .update(|list| list.push(format!("{tenant}: {title}")));
+                            }
+                            // Unbekannte und unlesbare Frames bewusst still:
+                            // neue Server-Events dürfen alte Clients nicht
+                            // stören.
+                            Some(WsEvent::Other { .. }) | None => {}
                         }
-                        // Unbekannte und unlesbare Frames bewusst still: neue
-                        // Server-Events dürfen alte Clients nicht stören.
-                        Some(WsEvent::Other { .. }) | None => {}
-                    },
+                    }
                     Ok(WsMessage::Bytes(_)) => {}
+                    // Der Dienst hat die Auth abgewiesen (eigener Close-Code
+                    // 4401, siehe delivery). Beim zweiten Mal in Folge ist
+                    // das Token endgültig tot: sichtbar machen und aufhören,
+                    // statt alle 30 s mit demselben toten Token anzuklopfen.
+                    Err(WebSocketError::ConnectionClose(event)) if event.code == 4401 => {
+                        auth_rejected += 1;
+                        if auth_rejected >= 2 {
+                            set_connected.set(false);
+                            set_status.set(
+                                "Echtzeit-Kanal: Sitzung ungültig, bitte neu anmelden.".to_string(),
+                            );
+                            return;
+                        }
+                        break;
+                    }
                     // Fehler: innere Schleife verlassen und neu verbinden.
                     Err(_) => break,
                 }
@@ -701,7 +868,7 @@ fn start_hint_channel(
 /// Beweis gegen die signierte Wurzel verifizieren. Alarm (`true` im
 /// Fehler-Tupel) und gewöhnlicher Fehler werden getrennt gemeldet, weil
 /// nur ersterer ein Sicherheitssignal ist; ein kt-Ausfall ist keiner.
-async fn kt_self_check(core: &Core) -> Result<String, (bool, String)> {
+async fn kt_self_check(core: &Core, token: &str) -> Result<String, (bool, String)> {
     let profile =
         load_profile(&core.storage).ok_or((false, "Kein Profil in der Ablage".to_string()))?;
     let seed: [u8; 32] = BASE64
@@ -711,7 +878,7 @@ async fn kt_self_check(core: &Core) -> Result<String, (bool, String)> {
         .map_err(|_| (false, "Konto-Seed hat die falsche Länge".to_string()))?;
     let account = IdentityKeypair::from_seed(&seed);
     let devices = IdentityClient::new(identity_url())
-        .devices(&core.token)
+        .devices(token)
         .await
         .map_err(|e| (false, format!("Gerätemenge nicht abrufbar: {e}")))?;
     match KtClient::new(kt_url())
@@ -796,6 +963,15 @@ fn App() -> impl IntoView {
     // veraltet ist (siehe start_hint_channel).
     let channel_epoch = StoredValue::new(0u64);
 
+    // Das Zugriffstoken der Sitzung als Signal, damit alle Abläufe (Senden,
+    // Abholen, KT-Prüfung, Reconnect des Hinweiskanals) beim Zugriff das
+    // jeweils aktuelle Token lesen; die Token-Erneuerung schreibt es fort.
+    // Das Refresh-Token liegt daneben (nicht reaktiv, es steuert keine
+    // Anzeige), die Epoche beendet die Erneuerungsschleife bei Abmeldung.
+    let (access_token, set_access_token) = signal(String::new());
+    let refresh_token = StoredValue::new(String::new());
+    let token_epoch = StoredValue::new(0u64);
+
     // Die Ablage des aktiven Cores, für die synchronen Listen-Handler
     // (Auswahl, Neuer Chat) außerhalb der async-Abläufe.
     let current_storage = {
@@ -857,10 +1033,29 @@ fn App() -> impl IntoView {
             let core = core.clone();
             spawn_local(async move {
                 match onboard(storage, handle.clone(), password).await {
-                    Ok(new_core) => {
+                    Ok(onboarded) => {
+                        let Onboarded {
+                            core: new_core,
+                            access_token: at,
+                            refresh_token: rt,
+                            expires_in,
+                        } = onboarded;
+                        // Token in die App-Signale übernehmen und die
+                        // Erneuerung starten, bevor der Core aktiv wird.
+                        set_access_token.set(at);
+                        refresh_token.set_value(rt);
+                        token_epoch.update_value(|e| *e += 1);
+                        start_token_refresh(
+                            token_epoch,
+                            token_epoch.get_value(),
+                            refresh_token,
+                            set_access_token,
+                            set_status,
+                            expires_in,
+                        );
                         channel_epoch.update_value(|e| *e += 1);
                         start_hint_channel(
-                            new_core.token.clone(),
+                            access_token,
                             channel_epoch,
                             channel_epoch.get_value(),
                             set_hints,
@@ -903,10 +1098,27 @@ fn App() -> impl IntoView {
             let core = core.clone();
             spawn_local(async move {
                 match login(storage, password).await {
-                    Ok(new_core) => {
+                    Ok(onboarded) => {
+                        let Onboarded {
+                            core: new_core,
+                            access_token: at,
+                            refresh_token: rt,
+                            expires_in,
+                        } = onboarded;
+                        set_access_token.set(at);
+                        refresh_token.set_value(rt);
+                        token_epoch.update_value(|e| *e += 1);
+                        start_token_refresh(
+                            token_epoch,
+                            token_epoch.get_value(),
+                            refresh_token,
+                            set_access_token,
+                            set_status,
+                            expires_in,
+                        );
                         channel_epoch.update_value(|e| *e += 1);
                         start_hint_channel(
-                            new_core.token.clone(),
+                            access_token,
                             channel_epoch,
                             channel_epoch.get_value(),
                             set_hints,
@@ -939,13 +1151,17 @@ fn App() -> impl IntoView {
         let core = core.clone();
         let boot_storage = boot_storage.clone();
         move |_| {
-            // Die Kanal-Schleife veralten lassen (kein toter Kanal mit
-            // altem Token) und den Verbindungszustand zurücksetzen.
+            // Die Kanal-Schleife und die Token-Erneuerung veralten lassen
+            // (kein toter Kanal mit altem Token, keine Erneuerung nach der
+            // Abmeldung) und den Verbindungszustand zurücksetzen.
             channel_epoch.update_value(|e| *e += 1);
+            token_epoch.update_value(|e| *e += 1);
             set_connected.set(false);
+            let token = access_token.get_untracked();
+            set_access_token.set(String::new());
+            refresh_token.set_value(String::new());
             if let Some(active) = core.borrow_mut().take() {
                 let handle = active.handle.clone();
-                let token = active.token.clone();
                 *boot_storage.borrow_mut() = Some(active.storage.clone());
                 // Best effort: das Token beim Dienst widerrufen. Ein Fehler
                 // hier ist unkritisch, lokal ist die Session schon beendet.
@@ -1001,7 +1217,8 @@ fn App() -> impl IntoView {
                     Some(mut active) => {
                         let storage = active.storage.clone();
                         let who = active.handle.clone();
-                        let result = send_message(&mut active, &peer, &text, expires_at).await;
+                        let result =
+                            send_message(&mut active, access_token, &peer, &text, expires_at).await;
                         *core.borrow_mut() = Some(active);
                         match result {
                             Ok(()) => {
@@ -1065,7 +1282,7 @@ fn App() -> impl IntoView {
                 match taken {
                     Some(mut active) => {
                         let storage = active.storage.clone();
-                        let result = fetch_messages(&mut active).await;
+                        let result = fetch_messages(&mut active, access_token).await;
                         *core.borrow_mut() = Some(active);
                         match result {
                             Ok(received) if received.is_empty() => {
@@ -1260,7 +1477,8 @@ fn App() -> impl IntoView {
                 let taken = core.borrow_mut().take();
                 match taken {
                     Some(active) => {
-                        let result = kt_self_check(&active).await;
+                        let token = access_token.get_untracked();
+                        let result = kt_self_check(&active, &token).await;
                         *core.borrow_mut() = Some(active);
                         match result {
                             Ok(message) => {

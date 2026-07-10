@@ -7,6 +7,65 @@ use identity::api::{app, AppState};
 use identity::pg;
 use identity::session::SessionConfig;
 
+/// Obergrenze fuer beide Token-Laufzeiten: 10 Jahre. Faengt die klassische
+/// Millisekunden-Verwechslung (30 Tage als 2592000000 waeren 82 Jahre) und
+/// bleibt weit unter dem Punkt, an dem die Unix-Sekunden-Arithmetik der
+/// Ablage kippen koennte.
+const TTL_MAX_SECS: u64 = 10 * 365 * 24 * 60 * 60;
+
+/// Liest eine Token-Laufzeit aus der Umgebung. Fehlt die Variable (oder ist
+/// sie leer), gilt die Vorgabe; ist sie gesetzt, aber kein brauchbarer Wert
+/// (unparsbar, 0, jenseits von zehn Jahren), bricht der Start ab. Der
+/// Unterschied ist Absicht: eine fehlende Variable ist der Normalfall, ein
+/// gesetzter-aber-kaputter Wert ist eine Fehlkonfiguration, und ein Dienst,
+/// der sie still verwirft, liefe mit anderen Laufzeiten als der Betreiber
+/// glaubt (etwa 30 Tage Refresh statt der beabsichtigten Verkuerzung).
+/// Gleiches Muster wie bei den uebrigen Pflicht-Secrets in dieser Datei.
+fn ttl_from_env(name: &str, default: std::time::Duration) -> std::time::Duration {
+    let Ok(raw) = std::env::var(name) else {
+        return default;
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return default;
+    }
+    let secs: u64 = raw
+        .parse()
+        .unwrap_or_else(|_| panic!("{name} ist keine Ganzzahl in Sekunden: '{raw}'"));
+    assert!(secs > 0, "{name} muss groesser als 0 sein");
+    assert!(
+        secs <= TTL_MAX_SECS,
+        "{name} ist groesser als 10 Jahre ({secs} s); Sekunden statt Millisekunden angeben"
+    );
+    std::time::Duration::from_secs(secs)
+}
+
+/// Token-Laufzeiten aus der Umgebung, sonst die Vorgaben (15 min Access,
+/// 30 Tage Refresh). ACCESS_TTL_SECS und REFRESH_TTL_SECS erlauben einer
+/// Betriebsumgebung eine andere Wahl, ohne dass ein Client dafuer gebaut
+/// werden muss; in der Entwicklung macht ein kurzer Access-Wert die
+/// Token-Erneuerung des Clients binnen Sekunden statt Minuten pruefbar.
+fn session_config_from_env() -> SessionConfig {
+    let default = SessionConfig::default();
+    let config = SessionConfig {
+        access_ttl: ttl_from_env("ACCESS_TTL_SECS", default.access_ttl),
+        refresh_ttl: ttl_from_env("REFRESH_TTL_SECS", default.refresh_ttl),
+    };
+    if config.access_ttl != default.access_ttl {
+        tracing::info!(
+            access_ttl_secs = config.access_ttl.as_secs(),
+            "Access-Token-Laufzeit aus Umgebung"
+        );
+    }
+    if config.refresh_ttl != default.refresh_ttl {
+        tracing::info!(
+            refresh_ttl_secs = config.refresh_ttl.as_secs(),
+            "Refresh-Token-Laufzeit aus Umgebung"
+        );
+    }
+    config
+}
+
 #[tokio::main]
 async fn main() {
     telemetry::init();
@@ -21,7 +80,7 @@ async fn main() {
             let pool = pg::connect_and_migrate(url)
                 .await
                 .expect("PostgreSQL erreichbar und migrierbar");
-            let session_config = SessionConfig::default();
+            let session_config = session_config_from_env();
             tracing::info!("Persistenz: PostgreSQL");
             AppState::with_stores(
                 Arc::new(pg::PgAccountStore::new(pool.clone())),
@@ -31,7 +90,11 @@ async fn main() {
         }
         None => {
             tracing::warn!("DATABASE_URL nicht gesetzt, Daten nur im Prozessspeicher");
-            AppState::new_in_memory()
+            // Die TTL-Variablen gelten auch hier: gerade der Modus ohne
+            // Datenbank ist der Entwicklungsfall, fuer den ein kurzer
+            // Access-Wert gedacht ist; ein Knopf, der je nach Persistenz
+            // still ins Leere griffe, wuerde Fehlkonfiguration verschleiern.
+            AppState::with_session_config(session_config_from_env())
         }
     };
 
