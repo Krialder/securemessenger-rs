@@ -275,6 +275,21 @@ struct DeviceRow {
     is_own: bool,
 }
 
+/// Was ein Abruf je Hülle liefert: eine gewöhnliche eingehende Nachricht
+/// oder eine Self-Sync-Kopie einer selbst (auf einem anderen Gerät)
+/// gesendeten Nachricht, die als ausgehend in den Verlauf gehört.
+enum Incoming {
+    Message {
+        from: String,
+        text: String,
+        report_id: Option<String>,
+    },
+    Synced {
+        peer: String,
+        text: String,
+    },
+}
+
 /// Der lebende Client-Zustand hinter der Oberfläche. In einem
 /// `Rc<RefCell<...>>`, weil das Gerät nicht klonbar ist und die
 /// Leptos-Handler es teilen; der `busy`-Riegel in der UI verhindert, dass
@@ -494,6 +509,10 @@ async fn login(storage: SharedStorage, password: String) -> Result<Onboarded, St
     // (Migration einer alten Klartext-Ablage) verschlüsseln; bei einer schon
     // entsperrten gesealten Ablage ist das ein No-op.
     storage.borrow_mut().adopt_passphrase(&password);
+    // Den Self-Sync-Cache leeren: ein seit der letzten Anmeldung von einem
+    // anderen Gerät gekoppeltes (oder entferntes) Gerät wird so beim nächsten
+    // Senden neu aufgelöst.
+    let _ = storage.borrow_mut().remove("sync/own_devices");
     let next_prekey_id = load_counter(&storage)?;
     let device = Device::with_store(
         &profile.handle,
@@ -702,6 +721,14 @@ async fn send_message(
             expires_at,
         });
     }
+    // Self-Sync: dieselbe Nachricht als Kopie an die eigenen Zweitgeräte,
+    // damit der gesendete Text auch dort im Verlauf steht. Best effort:
+    // scheitert das, ist die Nachricht beim Empfänger trotzdem raus.
+    match build_sync_envelopes(core, token, certificate.as_deref(), peer, text, expires_at).await {
+        Ok(mut sync) => envelopes.append(&mut sync),
+        Err(error) => leptos::logging::warn!("Self-Sync übersprungen: {error}"),
+    }
+
     let delivery = DeliveryClient::new(delivery_url());
     if sealed {
         delivery
@@ -715,6 +742,104 @@ async fn send_message(
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Löst die eigenen ANDEREN Geräte auf und baut je Gerät eine
+/// Self-Sync-Kopie (Gegenstück zur CLI). Die Geräteliste wird gecacht
+/// (`sync/own_devices`); Schlüssel-vorhanden heißt aufgelöst (auch leer =
+/// keine Zweitgeräte), damit ein Ein-Gerät-Konto nicht bei jedem Senden
+/// erneut auflöst und Prekeys verbraucht. Der Web-Client ist Erstgerät,
+/// seine eigene Nummer ist `PROTOCOL_DEVICE_ID`. Der Cache wird bei der
+/// Anmeldung geleert, damit ein neu gekoppeltes Gerät auftaucht.
+async fn build_sync_envelopes(
+    core: &mut Core,
+    token: ReadSignal<String>,
+    certificate: Option<&[u8]>,
+    peer: &str,
+    text: &str,
+    expires_at: Option<u64>,
+) -> Result<Vec<OutgoingEnvelope>, String> {
+    const OWN_KEY: &str = "sync/own_devices";
+    let cached = core
+        .storage
+        .borrow()
+        .get(OWN_KEY)
+        .map_err(|e| e.to_string())?;
+    let siblings: Vec<ContactDevice> = match cached {
+        Some(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| format!("Eigene Geräte unlesbar: {e}"))?
+        }
+        None => {
+            let bundles = DirectoryClient::new(directory_url())
+                .bundles(&token.get_untracked(), &core.handle)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut siblings = Vec::new();
+            for bundle_json in &bundles.devices {
+                let (bundle, protocol_device_id) =
+                    bundle_from_directory(bundle_json).map_err(|e| e.to_string())?;
+                if protocol_device_id == PROTOCOL_DEVICE_ID {
+                    continue; // das eigene Gerät bekommt keine Kopie
+                }
+                let address = ProtocolAddress::new(
+                    core.handle.clone(),
+                    device_id_from_u32(protocol_device_id).map_err(|e| e.to_string())?,
+                );
+                core.device
+                    .establish_session(&address, &bundle)
+                    .await
+                    .map_err(|e| format!("Sitzungsaufbau (eigenes Gerät): {e}"))?;
+                siblings.push(ContactDevice {
+                    server_device_id: bundle_json.device_id.clone(),
+                    protocol_device_id,
+                });
+            }
+            let json = serde_json::to_vec(&siblings).map_err(|e| e.to_string())?;
+            core.storage
+                .borrow_mut()
+                .put(OWN_KEY, &json)
+                .map_err(|e| e.to_string())?;
+            siblings
+        }
+    };
+    if siblings.is_empty() {
+        return Ok(Vec::new());
+    }
+    let payload = client_app::sync::encode(peer, text);
+    let mut out = Vec::with_capacity(siblings.len());
+    for sib in &siblings {
+        let address = ProtocolAddress::new(
+            core.handle.clone(),
+            device_id_from_u32(sib.protocol_device_id).map_err(|e| e.to_string())?,
+        );
+        let envelope = match certificate {
+            Some(cert) => {
+                let blob = core
+                    .device
+                    .seal_message(&address, cert, &payload)
+                    .await
+                    .map_err(|e| format!("Versiegeln (Sync): {e}"))?;
+                wire::seal_sealed(&blob).map_err(|e| e.to_string())?
+            }
+            None => {
+                let message = core
+                    .device
+                    .encrypt(&address, &payload)
+                    .await
+                    .map_err(|e| format!("Verschlüsselung (Sync): {e}"))?;
+                wire::seal(&core.handle, PROTOCOL_DEVICE_ID, &message).map_err(|e| e.to_string())?
+            }
+        };
+        out.push(OutgoingEnvelope {
+            id: new_uuid(),
+            recipient: core.handle.clone(),
+            device_id: sib.server_device_id.clone(),
+            envelope,
+            franking_tag: None,
+            expires_at,
+        });
+    }
+    Ok(out)
 }
 
 /// Der Trust Root zum Entsiegeln, gepinnt in der Ablage
@@ -821,15 +946,16 @@ fn open_payload(
     }
 }
 
-/// Holt wartende Hüllen ab, entschlüsselt und bestätigt sie; liefert
-/// (Absender, Klartext, Melde-ID) je Nachricht. Die Melde-ID ist gesetzt,
-/// wenn Franking-Material fürs Melden abgelegt wurde. Token als Signal aus
+/// Holt wartende Hüllen ab, entschlüsselt und bestätigt sie; liefert je
+/// Hülle ein `Incoming` (gewöhnliche Nachricht oder Self-Sync-Kopie). Eine
+/// Hülle, deren Absender das eigene Handle ist, ist eine Self-Sync-Kopie
+/// (man schreibt sich nie selbst im normalen Fluss). Token als Signal aus
 /// demselben Grund wie bei `send_message`: zwischen fetch und ack liegt die
 /// Entschlüsselung, in der die Erneuerung rotieren kann.
 async fn fetch_messages(
     core: &mut Core,
     token: ReadSignal<String>,
-) -> Result<Vec<(String, String, Option<String>)>, String> {
+) -> Result<Vec<Incoming>, String> {
     let delivery = DeliveryClient::new(delivery_url());
     let waiting = delivery
         .fetch(&token.get_untracked())
@@ -852,9 +978,28 @@ async fn fetch_messages(
             let trust_root = sealed_trust_root_cached(&core.storage).await?;
             match core.device.unseal_message(&trust_root, &blob).await {
                 Ok(unsealed) => {
-                    let (text, report_id) =
-                        open_payload(&core.storage, &message.id, &unsealed.plaintext);
-                    received.push((unsealed.sender.clone(), text, report_id));
+                    if unsealed.sender == core.handle {
+                        match client_app::sync::decode(&unsealed.plaintext) {
+                            Ok(synced) => received.push(Incoming::Synced {
+                                peer: synced.peer,
+                                text: synced.text,
+                            }),
+                            Err(error) => {
+                                leptos::logging::warn!(
+                                    "Sync-Hülle {} unlesbar: {error}",
+                                    message.id
+                                )
+                            }
+                        }
+                    } else {
+                        let (text, report_id) =
+                            open_payload(&core.storage, &message.id, &unsealed.plaintext);
+                        received.push(Incoming::Message {
+                            from: unsealed.sender.clone(),
+                            text,
+                            report_id,
+                        });
+                    }
                     acked.push(message.id.clone());
                 }
                 Err(error) => {
@@ -880,8 +1025,24 @@ async fn fetch_messages(
         );
         match core.device.decrypt(&address, &opened.message).await {
             Ok(payload) => {
-                let (text, report_id) = open_payload(&core.storage, &message.id, &payload);
-                received.push((opened.from.clone(), text, report_id));
+                if opened.from == core.handle {
+                    match client_app::sync::decode(&payload) {
+                        Ok(synced) => received.push(Incoming::Synced {
+                            peer: synced.peer,
+                            text: synced.text,
+                        }),
+                        Err(error) => {
+                            leptos::logging::warn!("Sync-Hülle {} unlesbar: {error}", message.id)
+                        }
+                    }
+                } else {
+                    let (text, report_id) = open_payload(&core.storage, &message.id, &payload);
+                    received.push(Incoming::Message {
+                        from: opened.from.clone(),
+                        text,
+                        report_id,
+                    });
+                }
                 acked.push(message.id.clone());
             }
             Err(error) => {
@@ -1207,6 +1368,10 @@ async fn approve_device(
         )
         .await
         .map_err(|e| e.to_string())?;
+    // Der Self-Sync-Cache dieses Geräts ist jetzt veraltet (ein Geschwister
+    // kam dazu); leeren, damit die nächste gesendete Nachricht auch an das
+    // neue Gerät synchronisiert.
+    let _ = storage.borrow_mut().remove("sync/own_devices");
     Ok(outcome.protocol_device_id)
 }
 
@@ -1635,22 +1800,46 @@ fn App() -> impl IntoView {
                             }
                             Ok(received) => {
                                 let open = selected.get_untracked();
+                                let own = me.get_untracked();
                                 let mut summaries = None;
-                                for (sender, text, report_id) in received {
-                                    let for_open = open.as_deref() == Some(sender.as_str());
-                                    let line = StoredLine {
-                                        from: sender.clone(),
-                                        text,
-                                        at: now_unix(),
-                                        report_id,
+                                for item in received {
+                                    // Ausgehend (Self-Sync) gehört in den Chat
+                                    // mit dem Empfänger und zählt nie ungelesen;
+                                    // eingehend zählt ungelesen, wenn der Chat
+                                    // nicht offen ist.
+                                    let (chat_peer, line, outgoing) = match item {
+                                        Incoming::Message {
+                                            from,
+                                            text,
+                                            report_id,
+                                        } => (
+                                            from.clone(),
+                                            StoredLine {
+                                                from,
+                                                text,
+                                                at: now_unix(),
+                                                report_id,
+                                            },
+                                            false,
+                                        ),
+                                        Incoming::Synced { peer, text } => (
+                                            peer,
+                                            StoredLine {
+                                                from: own.clone(),
+                                                text,
+                                                at: now_unix(),
+                                                report_id: None,
+                                            },
+                                            true,
+                                        ),
                                     };
-                                    // Nur eine noch nicht offene Unterhaltung
-                                    // zählt ungelesen hoch.
+                                    let for_open = open.as_deref() == Some(chat_peer.as_str());
+                                    let bump = !outgoing && !for_open;
                                     summaries = Some(record_message(
                                         &storage,
-                                        &sender,
+                                        &chat_peer,
                                         line.clone(),
-                                        !for_open,
+                                        bump,
                                     ));
                                     if for_open {
                                         set_messages.update(|list| push_capped(list, line));

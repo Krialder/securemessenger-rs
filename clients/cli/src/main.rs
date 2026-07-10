@@ -214,6 +214,13 @@ async fn login(args: &[String]) -> Result<(), String> {
     profile.refresh_token = Some(session.refresh_token);
     save_profile(&profile)?;
 
+    // Den Self-Sync-Cache der eigenen Geräte leeren: ein seit der letzten
+    // Anmeldung neu gekoppeltes Gerät wird so beim nächsten Senden
+    // aufgelöst (sonst bekäme es keine Kopien). Best effort.
+    if let Ok(storage) = open_storage() {
+        let _ = storage.borrow_mut().remove("sync/own_devices");
+    }
+
     println!(
         "Angemeldet als {} (Token läuft in {}s ab)",
         profile.handle, session.expires_in
@@ -417,6 +424,26 @@ async fn send(args: &[String]) -> Result<(), String> {
         });
     }
 
+    // Self-Sync: dieselbe Nachricht als Kopie an die eigenen Zweitgeräte,
+    // damit der gesendete Text auch dort im Verlauf steht. Best effort:
+    // scheitert das, ist die Nachricht beim Empfänger trotzdem raus.
+    match build_sync_envelopes(
+        &mut device,
+        &storage,
+        &token,
+        &profile.handle,
+        u32::from(profile.protocol_device_id),
+        certificate.as_deref(),
+        recipient,
+        text,
+        expires_at,
+    )
+    .await
+    {
+        Ok(mut sync) => envelopes.append(&mut sync),
+        Err(error) => eprintln!("Self-Sync übersprungen: {error}"),
+    }
+
     let delivery = DeliveryClient::new(delivery_url());
     let outcome = if sealed {
         // Absichtlich ohne Token: ein Bearer würde den Absender gegenüber
@@ -434,6 +461,105 @@ async fn send(args: &[String]) -> Result<(), String> {
         if sealed { ", versiegelt" } else { "" }
     );
     Ok(())
+}
+
+/// Löst die eigenen ANDEREN Geräte auf (für den Self-Sync) und baut je Gerät
+/// eine Kopie-Hülle. Die Geräteliste wird wie ein Kontakt gecacht
+/// (`sync/own_devices`); der Schlüssel-vorhanden-heißt-aufgelöst-Trick
+/// unterscheidet „keine Zweitgeräte" (leer gespeichert) von „noch nicht
+/// aufgelöst" (Schlüssel fehlt), sodass ein Ein-Gerät-Konto nicht bei jedem
+/// Senden erneut auflöst und Prekeys verbraucht. Nach dem Koppeln eines
+/// neuen Geräts wird der Cache geleert (approve und die nächste Anmeldung).
+// Die Argumente sind alle unabhängig nötig (Gerät, Ablage, Token, eigene
+// Identität, Sealed-Zertifikat, Ziel-Nachricht); ein Sammel-Struct für einen
+// einzigen Aufrufer wäre nur Zeremonie.
+#[allow(clippy::too_many_arguments)]
+async fn build_sync_envelopes(
+    device: &mut Device<PersistentProtocolStore<FileStorage>>,
+    storage: &SharedStorage,
+    token: &str,
+    handle: &str,
+    own_protocol_id: u32,
+    certificate: Option<&[u8]>,
+    peer: &str,
+    text: &str,
+    expires_at: Option<u64>,
+) -> Result<Vec<OutgoingEnvelope>, String> {
+    const OWN_KEY: &str = "sync/own_devices";
+    let cached = storage.borrow().get(OWN_KEY).map_err(|e| e.to_string())?;
+    let siblings: Vec<ContactDevice> = match cached {
+        Some(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| format!("Eigene Geräte unlesbar: {e}"))?
+        }
+        None => {
+            let bundles = DirectoryClient::new(directory_url())
+                .bundles(token, handle)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut siblings = Vec::new();
+            for bundle_json in &bundles.devices {
+                let (bundle, protocol_device_id) =
+                    bundle_from_directory(bundle_json).map_err(|e| e.to_string())?;
+                if protocol_device_id == own_protocol_id {
+                    continue; // das eigene Gerät bekommt keine Kopie
+                }
+                let address = ProtocolAddress::new(
+                    handle.to_string(),
+                    device_id_from_u32(protocol_device_id).map_err(|e| e.to_string())?,
+                );
+                device
+                    .establish_session(&address, &bundle)
+                    .await
+                    .map_err(|e| format!("Sitzungsaufbau (eigenes Gerät): {e}"))?;
+                siblings.push(ContactDevice {
+                    server_device_id: bundle_json.device_id.clone(),
+                    protocol_device_id,
+                });
+            }
+            let json = serde_json::to_vec(&siblings).map_err(|e| e.to_string())?;
+            storage
+                .borrow_mut()
+                .put(OWN_KEY, &json)
+                .map_err(|e| e.to_string())?;
+            siblings
+        }
+    };
+    if siblings.is_empty() {
+        return Ok(Vec::new());
+    }
+    let payload = client_app::sync::encode(peer, text);
+    let mut out = Vec::with_capacity(siblings.len());
+    for sib in &siblings {
+        let address = ProtocolAddress::new(
+            handle.to_string(),
+            device_id_from_u32(sib.protocol_device_id).map_err(|e| e.to_string())?,
+        );
+        let envelope = match certificate {
+            Some(cert) => {
+                let blob = device
+                    .seal_message(&address, cert, &payload)
+                    .await
+                    .map_err(|e| format!("Versiegeln (Sync): {e}"))?;
+                wire::seal_sealed(&blob).map_err(|e| e.to_string())?
+            }
+            None => {
+                let message = device
+                    .encrypt(&address, &payload)
+                    .await
+                    .map_err(|e| format!("Verschlüsselung (Sync): {e}"))?;
+                wire::seal(handle, own_protocol_id, &message).map_err(|e| e.to_string())?
+            }
+        };
+        out.push(OutgoingEnvelope {
+            id: uuid::Uuid::new_v4().to_string(),
+            recipient: handle.to_string(),
+            device_id: sib.server_device_id.clone(),
+            envelope,
+            franking_tag: None,
+            expires_at,
+        });
+    }
+    Ok(out)
 }
 
 /// Holt das Sealed-Sender-Zertifikat des eigenen Geräts, mit Cache in der
@@ -534,12 +660,29 @@ fn remember_franking(
 /// fürs spätere Melden ab (`sm report`). Der Payload ist gefrankt (K_f
 /// vorangestellt); ältere, ungefrankte Nachrichten fallen auf die rohe
 /// Anzeige zurück.
+///
+/// Ist der Absender das eigene Handle, ist es eine Self-Sync-Kopie einer
+/// selbst gesendeten Nachricht (ein anderes eigenes Gerät hat sie
+/// verschickt): dann steht im Payload nicht die Nachricht, sondern der
+/// Sync-Datensatz (Empfänger und Text), und die Zeile wird als ausgehend
+/// gezeigt.
 fn print_and_remember(
     storage: &SharedStorage,
     message_id: &str,
     from: &str,
     payload: &[u8],
+    own_handle: &str,
 ) -> Result<(), String> {
+    if from == own_handle {
+        match client_app::sync::decode(payload) {
+            Ok(synced) => println!(
+                "[-> {}] {}  (auf anderem Gerät gesendet)",
+                synced.peer, synced.text
+            ),
+            Err(error) => eprintln!("Sync-Hülle {message_id} unlesbar: {error}"),
+        }
+        return Ok(());
+    }
     match client_app::franking::unfrank(payload) {
         Ok(opened_msg) => {
             println!(
@@ -569,6 +712,8 @@ async fn drain_waiting(
     storage: &SharedStorage,
 ) -> Result<usize, String> {
     let waiting = delivery.fetch(token).await.map_err(|e| e.to_string())?;
+    // Das eigene Handle für die Self-Sync-Erkennung (Absender == ich).
+    let own_handle = device.address().name().to_string();
     let mut acked = Vec::with_capacity(waiting.len());
     for message in &waiting {
         // Sealed-Sender-Hüllen zuerst: sie tragen keinen Absender im
@@ -589,6 +734,7 @@ async fn drain_waiting(
                         &message.id,
                         &unsealed.sender,
                         &unsealed.plaintext,
+                        &own_handle,
                     )?;
                     acked.push(message.id.clone());
                 }
@@ -616,7 +762,7 @@ async fn drain_waiting(
         );
         match device.decrypt(&address, &opened.message).await {
             Ok(payload) => {
-                print_and_remember(storage, &message.id, &opened.from, &payload)?;
+                print_and_remember(storage, &message.id, &opened.from, &payload, &own_handle)?;
                 acked.push(message.id.clone());
             }
             Err(error) => {
@@ -976,6 +1122,13 @@ async fn approve(args: &[String]) -> Result<(), String> {
         )
         .await
         .map_err(|e| e.to_string())?;
+
+    // Der Self-Sync-Cache dieses Geräts ist jetzt veraltet (ein Geschwister
+    // kam dazu); leeren, damit die nächste gesendete Nachricht auch an das
+    // neue Gerät synchronisiert. Best effort.
+    if let Ok(storage) = open_storage() {
+        let _ = storage.borrow_mut().remove("sync/own_devices");
+    }
 
     println!(
         "Gerät {} freigeschaltet (Nummer {}). Auf dem neuen Gerät 'sm link-finish' ausführen.",

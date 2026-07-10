@@ -467,6 +467,25 @@ async fn second_device_receives_own_copy() {
         "Gerät 2 muss dieselbe Nachricht lesen, stdout war: {got2}"
     );
 
+    // Self-Sync: Gerät 1 schreibt nils; Gerät 2 sieht die selbst gesendete
+    // Nachricht als ausgehende Kopie (der Verlauf stimmt auf beiden Geräten).
+    let sent = mona1.run(&["send", "nils", "sync-probe an nils"]);
+    assert!(
+        sent.contains("an 1 Gerät(e)"),
+        "nils hat ein Gerät; der Self-Sync zählt nicht mit, stdout war: {sent}"
+    );
+    let synced = mona2.run(&["recv"]);
+    assert!(
+        synced.contains("[-> nils] sync-probe an nils"),
+        "Gerät 2 muss die von Gerät 1 gesendete Nachricht als Sync sehen, stdout war: {synced}"
+    );
+    // nils selbst bekommt sie natürlich normal.
+    let nils_got = nils.run(&["recv"]);
+    assert!(
+        nils_got.contains("[mona] sync-probe an nils"),
+        "nils muss die Nachricht normal empfangen, stdout war: {nils_got}"
+    );
+
     // Revocation: das Erstgerät entfernt das Zweitgerät; ein frischer
     // Absender löst die Menge neu auf und stellt nur noch an eines zu.
     let device_line = devices

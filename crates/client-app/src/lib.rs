@@ -30,6 +30,7 @@ pub mod kt;
 pub mod prekeys;
 pub mod protocol_store;
 pub mod storage;
+pub mod sync;
 pub mod wire;
 
 pub use error::ClientError;
