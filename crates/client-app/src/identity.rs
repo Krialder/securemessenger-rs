@@ -45,6 +45,16 @@ pub struct Account {
     pub handle: String,
     pub display_name: String,
     pub device_id: String,
+    /// Die vom Server vergebene libsignal-Gerätenummer des ersten Geräts
+    /// (immer 1). Der Client übernimmt sie als seinen ProtocolAddress-Teil.
+    /// `default` für den Fall eines älteren Servers ohne das Feld: dann ist
+    /// die alte Konstante 1 die richtige Annahme.
+    #[serde(default = "device_id_one")]
+    pub protocol_device_id: u16,
+}
+
+fn device_id_one() -> u16 {
+    1
 }
 
 /// Ein Gerät der eigenen Gerätemenge (Antwort von `GET /devices`).
@@ -56,6 +66,33 @@ pub struct DeviceView {
     pub name: Option<String>,
     pub public_key: String,
     pub not_after: u64,
+    /// Die libsignal-Gerätenummer; `default` 0, falls ein älterer Server
+    /// sie nicht mitführt (dann ist die Nummer aus der Menge nicht bekannt).
+    #[serde(default)]
+    pub protocol_device_id: u16,
+}
+
+/// Was eine Geräte-Freischaltung braucht (Parameter von `add_device`). Der
+/// Konto-Wurzelschlüssel signiert das Credential des neuen Geräts; der
+/// Server prüft die Signatur gegen den Konto-Identitätsschlüssel.
+pub struct DeviceEnrollment<'a> {
+    pub account_key: &'a IdentityKeypair,
+    pub handle: &'a str,
+    /// Öffentlicher Schlüssel des neuen Geräts (libsignal-Identität, Base64).
+    pub device_public_key: &'a str,
+    /// Client-erzeugte Geräte-ID, kanonische UUID.
+    pub device_id: &'a str,
+    pub name: Option<&'a str>,
+    pub not_after: u64,
+}
+
+/// Ergebnis einer Freischaltung (Antwort von `POST /devices`): die
+/// bestätigte Geräte-ID und die vom Server vergebene Protokollnummer, die
+/// das neue Gerät als seinen ProtocolAddress-Teil übernimmt.
+#[derive(Deserialize, Debug, Clone)]
+pub struct AddDeviceOutcome {
+    pub device_id: String,
+    pub protocol_device_id: u16,
 }
 
 /// Ein Token-Paar mit Laufzeit (Antwort von Login und Refresh). Feldnamen nach
@@ -246,6 +283,61 @@ impl IdentityClient {
             .await
             .map_err(transport)?;
         parse_json(response).await
+    }
+
+    /// `POST /devices`: schaltet ein weiteres Gerät fürs eigene Konto frei.
+    /// Der Aufrufer ist ein bereits angemeldetes Gerät (Bearer); das
+    /// Credential des neuen Geräts signiert der Konto-Wurzelschlüssel
+    /// clientseitig, der Server prüft es gegen den Konto-Identitätsschlüssel
+    /// (geraete-identitaet.md). Liefert die vom Server vergebene
+    /// Protokollnummer, die das neue Gerät als seine libsignal-Gerätenummer
+    /// übernimmt.
+    pub async fn add_device(
+        &self,
+        access_token: &str,
+        enroll: &DeviceEnrollment<'_>,
+    ) -> Result<AddDeviceOutcome, ClientError> {
+        let credential = build_device_credential(
+            enroll.account_key,
+            enroll.handle,
+            enroll.device_id,
+            enroll.device_public_key,
+            enroll.not_after,
+        );
+        let body = DeviceRequest {
+            id: enroll.device_id,
+            name: enroll.name,
+            public_key: enroll.device_public_key,
+            not_after: enroll.not_after,
+            credential: &credential,
+        };
+        let response = self
+            .http
+            .post(self.url("/devices"))
+            .bearer_auth(access_token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(transport)?;
+        parse_json(response).await
+    }
+
+    /// `DELETE /devices/{id}`: nimmt ein Gerät aus der gültigen Menge
+    /// (Revocation). Ein Gerät kann sich nicht selbst entfernen (der Server
+    /// antwortet dann `409`), damit man sich nicht aussperrt.
+    pub async fn remove_device(
+        &self,
+        access_token: &str,
+        device_id: &str,
+    ) -> Result<(), ClientError> {
+        let response = self
+            .http
+            .delete(self.url(&format!("/devices/{device_id}")))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(transport)?;
+        expect_success(response).await
     }
 
     /// `DELETE /sessions`: meldet ab und widerruft die ganze Session-Familie.

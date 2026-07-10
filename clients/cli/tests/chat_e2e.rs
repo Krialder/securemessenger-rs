@@ -396,3 +396,98 @@ async fn franking_report_verifies_and_blocking_drops() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Multi-Device: ein zweites Gerät wird zum selben Konto gekoppelt und
+/// empfängt eigene Kopien. Beweist die Nummernvergabe (1 und 2), den
+/// Kopplungsfluss (link/approve/link-finish über die echten Dienste) und
+/// den Fanout an beide Geräte des Empfängers.
+#[tokio::test(flavor = "multi_thread")]
+async fn second_device_receives_own_copy() {
+    let urls = start_stack().await;
+    let dir = std::env::temp_dir().join(format!("sm-mdev-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("Testverzeichnis");
+
+    // Erstes Gerät: Konto anlegen, anmelden, Prekeys veröffentlichen.
+    let mona1 = CliUser::new(&dir, "mona1", &urls);
+    mona1.run(&["register", "mona", "monas-langes-passwort"]);
+    mona1.run(&["login", "monas-langes-passwort"]);
+    mona1.run(&["publish-keys"]);
+
+    // Zweites Gerät (eigenes Profil, gleiches Handle): Kopplung beginnen.
+    let mona2 = CliUser::new(&dir, "mona2", &urls);
+    let link_out = mona2.run(&["link", "mona", "monas-langes-passwort"]);
+    let payload = link_out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("sm approve "))
+        .expect("Kopplungs-Antrag in der Ausgabe")
+        .to_string();
+
+    // Erstgerät schaltet frei; der Server vergibt Nummer 2.
+    let approved = mona1.run(&["approve", &payload]);
+    assert!(
+        approved.contains("Nummer 2"),
+        "das zweite Gerät muss Nummer 2 bekommen, stdout war: {approved}"
+    );
+
+    // Zweitgerät schließt ab: meldet sich an, übernimmt die Nummer,
+    // veröffentlicht Prekeys.
+    let finished = mona2.run(&["link-finish", "mona", "monas-langes-passwort"]);
+    assert!(
+        finished.contains("Nummer 2"),
+        "link-finish muss die Nummer bestätigen, stdout war: {finished}"
+    );
+
+    // Die Gerätemenge zeigt beide Geräte mit ihren Nummern.
+    let devices = mona1.run(&["devices"]);
+    assert!(
+        devices.contains("Nummer 1") && devices.contains("Nummer 2"),
+        "beide Geräte müssen in der Menge stehen, stdout war: {devices}"
+    );
+
+    // Ein Dritter schreibt mona; die Zustellung geht an BEIDE Geräte.
+    let nils = CliUser::new(&dir, "nils", &urls);
+    nils.run(&["register", "nils", "nils-langes-passwort"]);
+    nils.run(&["login", "nils-langes-passwort"]);
+    nils.run(&["publish-keys"]);
+    let sent = nils.run(&["send", "mona", "an alle geraete von mona"]);
+    assert!(
+        sent.contains("an 2 Gerät(e)"),
+        "der Fanout muss beide Geräte adressieren, stdout war: {sent}"
+    );
+
+    // Beide Geräte holen unabhängig ab und entschlüsseln dieselbe Nachricht.
+    let got1 = mona1.run(&["recv"]);
+    assert!(
+        got1.contains("[nils] an alle geraete von mona"),
+        "Gerät 1 muss die Nachricht lesen, stdout war: {got1}"
+    );
+    let got2 = mona2.run(&["recv"]);
+    assert!(
+        got2.contains("[nils] an alle geraete von mona"),
+        "Gerät 2 muss dieselbe Nachricht lesen, stdout war: {got2}"
+    );
+
+    // Revocation: das Erstgerät entfernt das Zweitgerät; ein frischer
+    // Absender löst die Menge neu auf und stellt nur noch an eines zu.
+    let device_line = devices
+        .lines()
+        .find(|l| l.contains("Nummer 2"))
+        .expect("Zeile des zweiten Geräts");
+    let device2_id = device_line
+        .split('[')
+        .nth(1)
+        .and_then(|s| s.split(']').next())
+        .expect("Geräte-ID in eckigen Klammern");
+    mona1.run(&["unlink", device2_id]);
+    let pia = CliUser::new(&dir, "pia", &urls);
+    pia.run(&["register", "pia", "pias-langes-passwort"]);
+    pia.run(&["login", "pias-langes-passwort"]);
+    pia.run(&["publish-keys"]);
+    let sent = pia.run(&["send", "mona", "nur noch ein geraet"]);
+    assert!(
+        sent.contains("an 1 Gerät(e)"),
+        "nach der Revocation darf nur ein Gerät adressiert werden, stdout war: {sent}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

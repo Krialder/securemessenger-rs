@@ -27,9 +27,8 @@ use client_app::delivery::{
     parse_ws_event, ws_auth_frame, DeliveryClient, OutgoingEnvelope, WsEvent,
 };
 use client_app::directory::DirectoryClient;
-use client_app::prekeys::{
-    bundle_from_directory, device_id_from_u32, publication_from_bundle, PROTOCOL_DEVICE_ID,
-};
+use client_app::identity::DeviceEnrollment;
+use client_app::prekeys::{bundle_from_directory, device_id_from_u32, publication_from_bundle};
 use client_app::protocol_store::{has_own_identity, store_own_identity, PersistentProtocolStore};
 use client_app::storage::{FileStorage, KeyValueStorage as _};
 use client_app::{wire, IdentityClient, NewAccount};
@@ -57,14 +56,38 @@ const COUNTER_KEY: &str = "counter/next_prekey_id";
 #[derive(Serialize, Deserialize, Default)]
 struct Profile {
     handle: String,
-    /// Seed des Ed25519-Konto-Wurzelschlüssels (Base64).
+    /// Seed des Ed25519-Konto-Wurzelschlüssels (Base64). Leer auf einem
+    /// gekoppelten Zweitgerät: das hält nur seine eigene Geräte-Identität,
+    /// nicht den Konto-Wurzelschlüssel (der bleibt auf dem Erstgerät). Ein
+    /// Zweitgerät kann darum senden und empfangen, aber keine weiteren
+    /// Geräte freischalten und keine KT-Selbstprüfung fahren.
+    #[serde(default)]
     account_seed: String,
     /// Server-seitige Geräte-ID (UUID).
     device_id: String,
+    /// Die vom Server vergebene libsignal-Gerätenummer (ProtocolAddress-Teil).
+    /// Vorgabe 1 für Altprofile aus der Ein-Gerät-Zeit.
+    #[serde(default = "one_u16")]
+    protocol_device_id: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     access_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     refresh_token: Option<String>,
+}
+
+fn one_u16() -> u16 {
+    1
+}
+
+/// Der offene Kopplungs-Antrag, den ein Zweitgerät ausgibt und ein Erstgerät
+/// freischaltet: die Geräte-ID und der öffentliche Geräteschlüssel des neuen
+/// Geräts. Als eine Base64-Zeile kodiert, damit sie sich wie ein QR-Code in
+/// einem Stück übertragen lässt (der QR-/Relay-Kanal automatisiert genau
+/// diese Übergabe später).
+#[derive(Serialize, Deserialize)]
+struct LinkRequest {
+    device_id: String,
+    device_public_key: String,
 }
 
 /// Ein bekannter Kontakt: die Geräte, an die zugestellt wird, samt der
@@ -92,6 +115,11 @@ async fn run() -> Result<(), String> {
         "login" => login(&args[1..]).await,
         "logout" => logout().await,
         "whoami" => whoami(),
+        "link" => link(&args[1..]).await,
+        "approve" => approve(&args[1..]).await,
+        "link-finish" => link_finish(&args[1..]).await,
+        "devices" => devices().await,
+        "unlink" => unlink(&args[1..]).await,
         "publish-keys" => publish_keys().await,
         "send" => send(&args[1..]).await,
         "recv" => recv().await,
@@ -155,13 +183,15 @@ async fn register(args: &[String]) -> Result<(), String> {
         handle: account.handle.clone(),
         account_seed: BASE64.encode(account_key.to_seed()),
         device_id: account.device_id.clone(),
+        // Das erste Gerät ist Nummer 1 (der Server bestätigt es).
+        protocol_device_id: account.protocol_device_id,
         access_token: None,
         refresh_token: None,
     })?;
 
     println!(
-        "Registriert: {} (Gerät {})",
-        account.handle, account.device_id
+        "Registriert: {} (Gerät {}, Nummer {})",
+        account.handle, account.device_id, account.protocol_device_id
     );
     Ok(())
 }
@@ -341,7 +371,10 @@ async fn send(args: &[String]) -> Result<(), String> {
     let franking_tag = BASE64.encode(&franked.commitment);
     // Für --sealed einmal das Absender-Zertifikat besorgen (gecacht).
     let certificate = if sealed {
-        Some(sender_certificate_cached(&token, &storage).await?)
+        Some(
+            sender_certificate_cached(&token, u32::from(profile.protocol_device_id), &storage)
+                .await?,
+        )
     } else {
         None
     };
@@ -366,8 +399,12 @@ async fn send(args: &[String]) -> Result<(), String> {
                     .encrypt(&address, &franked.payload)
                     .await
                     .map_err(|e| format!("Verschlüsselung: {e}"))?;
-                wire::seal(&profile.handle, PROTOCOL_DEVICE_ID, &message)
-                    .map_err(|e| e.to_string())?
+                wire::seal(
+                    &profile.handle,
+                    u32::from(profile.protocol_device_id),
+                    &message,
+                )
+                .map_err(|e| e.to_string())?
             }
         };
         envelopes.push(OutgoingEnvelope {
@@ -404,6 +441,7 @@ async fn send(args: &[String]) -> Result<(), String> {
 /// Minuten abläuft, fragt der Client den identity-Dienst neu.
 async fn sender_certificate_cached(
     token: &str,
+    protocol_device_id: u32,
     storage: &SharedStorage,
 ) -> Result<Vec<u8>, String> {
     const KEY: &str = "sealed/certificate";
@@ -421,7 +459,7 @@ async fn sender_certificate_cached(
         }
     }
     let issued = IdentityClient::new(identity_url())
-        .sender_certificate(token, PROTOCOL_DEVICE_ID)
+        .sender_certificate(token, protocol_device_id)
         .await
         .map_err(|e| format!("Absender-Zertifikat: {e}"))?;
     let record = serde_json::json!({
@@ -840,6 +878,216 @@ async fn blocks() -> Result<(), String> {
     Ok(())
 }
 
+/// `sm link <handle> <passwort>`: beginnt die Kopplung auf einem NEUEN,
+/// leeren Gerät. Erzeugt die Geräte-Identität, legt ein vorläufiges Profil
+/// an (noch ohne Nummer, ohne Token) und gibt den Kopplungs-Antrag als eine
+/// Base64-Zeile aus. Diese Zeile wird auf dem Erstgerät mit `sm approve`
+/// freigeschaltet; danach schließt `sm link-finish` die Kopplung ab. Der
+/// Konto-Wurzelschlüssel bleibt auf dem Erstgerät: dieses Gerät wird ein
+/// gekoppeltes Zweitgerät, das senden und empfangen kann.
+async fn link(args: &[String]) -> Result<(), String> {
+    let [handle, _password] = args else {
+        return Err("Aufruf: sm link <handle> <passwort>".to_string());
+    };
+    let storage = open_storage()?;
+    if has_own_identity(&storage).map_err(|e| e.to_string())? {
+        return Err(format!(
+            "Unter {} liegt schon eine Geräte-Identität. Kopplung braucht ein leeres Profil (SM_STATE auf einen neuen Pfad setzen).",
+            state_path()
+        ));
+    }
+    // Frische Geräte-Identität. Die Protokollnummer steht erst nach der
+    // Freischaltung fest; für die Schlüsselerzeugung ist sie belanglos (der
+    // Identitätsschlüssel hängt nicht an der Adresse), deshalb hier 1.
+    let registration_id = rand::Rng::random_range(&mut rand::rng(), 1u32..16380);
+    let mut keygen = Device::new(handle, 1, registration_id).map_err(|e| e.to_string())?;
+    let device_public = BASE64.encode(keygen.identity_public().await.map_err(|e| e.to_string())?);
+    let identity_bytes = keygen
+        .identity_keypair_bytes()
+        .await
+        .map_err(|e| e.to_string())?;
+    let device_id = uuid::Uuid::new_v4().to_string();
+
+    store_own_identity(&storage, &identity_bytes, registration_id).map_err(|e| e.to_string())?;
+    save_profile(&Profile {
+        handle: handle.clone(),
+        // Kein Konto-Wurzelschlüssel auf dem Zweitgerät.
+        account_seed: String::new(),
+        device_id: device_id.clone(),
+        // 0 = noch nicht freigeschaltet; link-finish setzt die echte Nummer.
+        protocol_device_id: 0,
+        access_token: None,
+        refresh_token: None,
+    })?;
+
+    let request = LinkRequest {
+        device_id,
+        device_public_key: device_public,
+    };
+    let payload = BASE64.encode(serde_json::to_vec(&request).map_err(|e| e.to_string())?);
+    println!("Kopplung begonnen. Auf dem Erstgerät ausführen:");
+    println!("  sm approve {payload}");
+    println!("Danach hier abschließen: sm link-finish {handle} <passwort>");
+    Ok(())
+}
+
+/// `sm approve <antrag>`: schaltet auf dem ERSTGERÄT (mit Konto-Wurzel-
+/// schlüssel und aktiver Anmeldung) ein neues Gerät frei. Signiert dessen
+/// Credential mit dem Konto-Schlüssel und ruft `POST /devices`; der Server
+/// vergibt die Gerätenummer. Ohne Wurzelschlüssel (also auf einem
+/// Zweitgerät) geht das nicht.
+async fn approve(args: &[String]) -> Result<(), String> {
+    let [payload] = args else {
+        return Err("Aufruf: sm approve <antrag>".to_string());
+    };
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    if profile.account_seed.is_empty() {
+        return Err(
+            "Dieses Gerät hat keinen Konto-Wurzelschlüssel (Zweitgerät). Freischalten nur auf dem Erstgerät.".to_string(),
+        );
+    }
+    let seed: [u8; 32] = BASE64
+        .decode(&profile.account_seed)
+        .map_err(|e| format!("Konto-Seed unlesbar: {e}"))?
+        .try_into()
+        .map_err(|_| "Konto-Seed hat die falsche Länge".to_string())?;
+    let account_key = IdentityKeypair::from_seed(&seed);
+
+    let request: LinkRequest = serde_json::from_slice(
+        &BASE64
+            .decode(payload)
+            .map_err(|_| "Antrag ist kein Base64".to_string())?,
+    )
+    .map_err(|e| format!("Antrag unlesbar: {e}"))?;
+
+    let not_after = now_unix() + CREDENTIAL_TTL_SECONDS;
+    let outcome = IdentityClient::new(identity_url())
+        .add_device(
+            &token,
+            &DeviceEnrollment {
+                account_key: &account_key,
+                handle: &profile.handle,
+                device_public_key: &request.device_public_key,
+                device_id: &request.device_id,
+                name: None,
+                not_after,
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    println!(
+        "Gerät {} freigeschaltet (Nummer {}). Auf dem neuen Gerät 'sm link-finish' ausführen.",
+        outcome.device_id, outcome.protocol_device_id
+    );
+    Ok(())
+}
+
+/// `sm link-finish <handle> <passwort>`: schließt die Kopplung auf dem
+/// Zweitgerät ab, nachdem das Erstgerät `sm approve` ausgeführt hat. Meldet
+/// sich an (jetzt möglich, das Gerät ist freigeschaltet), liest die vom
+/// Server vergebene Nummer aus der eigenen Gerätemenge, verankert sie im
+/// Profil und veröffentlicht die Prekeys, damit Absender an dieses Gerät
+/// zustellen können.
+async fn link_finish(args: &[String]) -> Result<(), String> {
+    let [handle, password] = args else {
+        return Err("Aufruf: sm link-finish <handle> <passwort>".to_string());
+    };
+    let mut profile = load_profile()?;
+    if handle != &profile.handle {
+        return Err(format!(
+            "Profil gehört zu '{}', nicht zu '{handle}'.",
+            profile.handle
+        ));
+    }
+
+    let client = IdentityClient::new(identity_url());
+    let session = client
+        .login(&profile.handle, password, &profile.device_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let access = session.access_token.clone();
+    profile.access_token = Some(session.access_token);
+    profile.refresh_token = Some(session.refresh_token);
+
+    // Die eigene Nummer aus der Gerätemenge holen (der Server hat sie bei
+    // der Freischaltung vergeben).
+    let devices = client.devices(&access).await.map_err(|e| e.to_string())?;
+    let mine = devices.iter().find(|d| d.id == profile.device_id).ok_or(
+        "Dieses Gerät steht nicht in der Gerätemenge. Zuerst 'sm approve' auf dem Erstgerät.",
+    )?;
+    if mine.protocol_device_id == 0 {
+        return Err("Der Server hat keine Gerätenummer geliefert (zu alter Server?).".to_string());
+    }
+    profile.protocol_device_id = mine.protocol_device_id;
+    save_profile(&profile)?;
+
+    // Prekeys veröffentlichen, sonst kann niemand an dieses Gerät zustellen.
+    let (mut device, storage) = open_device(&profile)?;
+    let bundle = device
+        .publish_prekey_bundle()
+        .await
+        .map_err(|e| e.to_string())?;
+    let publication = publication_from_bundle(&bundle).map_err(|e| e.to_string())?;
+    DirectoryClient::new(directory_url())
+        .publish(&access, &publication)
+        .await
+        .map_err(|e| e.to_string())?;
+    save_counter(&storage, device.next_prekey_id())?;
+
+    println!(
+        "Gekoppelt als Gerät {} (Nummer {}). Empfängt ab jetzt eigene Kopien.",
+        profile.device_id, profile.protocol_device_id
+    );
+    Ok(())
+}
+
+/// `sm devices`: listet die gültige Gerätemenge des eigenen Kontos mit ihren
+/// Nummern (das eigene Gerät markiert).
+async fn devices() -> Result<(), String> {
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    let list = IdentityClient::new(identity_url())
+        .devices(&token)
+        .await
+        .map_err(|e| e.to_string())?;
+    if list.is_empty() {
+        println!("Keine Geräte.");
+        return Ok(());
+    }
+    for d in &list {
+        let mine = if d.id == profile.device_id {
+            " (dieses Gerät)"
+        } else {
+            ""
+        };
+        let name = d.name.as_deref().unwrap_or("Gerät");
+        println!(
+            "Nummer {}: {} [{}]{}",
+            d.protocol_device_id, name, d.id, mine
+        );
+    }
+    Ok(())
+}
+
+/// `sm unlink <geräte-id>`: entfernt ein Gerät aus der gültigen Menge
+/// (Revocation). Das eigene Gerät kann sich nicht selbst entfernen (der
+/// Server lehnt das ab, damit man sich nicht aussperrt).
+async fn unlink(args: &[String]) -> Result<(), String> {
+    let [device_id] = args else {
+        return Err("Aufruf: sm unlink <geräte-id>".to_string());
+    };
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    IdentityClient::new(identity_url())
+        .remove_device(&token, device_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("Gerät {device_id} entfernt.");
+    Ok(())
+}
+
 /// `sm verify`: die KT-Selbstprüfung des eigenen Kontos
 /// (specs/key-transparency.md). Rechnet das Commitment aus Konto-Schlüssel
 /// und eigener Gerätemenge nach und verifiziert den Inklusionsbeweis gegen
@@ -885,6 +1133,11 @@ fn print_usage() {
          \x20 login <passwort>               Gerät anmelden, Token speichern\n\
          \x20 logout                         Session abmelden\n\
          \x20 whoami                         Profil anzeigen\n\
+         \x20 link <handle> <passwort>       neues Zweitgeraet koppeln: Antrag ausgeben\n\
+         \x20 approve <antrag>               Zweitgeraet freischalten (nur Erstgeraet)\n\
+         \x20 link-finish <handle> <passwort>  Kopplung auf dem Zweitgeraet abschliessen\n\
+         \x20 devices                        eigene Geraetemenge mit Nummern anzeigen\n\
+         \x20 unlink <geraete-id>            ein Geraet entfernen (Revocation)\n\
          \x20 publish-keys                   Prekey-Satz im Verzeichnis veröffentlichen\n\
          \x20 send <handle> <text> [--ttl s] [--sealed]  E2EE senden (--ttl: verschwindet; --sealed: ohne Absender-Klartext)\n\
          \x20 recv                           wartende Nachrichten abholen und entschlüsseln\n\
@@ -1021,9 +1274,11 @@ fn open_device(
         ),
         None => 1,
     };
+    let protocol_device_id = u8::try_from(profile.protocol_device_id)
+        .map_err(|_| format!("Gerätenummer {} über 255", profile.protocol_device_id))?;
     let device = Device::with_store(
         &profile.handle,
-        1,
+        protocol_device_id,
         PersistentProtocolStore::open(storage.clone()),
         next_prekey_id,
     )
