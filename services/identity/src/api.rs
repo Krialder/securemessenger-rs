@@ -161,7 +161,8 @@ impl AppState {
 pub fn app(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/", get(|| async { "SecureMessenger identity service" }))
-        .route("/accounts", post(register))
+        .route("/accounts", post(register).delete(delete_account))
+        .route("/accounts/undelete", post(undelete_account))
         .route("/pow", get(pow_info))
         .route("/sessions", post(login).delete(logout))
         .route("/sessions/refresh", post(refresh))
@@ -432,6 +433,21 @@ struct PasswordChangeRequest {
     new_password: String,
 }
 
+/// Konto-Löschung vormerken: das Passwort bestätigt, dass es der Besitzer
+/// ist (ein gestohlenes Token allein soll das Konto nicht löschen können).
+#[derive(Deserialize)]
+struct DeleteAccountRequest {
+    password: String,
+}
+
+/// Antwort auf die vorgemerkte Löschung: der Ablauf der Widerrufsfrist als
+/// Unix-Sekunden, damit der Client die Frist anzeigen und das Widerrufen
+/// anbieten kann.
+#[derive(Serialize)]
+struct DeletionScheduledResponse {
+    deletion_pending_until: u64,
+}
+
 #[derive(Deserialize)]
 struct RefreshRequest {
     refresh_token: String,
@@ -447,6 +463,12 @@ struct SessionResponse {
     token_type: &'static str,
     /// Sekunden bis zum Ablauf des Access-Tokens.
     expires_in: u64,
+    /// Bei einer vorgemerkten Löschung der Ablauf der Widerrufsfrist
+    /// (Unix-Sekunden); fehlt bei einem aktiven Konto. So sieht der Client
+    /// direkt nach dem Login, dass eine Löschung läuft, und kann sie anbieten
+    /// zu widerrufen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deletion_pending_until: Option<u64>,
 }
 
 /// Einheitliches Fehlerformat nach schnittstellen.md.
@@ -752,6 +774,7 @@ async fn register(State(st): State<AppState>, Json(req): Json<RegisterRequest>) 
         display_name,
         password_hash,
         identity_key: req.identity_key,
+        deletion_pending_until: None,
     };
     // Für den Discovery-Index vor dem Verschieben festhalten.
     let discovery_record = crate::store::DiscoveryRecord {
@@ -832,11 +855,12 @@ async fn login(State(st): State<AppState>, Json(req): Json<LoginRequest>) -> Res
     }
     // Auch bei unbekanntem Handle wird gegen einen Dummy-Hash geprüft,
     // damit die Antwortzeit keine Konto-Existenz verrät.
-    let (stored_hash, account_exists) = match st.store.get(&req.handle).await {
-        Ok(Some(account)) => (account.password_hash, true),
-        Ok(None) => (st.dummy_hash.to_string(), false),
-        Err(error) => return store_failure(error),
-    };
+    let (stored_hash, account_exists, deletion_pending_until) =
+        match st.store.get(&req.handle).await {
+            Ok(Some(account)) => (account.password_hash, true, account.deletion_pending_until),
+            Ok(None) => (st.dummy_hash.to_string(), false, None),
+            Err(error) => return store_failure(error),
+        };
     let password = req.password;
     let password_ok =
         tokio::task::spawn_blocking(move || auth::verify_password(&password, &stored_hash))
@@ -856,7 +880,8 @@ async fn login(State(st): State<AppState>, Json(req): Json<LoginRequest>) -> Res
             "Handle, Passwort oder Gerät ist ungültig",
         );
     }
-    let (response, access_hash, refresh_hash) = new_token_pair(&st);
+    let (mut response, access_hash, refresh_hash) = new_token_pair(&st);
+    response.deletion_pending_until = deletion_pending_until;
     let created = st
         .sessions
         .create(
@@ -887,6 +912,7 @@ fn new_token_pair(st: &AppState) -> (SessionResponse, String, String) {
         refresh_token,
         token_type: "Bearer",
         expires_in: st.session_config.access_ttl.as_secs(),
+        deletion_pending_until: None,
     };
     (response, access_hash, refresh_hash)
 }
@@ -1015,6 +1041,95 @@ async fn change_password(
         return store_failure(error);
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Widerrufsfrist der Konto-Löschung: 30 Tage (NF030 nennt keine Zahl).
+/// Über `ACCOUNT_DELETION_GRACE_SECS` überschreibbar, damit der Betrieb (und
+/// ein Test) eine andere Frist wählen kann; ein leerer oder unparsbarer Wert
+/// fällt still auf die Vorgabe zurück.
+const DELETION_GRACE_SECS_DEFAULT: u64 = 30 * 24 * 60 * 60;
+
+fn deletion_grace_secs() -> u64 {
+    std::env::var("ACCOUNT_DELETION_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(DELETION_GRACE_SECS_DEFAULT)
+}
+
+/// `DELETE /accounts`: merkt die Löschung des angemeldeten Kontos vor (NF030,
+/// Löschung mit Widerrufsfrist). Bearer-authentifiziert, aber das Passwort
+/// muss zusätzlich stimmen: ein gestohlenes Access-Token allein soll ein
+/// Konto nicht löschen können. Das Konto bleibt während der Frist voll
+/// nutzbar und die Löschung widerrufbar (`POST /accounts/undelete`); erst der
+/// Purge nach Ablauf entfernt Konto, Geräte, Sessions und Discovery-Eintrag
+/// (Crypto-Shredding: der Konto-Identitätsschlüssel und die Credentials
+/// verschwinden, die E2E-Schlüssel lagen ohnehin nie beim Server).
+async fn delete_account(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<DeleteAccountRequest>,
+) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return invalid_token(),
+        Err(error) => return session_failure(error),
+    };
+    // Wie beim Passwortwechsel: das Durchprobieren des Passworts (Angreifer
+    // mit Token, ohne Passwort) je Handle bremsen.
+    if let Err(retry_after) = st
+        .limiter
+        .check(&format!("delete:{}", who.handle), LOGIN_RATE_LIMIT)
+    {
+        return common::rate::too_many_requests(retry_after);
+    }
+    let account = match st.store.get(&who.handle).await {
+        Ok(Some(account)) => account,
+        Ok(None) => {
+            tracing::error!(handle = %who.handle, "Session ohne zugehöriges Konto");
+            return internal();
+        }
+        Err(error) => return store_failure(error),
+    };
+    let password = req.password;
+    let stored = account.password_hash;
+    let password_ok =
+        tokio::task::spawn_blocking(move || auth::verify_password(&password, &stored))
+            .await
+            .unwrap_or(false);
+    if !password_ok {
+        return api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "Das Passwort ist falsch",
+        );
+    }
+    let deletion_at = now_unix() + deletion_grace_secs();
+    match st.store.schedule_deletion(&who.handle, deletion_at).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(DeletionScheduledResponse {
+                deletion_pending_until: deletion_at,
+            }),
+        )
+            .into_response(),
+        Err(error) => store_failure(error),
+    }
+}
+
+/// `POST /accounts/undelete`: widerruft eine vorgemerkte Löschung innerhalb
+/// der Frist (Bearer, kein Passwort nötig: wer angemeldet ist, darf die
+/// eigene Löschung stoppen). Idempotent.
+async fn undelete_account(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return invalid_token(),
+        Err(error) => return session_failure(error),
+    };
+    match st.store.cancel_deletion(&who.handle).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => store_failure(error),
+    }
 }
 
 async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Response {

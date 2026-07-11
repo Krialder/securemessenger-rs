@@ -303,6 +303,18 @@ fn format_time(at: u64) -> String {
     format!("{:02}:{:02}", date.get_hours(), date.get_minutes())
 }
 
+/// Formatiert einen Unix-Zeitstempel als lokales Datum (TT.MM.JJJJ) über die
+/// JavaScript-Uhr des Browsers; für die Anzeige der Löschfrist.
+fn format_date(at: u64) -> String {
+    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64((at as f64) * 1000.0));
+    format!(
+        "{:02}.{:02}.{}",
+        date.get_date(),
+        date.get_month() + 1,
+        date.get_full_year()
+    )
+}
+
 type SharedStorage = Rc<RefCell<BrowserStorage>>;
 type WebDevice = Device<PersistentProtocolStore<BrowserStorage>>;
 
@@ -408,6 +420,11 @@ struct Onboarded {
     access_token: String,
     refresh_token: String,
     expires_in: u64,
+    /// Bei einer vorgemerkten Konto-Löschung der Ablauf der Widerrufsfrist
+    /// (Unix-Sekunden), aus der Login-Antwort; `None` bei einem aktiven
+    /// Konto. Nur der `login`-Weg kann ihn tragen (der Server meldet ihn bei
+    /// der Anmeldung); Registrierung und Kopplung setzen `None`.
+    deletion_pending_until: Option<u64>,
 }
 
 type SharedCore = SendWrapper<Rc<RefCell<Option<Core>>>>;
@@ -642,6 +659,8 @@ async fn onboard(
         access_token: session.access_token,
         refresh_token: session.refresh_token,
         expires_in: session.expires_in,
+        // Frisch registriert bzw. gekoppelt: keine Löschung vorgemerkt.
+        deletion_pending_until: None,
     })
 }
 
@@ -689,6 +708,8 @@ async fn login(storage: SharedStorage, password: String) -> Result<Onboarded, St
         access_token: session.access_token,
         refresh_token: session.refresh_token,
         expires_in: session.expires_in,
+        // Nur die Anmeldung erfährt vom Server, ob eine Löschung läuft.
+        deletion_pending_until: session.deletion_pending_until,
     })
 }
 
@@ -854,6 +875,8 @@ async fn link_finish(storage: SharedStorage, password: String) -> Result<Onboard
         access_token: session.access_token,
         refresh_token: session.refresh_token,
         expires_in: session.expires_in,
+        // Frisch registriert bzw. gekoppelt: keine Löschung vorgemerkt.
+        deletion_pending_until: None,
     })
 }
 
@@ -1927,6 +1950,12 @@ fn App() -> impl IntoView {
     let (pw_current, set_pw_current) = signal(String::new());
     let (pw_new, set_pw_new) = signal(String::new());
     let (pw_confirm, set_pw_confirm) = signal(String::new());
+    // Ablauf der Widerrufsfrist einer vorgemerkten Konto-Löschung
+    // (Unix-Sekunden); `None` = aktives Konto. Aus der Login-Antwort gesetzt.
+    let (deletion_pending, set_deletion_pending) = signal(Option::<u64>::None);
+    // Passwort-Bestätigung im Lösch-Formular (die Löschung ist zerstörend,
+    // deshalb ein bewusster Schritt statt eines Ein-Klick-Knopfes).
+    let (delete_pw, set_delete_pw) = signal(String::new());
     // Maschinen-Benachrichtigungen vom integrations-Dienst, getrennt vom
     // Krypto-Status und vom E2E-Chat (design-system.md, Status-Trennung).
     let (notifications, set_notifications) = signal(Vec::<String>::new());
@@ -2014,7 +2043,9 @@ fn App() -> impl IntoView {
                 access_token: at,
                 refresh_token: rt,
                 expires_in,
+                deletion_pending_until,
             } = onboarded;
+            set_deletion_pending.set(deletion_pending_until);
             set_access_token.set(at);
             refresh_token.set_value(rt);
             token_epoch.update_value(|e| *e += 1);
@@ -2225,6 +2256,7 @@ fn App() -> impl IntoView {
             channel_epoch.update_value(|e| *e += 1);
             token_epoch.update_value(|e| *e += 1);
             set_connected.set(false);
+            set_deletion_pending.set(None);
             let token = access_token.get_untracked();
             set_access_token.set(String::new());
             refresh_token.set_value(String::new());
@@ -2900,6 +2932,57 @@ fn App() -> impl IntoView {
         }
     };
 
+    // Konto-Löschung vormerken (NF030, Widerrufsfrist): das Passwort
+    // bestätigt den Besitzer. Fängt nur Copy-Signale ein.
+    let on_delete_account = move |_| {
+        if busy.get_untracked() {
+            return;
+        }
+        let password = delete_pw.get_untracked();
+        if password.is_empty() {
+            set_status.set("Zum Löschen das Passwort eingeben.".to_string());
+            return;
+        }
+        set_busy.set(true);
+        spawn_local(async move {
+            let result = IdentityClient::new(identity_url())
+                .delete_account(&access_token.get_untracked(), &password)
+                .await;
+            match result {
+                Ok(until) => {
+                    set_deletion_pending.set(Some(until));
+                    set_delete_pw.set(String::new());
+                    set_status.set(
+                        "Löschung vorgemerkt. Bis zum Ablauf der Frist widerrufbar.".to_string(),
+                    );
+                }
+                Err(error) => set_status.set(format!("Löschen: {error}")),
+            }
+            set_busy.set(false);
+        });
+    };
+
+    // Vorgemerkte Löschung widerrufen.
+    let on_undelete = move |_| {
+        if busy.get_untracked() {
+            return;
+        }
+        set_busy.set(true);
+        spawn_local(async move {
+            let result = IdentityClient::new(identity_url())
+                .undelete_account(&access_token.get_untracked())
+                .await;
+            match result {
+                Ok(()) => {
+                    set_deletion_pending.set(None);
+                    set_status.set("Löschung widerrufen. Das Konto bleibt.".to_string());
+                }
+                Err(error) => set_status.set(format!("Widerrufen: {error}")),
+            }
+            set_busy.set(false);
+        });
+    };
+
     // Geteilter Nachlade-Ablauf der Gerätemenge, von mehreren Handlern
     // genutzt (Öffnen, Freischalten, Entfernen).
     let refresh_devices = {
@@ -3374,13 +3457,70 @@ fn App() -> impl IntoView {
                                                                 </button>
                                                             </div>
                                                         </div>
-                                                        <div class="sm-set-row sm-set-plan">
-                                                            <span class="sm-set-label sm-set-danger">
-                                                                "Konto löschen"
-                                                                <small>"NF030: Löschung mit Widerrufsfrist über Crypto-Shredding; braucht den Dienst-Unterbau."</small>
-                                                            </span>
-                                                            <span class="sm-set-badge">"geplant"</span>
-                                                        </div>
+                                                        {move || {
+                                                            match deletion_pending.get() {
+                                                                // Läuft eine Löschung: Frist zeigen und
+                                                                // das Widerrufen anbieten.
+                                                                Some(until) => {
+                                                                    view! {
+                                                                        <div class="sm-set-row" role="alert">
+                                                                            <span class="sm-set-label sm-set-danger">
+                                                                                "Konto wird gelöscht"
+                                                                                <small>
+                                                                                    "Vorgemerkt bis "
+                                                                                    {format_date(until)}
+                                                                                    ". Bis dahin kann die Löschung widerrufen werden; danach werden Konto und Schlüssel entfernt."
+                                                                                </small>
+                                                                            </span>
+                                                                            <button
+                                                                                type="button"
+                                                                                class="sm-secondary"
+                                                                                on:click=on_undelete
+                                                                                disabled=busy
+                                                                            >
+                                                                                "Löschung widerrufen"
+                                                                            </button>
+                                                                        </div>
+                                                                    }
+                                                                        .into_any()
+                                                                }
+                                                                // Aktiv: Löschen mit Passwort-Bestätigung
+                                                                // (zerstörend, deshalb bewusster Schritt).
+                                                                None => {
+                                                                    view! {
+                                                                        <div class="sm-set-row">
+                                                                            <span class="sm-set-label sm-set-danger">
+                                                                                "Konto löschen"
+                                                                                <small>
+                                                                                    "Merkt die Löschung mit Widerrufsfrist vor (NF030); danach werden Konto, Geräte und Schlüssel entfernt. Zum Bestätigen das Passwort eingeben."
+                                                                                </small>
+                                                                            </span>
+                                                                            <div class="sm-set-inline">
+                                                                                <input
+                                                                                    type="password"
+                                                                                    class="sm-set-input"
+                                                                                    aria-label="Passwort zum Löschen bestätigen"
+                                                                                    placeholder="Passwort"
+                                                                                    prop:value=delete_pw
+                                                                                    on:input=move |ev| {
+                                                                                        set_delete_pw.set(event_target_value(&ev))
+                                                                                    }
+                                                                                />
+                                                                                <button
+                                                                                    type="button"
+                                                                                    class="sm-danger-btn"
+                                                                                    on:click=on_delete_account
+                                                                                    disabled=busy
+                                                                                >
+                                                                                    "Konto löschen"
+                                                                                </button>
+                                                                            </div>
+                                                                        </div>
+                                                                    }
+                                                                        .into_any()
+                                                                }
+                                                            }
+                                                        }}
                                                     </section>
 
                                                     <section class="sm-set-group" aria-label="Sicherheit">

@@ -1087,6 +1087,38 @@ button:disabled {
   color: var(--sm-danger);
 }
 
+/* Passwortfeld plus Knopf des Loesch-Eintrags nebeneinander (umbrechend auf
+   schmalen Ansichten). */
+.sm-set-inline {
+  display: flex;
+  gap: var(--sm-space-2);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* Der Loesch-Knopf ist die eine ernsthaft zerstoerende Aktion: Gefahr-Ton
+   als Umrandung und Schrift auf dem Flaechen-Grund (kein Fuell-Ton, weil
+   --sm-danger im Dunkelmodus ein helles, fuer Text gedachtes Rot ist, auf
+   dem Weiss zu wenig Kontrast haette; danger-auf-surface ist dagegen im
+   Kontrast-Test verankert). Der Klartext "Konto loeschen" traegt die
+   Bedeutung mit, nicht nur die Farbe (SC 1.4.1); die Passwort-Bestaetigung
+   davor ist der Absicherungsschritt (GOV.UK zu destruktiven Aktionen). */
+.sm-danger-btn {
+  font: inherit;
+  font-size: 0.9rem;
+  padding: var(--sm-space-1) var(--sm-space-3);
+  border: 1px solid var(--sm-danger);
+  border-radius: var(--sm-radius);
+  background: var(--sm-surface);
+  color: var(--sm-danger);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sm-danger-btn:focus-visible {
+  outline: 3px solid var(--sm-focus);
+  outline-offset: 2px;
+}
+
 /* Geplante Funktionen: sichtbar, aber erkennbar inaktiv, mit Grund im
    small-Text. Kein klickbares, funktionsloses Steuerelement (NN/g zu
    Disabled-States); nur eine Marke rechts. */

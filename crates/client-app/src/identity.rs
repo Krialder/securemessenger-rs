@@ -104,6 +104,11 @@ pub struct Session {
     pub token_type: String,
     /// Sekunden bis zum Ablauf des Access-Tokens.
     pub expires_in: u64,
+    /// Bei einer vorgemerkten Konto-Löschung der Ablauf der Widerrufsfrist
+    /// (Unix-Sekunden); `None` bei einem aktiven Konto. Der Client zeigt
+    /// damit direkt nach dem Login, dass eine Löschung läuft.
+    #[serde(default)]
+    pub deletion_pending_until: Option<u64>,
 }
 
 impl IdentityClient {
@@ -367,6 +372,40 @@ impl IdentityClient {
         expect_success(response).await
     }
 
+    /// `DELETE /accounts`: merkt die Löschung des eigenen Kontos vor (NF030,
+    /// Widerrufsfrist). Bearer plus Passwort zur Bestätigung. Liefert den
+    /// Ablauf der Frist (Unix-Sekunden); bis dahin ist die Löschung mit
+    /// `undelete_account` widerrufbar. `401` heißt: Passwort falsch.
+    pub async fn delete_account(
+        &self,
+        access_token: &str,
+        password: &str,
+    ) -> Result<u64, ClientError> {
+        let response = self
+            .http
+            .delete(self.url("/accounts"))
+            .bearer_auth(access_token)
+            .json(&DeleteAccountBody { password })
+            .send()
+            .await
+            .map_err(transport)?;
+        let scheduled: DeletionScheduled = parse_json(response).await?;
+        Ok(scheduled.deletion_pending_until)
+    }
+
+    /// `POST /accounts/undelete`: widerruft eine vorgemerkte Löschung
+    /// innerhalb der Frist (Bearer, kein Passwort nötig).
+    pub async fn undelete_account(&self, access_token: &str) -> Result<(), ClientError> {
+        let response = self
+            .http
+            .post(self.url("/accounts/undelete"))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(transport)?;
+        expect_success(response).await
+    }
+
     /// `POST /provision`: legt einen verschlüsselten Kopplungs-Antrag unter
     /// seiner Kanal-ID im Relay ab (QR-Kopplung). Tokenlos, weil das neue
     /// Gerät noch nicht registriert ist und der Inhalt für den Dienst opak
@@ -425,6 +464,16 @@ impl IdentityClient {
             .map_err(transport)?;
         expect_success(response).await
     }
+}
+
+#[derive(Serialize)]
+struct DeleteAccountBody<'a> {
+    password: &'a str,
+}
+
+#[derive(Deserialize)]
+struct DeletionScheduled {
+    deletion_pending_until: u64,
 }
 
 #[derive(Serialize)]

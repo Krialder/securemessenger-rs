@@ -145,8 +145,12 @@ impl AccountStore for PgAccountStore {
     }
 
     async fn get(&self, handle: &str) -> Result<Option<Account>, StoreError> {
+        // deletion_pending_until ist TIMESTAMPTZ; als Unix-Sekunden
+        // (BIGINT-Epoche) lesen, damit kein sqlx-Zeit-Feature nötig ist und
+        // der Wert zum u64-Feld im Fachmodell passt.
         let row = sqlx::query(
-            "SELECT id, handle, display_name, password_hash, identity_key \
+            "SELECT id, handle, display_name, password_hash, identity_key, \
+                    EXTRACT(EPOCH FROM deletion_pending_until)::BIGINT AS deletion_epoch \
              FROM accounts WHERE handle = $1",
         )
         .bind(handle)
@@ -156,12 +160,14 @@ impl AccountStore for PgAccountStore {
         Ok(row.map(|r| {
             let identity_key: Vec<u8> = r.get("identity_key");
             let id: Uuid = r.get("id");
+            let deletion_epoch: Option<i64> = r.get("deletion_epoch");
             Account {
                 id: id.to_string(),
                 handle: r.get("handle"),
                 display_name: r.get("display_name"),
                 password_hash: r.get("password_hash"),
                 identity_key: BASE64.encode(identity_key),
+                deletion_pending_until: deletion_epoch.and_then(|e| u64::try_from(e).ok()),
             }
         }))
     }
@@ -177,6 +183,70 @@ impl AccountStore for PgAccountStore {
             return Err(StoreError::AccountMissing);
         }
         Ok(())
+    }
+
+    async fn schedule_deletion(&self, handle: &str, deletion_at: u64) -> Result<(), StoreError> {
+        // Die Frist als Unix-Sekunden in TIMESTAMPTZ setzen (to_timestamp),
+        // status auf deletion_pending. Reines SQL, keine Rust-Zeitarithmetik.
+        let result = sqlx::query(
+            "UPDATE accounts \
+             SET status = 'deletion_pending', deletion_pending_until = to_timestamp($2) \
+             WHERE handle = $1",
+        )
+        .bind(handle)
+        .bind(deletion_at as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::AccountMissing);
+        }
+        Ok(())
+    }
+
+    async fn cancel_deletion(&self, handle: &str) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            "UPDATE accounts SET status = 'active', deletion_pending_until = NULL \
+             WHERE handle = $1",
+        )
+        .bind(handle)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::AccountMissing);
+        }
+        Ok(())
+    }
+
+    async fn purge_deleted(&self, now: u64) -> Result<u64, StoreError> {
+        // Discovery hat keinen Fremdschlüssel auf accounts, also zuerst die
+        // Discovery-Einträge der fälligen Konten löschen; die accounts-Zeile
+        // kaskadiert dann Geräte, Sessions und Refresh-Hashes über die
+        // Fremdschlüssel (Crypto-Shredding). Eine Transaktion, damit kein
+        // halber Zustand entsteht.
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        sqlx::query(
+            "DELETE FROM discovery WHERE account_id IN \
+             (SELECT id FROM accounts \
+              WHERE deletion_pending_until IS NOT NULL \
+                AND deletion_pending_until <= to_timestamp($1))",
+        )
+        .bind(now as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        let result = sqlx::query(
+            "DELETE FROM accounts \
+             WHERE deletion_pending_until IS NOT NULL \
+               AND deletion_pending_until <= to_timestamp($1)",
+        )
+        .bind(now as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(result.rows_affected())
     }
 
     async fn add_device(&self, handle: &str, device: Device) -> Result<u16, StoreError> {

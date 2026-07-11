@@ -48,6 +48,7 @@ fn account(handle: &str) -> Account {
         display_name: handle.to_string(),
         password_hash: "$argon2id$fake".to_string(),
         identity_key: b64(1),
+        deletion_pending_until: None,
     }
 }
 
@@ -95,6 +96,53 @@ async fn account_roundtrip_and_conflicts() {
     clash.id = first.id.clone();
     let err = store.create(account(&other), clash).await.unwrap_err();
     assert_eq!(err, StoreError::DeviceIdTaken);
+}
+
+#[tokio::test]
+async fn deletion_schedule_cancel_and_purge() {
+    let Some(pool) = pool().await else { return };
+    let store = PgAccountStore::new(pool);
+    let handle = unique_handle("pg-loeschen");
+    let first = device(30);
+    store.create(account(&handle), first.clone()).await.unwrap();
+    store.add_device(&handle, device(31)).await.unwrap();
+
+    // Vormerken: die Frist kommt als Unix-Sekunden zurück (TIMESTAMPTZ ->
+    // Epoche), das Konto bleibt.
+    let deadline = 4_000_000_000u64; // fern in der Zukunft
+    store.schedule_deletion(&handle, deadline).await.unwrap();
+    let loaded = store.get(&handle).await.unwrap().unwrap();
+    assert_eq!(loaded.deletion_pending_until, Some(deadline));
+    assert_eq!(store.purge_deleted(deadline - 1).await, Ok(0));
+    assert!(store.get(&handle).await.unwrap().is_some());
+
+    // Widerruf: wieder aktiv, ein späterer Purge lässt es stehen.
+    store.cancel_deletion(&handle).await.unwrap();
+    assert_eq!(
+        store
+            .get(&handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .deletion_pending_until,
+        None
+    );
+    assert_eq!(store.purge_deleted(deadline + 1).await, Ok(0));
+
+    // Mit einer Frist in der Vergangenheit vormerken, dann purgen: das Konto
+    // ist weg, die Geräte kaskadieren, die Geräte-ID wird wieder vergebbar.
+    store.schedule_deletion(&handle, 1000).await.unwrap();
+    assert_eq!(store.purge_deleted(2000).await, Ok(1));
+    assert!(store.get(&handle).await.unwrap().is_none());
+    let mut reuse = device(32);
+    reuse.id = first.id.clone();
+    let reborn = unique_handle("pg-neu");
+    store.create(account(&reborn), reuse).await.unwrap();
+
+    assert_eq!(
+        store.schedule_deletion("pg-gibt-es-nicht", 1).await,
+        Err(StoreError::AccountMissing)
+    );
 }
 
 #[tokio::test]

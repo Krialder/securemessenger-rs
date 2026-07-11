@@ -828,3 +828,83 @@ async fn password_change_verifies_old_revokes_others_and_relogins() {
     .await;
     assert_eq!(status, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn account_deletion_schedules_reports_and_undeletes() {
+    let app = test_app();
+    let identity = key(13);
+
+    let register = register_body(&identity, "quinn", "quinns-langes-passwort", DEV_FIRST);
+    let (status, _) = send(&app, "POST", "/accounts", Some(register), None).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, body) = send(
+        &app,
+        "POST",
+        "/sessions",
+        Some(login_body("quinn", "quinns-langes-passwort", DEV_FIRST)),
+        None,
+    )
+    .await;
+    let access = body["access_token"].as_str().unwrap().to_string();
+    // Ein aktives Konto trägt keine Löschfrist in der Login-Antwort.
+    assert!(body.get("deletion_pending_until").is_none());
+
+    // Falsches Passwort: abgelehnt, nichts vorgemerkt.
+    let (status, body) = send(
+        &app,
+        "DELETE",
+        "/accounts",
+        Some(json!({ "password": "falsch" })),
+        Some(&access),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], "invalid_credentials");
+
+    // Ohne Token: abgelehnt.
+    let (status, _) = send(
+        &app,
+        "DELETE",
+        "/accounts",
+        Some(json!({ "password": "quinns-langes-passwort" })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Korrekt: 200 mit Frist.
+    let (status, body) = send(
+        &app,
+        "DELETE",
+        "/accounts",
+        Some(json!({ "password": "quinns-langes-passwort" })),
+        Some(&access),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["deletion_pending_until"].as_u64().unwrap() > 0);
+
+    // Die nächste Anmeldung meldet die laufende Löschung.
+    let (_, body) = send(
+        &app,
+        "POST",
+        "/sessions",
+        Some(login_body("quinn", "quinns-langes-passwort", DEV_FIRST)),
+        None,
+    )
+    .await;
+    assert!(body["deletion_pending_until"].as_u64().unwrap() > 0);
+
+    // Widerrufen: 204, danach ist die Frist weg.
+    let (status, _) = send(&app, "POST", "/accounts/undelete", None, Some(&access)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, body) = send(
+        &app,
+        "POST",
+        "/sessions",
+        Some(login_body("quinn", "quinns-langes-passwort", DEV_FIRST)),
+        None,
+    )
+    .await;
+    assert!(body.get("deletion_pending_until").is_none());
+}

@@ -121,6 +121,8 @@ async fn run() -> Result<(), String> {
         "link-finish" => link_finish(&args[1..]).await,
         "devices" => devices().await,
         "unlink" => unlink(&args[1..]).await,
+        "delete-account" => delete_account(&args[1..]).await,
+        "undelete" => undelete().await,
         "publish-keys" => publish_keys().await,
         "send" => send(&args[1..]).await,
         "recv" => recv().await,
@@ -1267,6 +1269,42 @@ async fn unlink(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `sm delete-account <passwort>`: merkt die Löschung des eigenen Kontos vor
+/// (NF030, Widerrufsfrist). Das Passwort bestätigt, dass es der Besitzer ist.
+/// Bis zum Ablauf der Frist ist die Löschung mit `sm undelete` widerrufbar;
+/// danach entfernt der Server-Purge Konto und Schlüssel. Die CLI versiegelt
+/// nichts neu: ihre Ablage liegt unter der separaten SM_PASSPHRASE, nicht
+/// unter dem Konto-Passwort.
+async fn delete_account(args: &[String]) -> Result<(), String> {
+    let [password] = args else {
+        return Err("Aufruf: sm delete-account <passwort>".to_string());
+    };
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    let until = IdentityClient::new(identity_url())
+        .delete_account(&token, password)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!(
+        "Löschung vorgemerkt. Widerrufsfrist läuft bis Unix-Zeit {until}. \
+         Widerrufen mit 'sm undelete'."
+    );
+    Ok(())
+}
+
+/// `sm undelete`: widerruft eine vorgemerkte Konto-Löschung innerhalb der
+/// Frist.
+async fn undelete() -> Result<(), String> {
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    IdentityClient::new(identity_url())
+        .undelete_account(&token)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("Löschung widerrufen. Das Konto bleibt bestehen.");
+    Ok(())
+}
+
 /// `sm verify`: die KT-Selbstprüfung des eigenen Kontos
 /// (specs/key-transparency.md). Rechnet das Commitment aus Konto-Schlüssel
 /// und eigener Gerätemenge nach und verifiziert den Inklusionsbeweis gegen
@@ -1318,6 +1356,8 @@ fn print_usage() {
          \x20 link-finish <handle> <passwort>  Kopplung auf dem Zweitgeraet abschliessen\n\
          \x20 devices                        eigene Geraetemenge mit Nummern anzeigen\n\
          \x20 unlink <geraete-id>            ein Geraet entfernen (Revocation)\n\
+         \x20 delete-account <passwort>     Konto-Loeschung vormerken (Widerrufsfrist)\n\
+         \x20 undelete                      vorgemerkte Loeschung widerrufen\n\
          \x20 publish-keys                   Prekey-Satz im Verzeichnis veröffentlichen\n\
          \x20 send <handle> <text> [--ttl s] [--sealed]  E2EE senden (--ttl: verschwindet; --sealed: ohne Absender-Klartext)\n\
          \x20 recv                           wartende Nachrichten abholen und entschlüsseln\n\

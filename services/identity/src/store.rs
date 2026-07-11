@@ -69,6 +69,21 @@ pub trait AccountStore: Send + Sync {
     /// die Ablage tauscht nur den Wert. `AccountMissing`, wenn das Konto
     /// nicht existiert (über die authentifizierte API nicht erreichbar).
     async fn set_password_hash(&self, handle: &str, password_hash: &str) -> Result<(), StoreError>;
+    /// Merkt eine Konto-Löschung vor (NF030, Widerrufsfrist): setzt den
+    /// Ablauf der Frist (`deletion_at`, Unix-Sekunden). Bis dahin kann der
+    /// Nutzer widerrufen; danach entfernt `purge_deleted` das Konto.
+    /// `AccountMissing`, wenn das Konto nicht existiert.
+    async fn schedule_deletion(&self, handle: &str, deletion_at: u64) -> Result<(), StoreError>;
+    /// Widerruft eine vorgemerkte Löschung (setzt das Konto wieder aktiv).
+    /// Idempotent: ist keine Löschung vorgemerkt, bleibt es aktiv.
+    async fn cancel_deletion(&self, handle: &str) -> Result<(), StoreError>;
+    /// Entfernt alle Konten, deren Widerrufsfrist abgelaufen ist
+    /// (`deletion_pending_until <= now`), samt ihrer Geräte, Sessions und
+    /// Discovery-Einträge (Crypto-Shredding: der Konto-Identitätsschlüssel
+    /// und die Credentials verschwinden). Liefert die Anzahl gelöschter
+    /// Konten. Operator-aufrufbar wie der Session-Purge; ein Neustart braucht
+    /// ihn nicht.
+    async fn purge_deleted(&self, now: u64) -> Result<u64, StoreError>;
     /// Fügt einem Konto ein weiteres Gerät hinzu und vergibt ihm die
     /// nächste freie Protokollnummer (max der vorhandenen, auch revozierter,
     /// plus 1). Liefert die vergebene Nummer zurück, damit der Client sie
@@ -168,6 +183,50 @@ impl AccountStore for InMemoryStore {
             .ok_or(StoreError::AccountMissing)?;
         record.account.password_hash = password_hash.to_string();
         Ok(())
+    }
+
+    async fn schedule_deletion(&self, handle: &str, deletion_at: u64) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().expect("Store-Lock nicht vergiftet");
+        let record = inner
+            .records
+            .get_mut(handle)
+            .ok_or(StoreError::AccountMissing)?;
+        record.account.deletion_pending_until = Some(deletion_at);
+        Ok(())
+    }
+
+    async fn cancel_deletion(&self, handle: &str) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().expect("Store-Lock nicht vergiftet");
+        let record = inner
+            .records
+            .get_mut(handle)
+            .ok_or(StoreError::AccountMissing)?;
+        record.account.deletion_pending_until = None;
+        Ok(())
+    }
+
+    async fn purge_deleted(&self, now: u64) -> Result<u64, StoreError> {
+        let mut inner = self.inner.write().expect("Store-Lock nicht vergiftet");
+        // Fällige Konten sammeln, dann samt Geräten, Geräte-IDs und
+        // Discovery-Einträgen entfernen. (Sessions liegen im getrennten
+        // SessionStore und laufen ab; in PostgreSQL kaskadieren sie über den
+        // Fremdschlüssel.)
+        let due: Vec<String> = inner
+            .records
+            .iter()
+            .filter(|(_, r)| r.account.deletion_pending_until.is_some_and(|t| t <= now))
+            .map(|(handle, _)| handle.clone())
+            .collect();
+        for handle in &due {
+            if let Some(record) = inner.records.remove(handle) {
+                let account_id = record.account.id.clone();
+                for device in &record.devices {
+                    inner.device_ids.remove(&device.id);
+                }
+                inner.discovery.retain(|_, rec| rec.id != account_id);
+            }
+        }
+        Ok(due.len() as u64)
     }
 
     async fn add_device(&self, handle: &str, device: Device) -> Result<u16, StoreError> {
@@ -274,6 +333,7 @@ mod tests {
             display_name: handle.into(),
             password_hash: "hash".into(),
             identity_key: "key".into(),
+            deletion_pending_until: None,
         }
     }
 
@@ -347,6 +407,55 @@ mod tests {
         assert_eq!(
             store.revoke_device("alice", "d2").await,
             Err(StoreError::DeviceNotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_schedule_cancel_and_purge() {
+        let store = InMemoryStore::default();
+        store.create(account("dora"), device("d1")).await.unwrap();
+        store.add_device("dora", device("d2")).await.unwrap();
+
+        // Vormerken mit einer Frist in der Zukunft: das Konto bleibt.
+        store.schedule_deletion("dora", 2000).await.unwrap();
+        assert_eq!(
+            store
+                .get("dora")
+                .await
+                .unwrap()
+                .unwrap()
+                .deletion_pending_until,
+            Some(2000)
+        );
+        // Purge vor der Frist entfernt nichts.
+        assert_eq!(store.purge_deleted(1999).await, Ok(0));
+        assert!(store.get("dora").await.unwrap().is_some());
+
+        // Widerruf setzt das Konto wieder aktiv; ein späterer Purge lässt es.
+        store.cancel_deletion("dora").await.unwrap();
+        assert_eq!(
+            store
+                .get("dora")
+                .await
+                .unwrap()
+                .unwrap()
+                .deletion_pending_until,
+            None
+        );
+        assert_eq!(store.purge_deleted(5000).await, Ok(0));
+        assert!(store.get("dora").await.unwrap().is_some());
+
+        // Erneut vormerken, dann nach Ablauf purgen: Konto und Geräte weg,
+        // die Geräte-IDs werden wieder frei.
+        store.schedule_deletion("dora", 2000).await.unwrap();
+        assert_eq!(store.purge_deleted(2000).await, Ok(1));
+        assert!(store.get("dora").await.unwrap().is_none());
+        // Eine der freigegebenen Geräte-IDs ist wieder vergebbar.
+        store.create(account("neu"), device("d1")).await.unwrap();
+
+        assert_eq!(
+            store.schedule_deletion("gibt-es-nicht", 1).await,
+            Err(StoreError::AccountMissing)
         );
     }
 

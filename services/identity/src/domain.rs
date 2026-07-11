@@ -23,6 +23,12 @@ pub struct Account {
     /// der Geräte-Credentials; der private Teil liegt nie beim Server
     /// (specs/geraete-identitaet.md).
     pub identity_key: String,
+    /// Ist eine Löschung vorgemerkt, steht hier der Ablauf der Widerrufsfrist
+    /// als Unix-Sekunden (NF030: Löschung mit Widerrufsfrist). `None` bei
+    /// einem aktiven Konto. Bis zu diesem Zeitpunkt kann der Nutzer die
+    /// Löschung widerrufen; danach entfernt der Purge das Konto und mit ihm
+    /// die Schlüssel (Crypto-Shredding).
+    pub deletion_pending_until: Option<u64>,
 }
 
 // Debug von Hand, damit der Hash nicht in Logs oder Fehlermeldungen leakt.

@@ -564,3 +564,44 @@ async fn password_change_relogins_and_revokes_other_device() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Konto-Löschung vormerken und widerrufen über die echten Dienste
+/// (NF030, Widerrufsfrist). Der Purge nach Ablauf prüfen die Store-Tests;
+/// hier zählt der Client-zu-Server-Weg der beiden Endpunkte.
+#[tokio::test(flavor = "multi_thread")]
+async fn account_deletion_schedule_and_undelete() {
+    let urls = start_stack().await;
+    let dir = std::env::temp_dir().join(format!("sm-del-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("Testverzeichnis");
+
+    let uwe = CliUser::new(&dir, "uwe", &urls);
+    uwe.run(&["register", "uwe", "uwes-langes-passwort"]);
+    uwe.run(&["login", "uwes-langes-passwort"]);
+
+    // Falsches Passwort: die Löschung wird abgelehnt (Prozess scheitert).
+    let wrong = uwe
+        .command(&["delete-account", "falsches-passwort"])
+        .output()
+        .expect("sm startet");
+    assert!(
+        !wrong.status.success(),
+        "eine Löschung mit falschem Passwort darf nicht durchgehen"
+    );
+
+    // Korrektes Passwort: vorgemerkt.
+    let scheduled = uwe.run(&["delete-account", "uwes-langes-passwort"]);
+    assert!(
+        scheduled.contains("Löschung vorgemerkt"),
+        "die Löschung muss vorgemerkt werden, stdout war: {scheduled}"
+    );
+
+    // Widerrufen: das Konto bleibt, eine erneute Anmeldung klappt.
+    let cancelled = uwe.run(&["undelete"]);
+    assert!(
+        cancelled.contains("widerrufen"),
+        "der Widerruf muss bestätigt werden, stdout war: {cancelled}"
+    );
+    uwe.run(&["login", "uwes-langes-passwort"]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
