@@ -11,5 +11,6 @@ pub mod credential;
 pub mod domain;
 pub mod kt_notify;
 pub mod pg;
+pub mod provision;
 pub mod session;
 pub mod store;

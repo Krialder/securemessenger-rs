@@ -43,6 +43,12 @@ rand = { workspace = true }
 # Verschlüsselte Geräte-Ablage: der IndexedDB-Blob wird unter dem
 # Login-Passwort gesealt (Argon2id + ChaCha20-Poly1305).
 keystore = { workspace = true }
+# QR-Kopplung: das Zweitgerät verschluesselt seinen Kopplungs-Antrag unter
+# einem im QR gezeigten Geheimnis, der Relay transportiert nur Chiffretext.
+provisioning = { workspace = true }
+# QR-Code-Erzeugung (reines Rust, kein Bild-Feature): die Matrix wird selbst
+# zu einem Inline-SVG gerendert, damit keine Fremd-Ressource noetig ist.
+qrcode = { version = "0.14", default-features = false }
 # Zustands-Blob der Ablage und Profil/Kontakte: dasselbe debugbare
 # JSON-Format wie beim CLI.
 serde = { workspace = true }

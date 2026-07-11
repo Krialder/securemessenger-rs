@@ -658,3 +658,67 @@ async fn internal_routes_for_service_to_service() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn provision_relay_round_trips_and_404s() {
+    let app = test_app();
+    // 32 Hex-Zeichen = das erwartete Kanal-ID-Format (16 Byte).
+    let channel = "abcdef0123456789abcdef0123456789";
+
+    // Ablegen, dann holen: Nonce und Chiffretext kommen unverändert zurück.
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/provision",
+        Some(json!({ "channel": channel, "nonce": "bm9uY2U=", "ciphertext": "Y2lwaGVy" })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Zweites Ablegen auf denselben Kanal: erster gewinnt (409). Vor dem
+    // GET geprüft, weil der GET den Kanal verbraucht.
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/provision",
+        Some(json!({ "channel": channel, "nonce": "eA==", "ciphertext": "eQ==" })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["code"], "channel_taken");
+
+    // Erster GET liefert den Antrag ...
+    let (status, body) = send(&app, "GET", &format!("/provision/{channel}"), None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["nonce"], "bm9uY2U=");
+    assert_eq!(body["ciphertext"], "Y2lwaGVy");
+
+    // ... ein zweiter GET nicht mehr (consume-on-read): der Kanal ist weg.
+    let (status, _) = send(&app, "GET", &format!("/provision/{channel}"), None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Unbekannter Kanal: 404 ohne weitere Auskunft.
+    let (status, _) = send(
+        &app,
+        "GET",
+        "/provision/00000000000000000000000000000000",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Kaputte Kanal-ID beim Ablegen: 400.
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/provision",
+        Some(json!({ "channel": "zu-kurz", "nonce": "eA==", "ciphertext": "eQ==" })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_channel");
+}

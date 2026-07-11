@@ -817,7 +817,7 @@ button:disabled {
 
 .sm-device-own {
   font-size: 0.75rem;
-  color: var(--sm-on-surface-variant);
+  color: var(--sm-on-surface-muted);
   white-space: nowrap;
 }
 
@@ -838,6 +838,39 @@ button:disabled {
 .sm-link-field span {
   font-size: 0.8rem;
   color: var(--sm-on-surface);
+}
+
+/* QR-Code der Kopplung: der Code ist bewusst schwarz auf weiss (im SVG
+   fest), damit ihn jeder Scanner liest; der weisse Rahmen mit Ruhezone gilt
+   in beiden Modi. Fest begrenzte Breite, damit er nicht die halbe Karte
+   fuellt. */
+.sm-qr {
+  inline-size: min(14rem, 60vw);
+  aspect-ratio: 1;
+  margin: var(--sm-space-2) 0;
+  padding: var(--sm-space-2);
+  background: #ffffff;
+  border-radius: var(--sm-radius);
+  border: 1px solid var(--sm-divider);
+}
+
+.sm-qr svg {
+  display: block;
+}
+
+/* Der Kopplungs-Code als abtippbare Rueckfallebene: Monospace, damit
+   Zeichen sich nicht verwechseln. */
+.sm-code {
+  font-family: var(--sm-font-mono);
+  font-size: 0.85rem;
+}
+
+/* Der manuelle Antragsweg steckt in einem <details>, damit er den QR-Weg
+   nicht ueberlagert, aber bei Bedarf da ist. */
+.sm-link-manual summary {
+  font-size: 0.8rem;
+  color: var(--sm-on-surface-muted);
+  cursor: pointer;
 }
 
 /* Melden-Aktion in der Empfangs-Blase: bewusst leise (Text-Knopf), damit

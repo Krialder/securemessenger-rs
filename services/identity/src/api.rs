@@ -21,6 +21,7 @@ use crate::auth;
 use crate::credential;
 use crate::domain::{Account, Device};
 use crate::kt_notify::{KtNotifier, NoopKtNotifier};
+use crate::provision::{ProvisionRelay, PutError};
 use crate::session::{
     InMemorySessionStore, RefreshError, SessionConfig, SessionIdentity, SessionStore,
 };
@@ -71,6 +72,10 @@ pub struct AppState {
     /// Aussteller der Sealed-Sender-Zertifikate; ohne Wert sind die
     /// Sealed-Sender-Routen abgeschaltet (specs/sealed-sender-und-abuse.md).
     sealed_sender: Option<Arc<sealed_cert::Issuer>>,
+    /// Flüchtiger Relay für die QR-Kopplung: transportiert den unter einem
+    /// Geheimnis verschlüsselten Kopplungs-Antrag vom neuen zum
+    /// freischaltenden Gerät (provision.rs). Sieht nie Klartext.
+    provision: Arc<ProvisionRelay>,
 }
 
 impl AppState {
@@ -110,6 +115,7 @@ impl AppState {
             discovery_oprf: None,
             pow_difficulty: 0,
             sealed_sender: None,
+            provision: Arc::new(ProvisionRelay::default()),
         }
     }
 
@@ -160,7 +166,24 @@ pub fn app(state: AppState) -> Router {
         .route("/sessions", post(login).delete(logout))
         .route("/sessions/refresh", post(refresh))
         .route("/devices", get(list_devices).post(add_device))
-        .route("/devices/{id}", delete(remove_device));
+        .route("/devices/{id}", delete(remove_device))
+        // QR-Kopplung: das neue Gerät legt seinen verschlüsselten Antrag ab
+        // (POST), das freischaltende holt ihn (GET). Beide ohne Token: das
+        // neue Gerät hat noch keins, und der Relay-Inhalt ist für ihn ohnehin
+        // opak. Immer eingehängt (kein Config-Gate), weil es reiner,
+        // zustandsloser Transport ist. Ein enger Body-Deckel (8 KiB) nur auf
+        // dem POST (die einzige Route mit Body), damit ein riesiger Request
+        // den Speicher nicht am Feld-Deckel vorbei füllt; die Feld-Grenzen in
+        // provision.rs sind die zweite Verteidigungslinie. Massenhaftes
+        // Kanal-Squatting bremst ein IP-Rate-Limit am Ingress (wie bei
+        // Login/Registrierung, deren Handle-Limit hier mangels Konto nicht
+        // greift); der QR-Weg fällt bei vollem Relay ohnehin sichtbar auf den
+        // manuellen Antrag zurück.
+        .route(
+            "/provision",
+            post(provision_put).layer(axum::extract::DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route("/provision/{channel}", get(provision_get));
     // Contact Discovery nur bei konfiguriertem OPRF-Schlüssel: sonst
     // existieren die Routen nicht (echtes 404 statt einer Antwort ohne
     // Verschleierung).
@@ -1092,6 +1115,74 @@ async fn remove_device(
             "Gerät ist unbekannt oder bereits entfernt",
         ),
         Err(error) => store_failure(error),
+    }
+}
+
+/// Was das neue Gerät ablegt (`POST /provision`): die aus dem Geheimnis
+/// abgeleitete Kanal-ID und der darunter verschlüsselte Antrag. Der Dienst
+/// prüft nichts am Inhalt, er hält nur die opaken Bytes.
+#[derive(Deserialize)]
+struct ProvisionPutRequest {
+    channel: String,
+    nonce: String,
+    ciphertext: String,
+}
+
+/// Was das freischaltende Gerät holt (`GET /provision/{channel}`).
+#[derive(Serialize)]
+struct ProvisionGetResponse {
+    nonce: String,
+    ciphertext: String,
+}
+
+/// `POST /provision`: legt einen verschlüsselten Kopplungs-Antrag unter
+/// seiner Kanal-ID ab (QR-Kopplung, specs/geraete-identitaet.md). Tokenlos:
+/// das neue Gerät ist noch nicht registriert, und der Inhalt ist für den
+/// Dienst opak. Erster gewinnt: ein belegter Kanal wird abgewiesen, statt
+/// still überschrieben (so fällt ein Vorpreschen auf).
+async fn provision_put(
+    State(st): State<AppState>,
+    Json(req): Json<ProvisionPutRequest>,
+) -> Response {
+    match st.provision.put(&req.channel, req.nonce, req.ciphertext) {
+        Ok(()) => StatusCode::CREATED.into_response(),
+        Err(PutError::InvalidChannel) => api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_channel",
+            "Kanal-ID hat nicht das erwartete Format",
+        ),
+        Err(PutError::TooLarge) => api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            "der verschluesselte Antrag ist zu gross",
+        ),
+        Err(PutError::ChannelTaken) => api_error(
+            StatusCode::CONFLICT,
+            "channel_taken",
+            "dieser Kopplungs-Kanal ist bereits belegt",
+        ),
+        Err(PutError::Full) => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "relay_full",
+            "der Kopplungs-Relay ist voruebergehend voll",
+        ),
+    }
+}
+
+/// `GET /provision/{channel}`: holt den abgelegten Antrag. `None` (nie
+/// abgelegt oder verfallen) ist ein 404 ohne weitere Auskunft.
+async fn provision_get(State(st): State<AppState>, Path(channel): Path<String>) -> Response {
+    match st.provision.get(&channel) {
+        Some((nonce, ciphertext)) => (
+            StatusCode::OK,
+            Json(ProvisionGetResponse { nonce, ciphertext }),
+        )
+            .into_response(),
+        None => api_error(
+            StatusCode::NOT_FOUND,
+            "channel_not_found",
+            "kein Kopplungs-Antrag unter dieser Kanal-ID",
+        ),
     }
 }
 

@@ -1,0 +1,33 @@
+[package]
+name = "provisioning"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Provisioning-Chiffre fuer die QR-Kopplung eines Zweitgeraets
+# (specs/geraete-identitaet.md "Freischaltung ueber QR-Code oder
+# Bestaetigung"). Das neue Geraet zeigt ein zufaelliges 32-Byte-Geheimnis
+# (im QR-Code), verschluesselt damit seinen Kopplungs-Antrag und legt den
+# Chiffretext unter einer aus dem Geheimnis abgeleiteten Kanal-ID beim Relay
+# ab; das freischaltende Geraet bekommt das Geheimnis ueber den QR/die
+# Eingabe, leitet dieselbe Kanal-ID und denselben Schluessel ab und
+# entschluesselt. Der Relay sieht nur die Kanal-ID und opaken Chiffretext
+# und kann weder lesen noch manipulieren (die Poly1305-Pruefung faengt jede
+# Aenderung). Kein Eigenbau: Schluesselableitung ueber HKDF-SHA256,
+# authentifizierte Verschluesselung ueber ChaCha20-Poly1305, beide aus den
+# geprueften RustCrypto-Bibliotheken; dieses Crate komponiert sie zu einem
+# versionierten Format. Baut auch nach wasm32 (reines Rust).
+
+[dependencies]
+# AEAD: frischer Nonce je seal aus dem OS-CSPRNG, Poly1305 faengt Manipulation.
+chacha20poly1305 = "0.10"
+# HKDF-SHA256 leitet aus dem 32-Byte-Geheimnis die Kanal-ID und den
+# Chiffre-Schluessel domaenengetrennt ab (RFC 5869).
+hkdf = "0.12"
+sha2 = { workspace = true }
+# Geheimnis und Nonce aus dem OS-CSPRNG.
+rand = { workspace = true }
+base64 = { workspace = true }
+# Das Geheimnis und den abgeleiteten Schluessel beim Fallenlassen wischen.
+zeroize = { version = "1", features = ["derive"] }

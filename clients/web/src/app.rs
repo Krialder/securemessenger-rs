@@ -454,6 +454,64 @@ fn now_unix() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
 }
 
+/// Rendert Daten als QR-Code zu einem Inline-SVG (dunkle Module auf weißem
+/// Grund, mit Ruhezone). Selbst gezeichnet aus der Modul-Matrix, damit keine
+/// Fremd-Ressource nötig ist und die Content-Security-Policy nichts laden
+/// muss. Schwarz auf Weiß unabhängig vom Modus: QR-Leser erwarten dunkel auf
+/// hell, ein invertierter Code scheitert bei manchen Scannern.
+fn qr_svg(data: &str) -> Option<String> {
+    use qrcode::types::Color;
+    use qrcode::QrCode;
+    let code = QrCode::new(data.as_bytes()).ok()?;
+    let width = code.width();
+    let quiet = 4usize;
+    let size = width + 2 * quiet;
+    let colors = code.to_colors();
+    let mut rects = String::new();
+    for y in 0..width {
+        for x in 0..width {
+            if colors[y * width + x] == Color::Dark {
+                rects.push_str(&format!(
+                    "<rect x=\"{}\" y=\"{}\" width=\"1\" height=\"1\"/>",
+                    x + quiet,
+                    y + quiet
+                ));
+            }
+        }
+    }
+    Some(format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {size} {size}\" \
+         width=\"100%\" height=\"100%\" shape-rendering=\"crispEdges\" \
+         role=\"img\" aria-label=\"QR-Code des Kopplungs-Codes\">\
+         <rect width=\"{size}\" height=\"{size}\" fill=\"#ffffff\"/>\
+         <g fill=\"#000000\">{rects}</g></svg>"
+    ))
+}
+
+/// Löst die Freischalt-Eingabe zu einem Kopplungs-Antrag auf: ist die Eingabe
+/// ein Kopplungs-Code (ein 32-Byte-Geheimnis aus dem QR), wird der Antrag
+/// über den Relay geholt und entschlüsselt; sonst ist die Eingabe schon der
+/// Antrag als Text (der manuelle Weg). Ein Geheimnis ist am festen Format
+/// eindeutig erkennbar (genau 32 Byte Base64), ein Antrag ist länger.
+async fn resolve_link_input(input: &str) -> Result<String, String> {
+    let trimmed = input.trim();
+    let Ok(secret) = provisioning::Secret::from_b64(trimmed) else {
+        // Kein Geheimnis: die Eingabe ist der Antrag selbst.
+        return Ok(trimmed.to_string());
+    };
+    let channel = secret.channel_id();
+    let (nonce, ciphertext) = IdentityClient::new(identity_url())
+        .provision_get(&channel)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            "Kein Kopplungs-Antrag unter diesem Code (abgelaufen oder falsch abgetippt)."
+                .to_string()
+        })?;
+    let plaintext = provisioning::open(&secret, &nonce, &ciphertext).map_err(|e| e.to_string())?;
+    String::from_utf8(plaintext).map_err(|e| format!("Antrag unlesbar: {e}"))
+}
+
 /// Die gespeicherte Modus-Wahl aus localStorage; ohne Wahl "system"
 /// (dann entscheidet die CSS-Media-Query nach der OS-Präferenz). Das
 /// gleiche Schlüsselwort wie im FOUC-Guard in index.html.
@@ -643,7 +701,15 @@ async fn login(storage: SharedStorage, password: String) -> Result<Onboarded, St
 /// Server-Anmeldung bestätigt (wie bei `login`), und in diesem Zustand liegt
 /// nur die frische, noch nicht autorisierte Geräte-Identität in der Ablage,
 /// keine Nachrichten.
-async fn link_start(storage: SharedStorage, handle: String) -> Result<String, String> {
+/// Ergebnis von `link_start`: der Kopplungs-Antrag als Text (immer, der
+/// manuelle Weg) und, falls das Ablegen beim Relay klappte, das Geheimnis
+/// für den QR-Code (der bequeme Weg).
+struct LinkStarted {
+    payload: String,
+    secret: Option<String>,
+}
+
+async fn link_start(storage: SharedStorage, handle: String) -> Result<LinkStarted, String> {
     let mut rng = rand::rng();
     let identity = IdentityKeyPair::generate(&mut rng);
     let registration_id = rand::Rng::random_range(&mut rng, 1u32..16380);
@@ -674,7 +740,28 @@ async fn link_start(storage: SharedStorage, handle: String) -> Result<String, St
         device_id,
         device_public_key: device_public,
     };
-    Ok(BASE64.encode(serde_json::to_vec(&request).map_err(|e| e.to_string())?))
+    let payload = BASE64.encode(serde_json::to_vec(&request).map_err(|e| e.to_string())?);
+
+    // Für die QR-Kopplung den Antrag zusätzlich unter einem frischen
+    // Geheimnis verschlüsseln und beim Relay ablegen. Das Geheimnis geht in
+    // den QR-Code; der Relay sieht nur Chiffretext (provisioning-Crate).
+    // Scheitert das Ablegen (Netz, Kanal-Kollision), bleibt der manuelle Weg
+    // (Antrag als Text kopieren), deshalb kein harter Fehler.
+    let secret = provisioning::Secret::generate();
+    let sealed = provisioning::seal(&secret, payload.as_bytes());
+    let relay_ok = IdentityClient::new(identity_url())
+        .provision_put(
+            &sealed.channel_id,
+            &sealed.nonce_b64,
+            &sealed.ciphertext_b64,
+        )
+        .await
+        .is_ok();
+
+    Ok(LinkStarted {
+        payload,
+        secret: relay_ok.then(|| secret.to_b64()),
+    })
 }
 
 /// Rekonstruiert den Kopplungs-Antrag aus einem angefangenen (Nummer 0)
@@ -1701,11 +1788,7 @@ async fn load_device_rows(storage: &SharedStorage, token: &str) -> Result<Vec<De
 /// den Kopplungs-Antrag, signiert dessen Credential mit dem Konto-Wurzel-
 /// schlüssel aus dem Profil und ruft `add_device`. Ohne Wurzelschlüssel
 /// (ein gekoppeltes Zweitgerät wäre so eins) geht das nicht.
-async fn approve_device(
-    storage: &SharedStorage,
-    token: &str,
-    payload: &str,
-) -> Result<u16, String> {
+async fn approve_device(storage: &SharedStorage, token: &str, input: &str) -> Result<u16, String> {
     let profile = load_profile(storage).ok_or("Kein Profil in der Ablage".to_string())?;
     if profile.account_seed.is_empty() {
         return Err(
@@ -1713,6 +1796,9 @@ async fn approve_device(
                 .to_string(),
         );
     }
+    // Die Eingabe kann ein QR-/Relay-Code oder der Antrag als Text sein.
+    let payload = resolve_link_input(input).await?;
+    let payload = payload.as_str();
     let seed: [u8; 32] = BASE64
         .decode(&profile.account_seed)
         .map_err(|e| format!("Konto-Seed unlesbar: {e}"))?
@@ -1760,9 +1846,15 @@ enum Boot {
     Locked,
     /// Eine begonnene Kopplung dieses Browsers als Zweitgerät (Profil liegt,
     /// aber die Nummer ist 0 = noch nicht freigeschaltet). Trägt den
-    /// Kopplungs-Antrag zum Anzeigen; nach dem Freischalten auf dem Erstgerät
-    /// schließt der Nutzer hier ab.
-    Linking(String),
+    /// Kopplungs-Antrag zum Anzeigen und, falls das Ablegen beim Relay klappte,
+    /// das Geheimnis für den QR-Code. Nach dem Freischalten auf dem Erstgerät
+    /// schließt der Nutzer hier ab. `secret` ist `None` nach einem Neuladen
+    /// mitten in der Kopplung (das Geheimnis ist flüchtig, nur der Antrag
+    /// liegt): dann bleibt der manuelle Weg.
+    Linking {
+        payload: String,
+        secret: Option<String>,
+    },
     /// Ablage nicht nutzbar (etwa privates Fenster ohne IndexedDB).
     Broken(String),
 }
@@ -1884,7 +1976,12 @@ fn App() -> impl IntoView {
                             // rekonstruieren und die Kopplung fortsetzen.
                             Some(p) if p.protocol_device_id == 0 => {
                                 match pending_link_payload(&storage).await {
-                                    Some(payload) => Boot::Linking(payload),
+                                    // Nach einem Neuladen ist das QR-Geheimnis
+                                    // weg (flüchtig); nur der manuelle Weg bleibt.
+                                    Some(payload) => Boot::Linking {
+                                        payload,
+                                        secret: None,
+                                    },
                                     None => Boot::Known(p.handle),
                                 }
                             }
@@ -2034,9 +2131,21 @@ fn App() -> impl IntoView {
             set_status.set("Kopplung wird vorbereitet ...".to_string());
             spawn_local(async move {
                 match link_start(storage, handle).await {
-                    Ok(payload) => {
-                        set_boot.set(Boot::Linking(payload));
-                        set_status.set(String::new());
+                    Ok(started) => {
+                        // Konnte der Antrag nicht beim Relay abgelegt werden
+                        // (Netz, Kanal voll), gibt es keinen QR-Code; dann den
+                        // manuellen Weg ansagen, statt ihn kommentarlos
+                        // anzubieten.
+                        let hint = if started.secret.is_none() {
+                            "Kein QR-Code (Relay nicht erreichbar). Den Antrag als Text übertragen."
+                        } else {
+                            ""
+                        };
+                        set_boot.set(Boot::Linking {
+                            payload: started.payload,
+                            secret: started.secret,
+                        });
+                        set_status.set(hint.to_string());
                     }
                     Err(error) => set_status.set(format!("Kopplung fehlgeschlagen: {error}")),
                 }
@@ -2070,6 +2179,11 @@ fn App() -> impl IntoView {
                 match link_finish(storage, password).await {
                     Ok(onboarded) => {
                         activate_session(onboarded);
+                        // Den Linking-Bootzustand (samt dem darin gehaltenen
+                        // Kopplungs-Geheimnis) fallen lassen: er wird nach der
+                        // Anmeldung nicht mehr angezeigt, und das Geheimnis
+                        // soll nicht die ganze Sitzung im Speicher bleiben.
+                        set_boot.set(Boot::Loading);
                         set_status.set("Gekoppelt. Empfängt ab jetzt eigene Kopien.".to_string());
                         set_hints.update(|n| *n += 1);
                     }
@@ -3249,7 +3363,8 @@ fn App() -> impl IntoView {
                                                         </ul>
                                                         <label class="sm-field sm-link-field">
                                                             <span>
-                                                                "Neues Gerät koppeln: Antrag aus 'sm link' einfügen"
+                                                                "Neues Gerät koppeln: Kopplungs-Code (vom QR) "
+                                                                "oder Antrag als Text einfügen"
                                                             </span>
                                                             <textarea
                                                                 class="sm-composer-input"
@@ -3832,26 +3947,53 @@ fn App() -> impl IntoView {
                                         }
                                             .into_any()
                                     }
-                                    Boot::Linking(payload) => {
+                                    Boot::Linking { payload, secret } => {
+                                        // Der QR-Code trägt das Kopplungs-Geheimnis;
+                                        // das Erstgerät scannt ihn (oder tippt den Code)
+                                        // und holt den Antrag verschlüsselt vom Relay.
+                                        let qr = secret.as_deref().and_then(qr_svg);
                                         view! {
                                             <section class="sm-card" aria-label="Gerät koppeln">
                                                 <h2>"Gerät koppeln: freischalten und abschließen"</h2>
                                                 <p class="sm-status">
-                                                    "Diesen Antrag auf dem Erstgerät freischalten (dort "
-                                                    "'sm approve <Antrag>' im CLI, oder in den Einstellungen "
-                                                    "unter Geräte einfügen). Danach hier das Passwort "
-                                                    "eingeben und abschließen."
+                                                    "Auf dem Erstgerät freischalten: den QR-Code scannen "
+                                                    "oder den Kopplungs-Code eingeben (Einstellungen, "
+                                                    "Geräte). Danach hier das Passwort eingeben und "
+                                                    "abschließen."
                                                 </p>
-                                                <label class="sm-field">
-                                                    <span>"Kopplungs-Antrag (auf dem Erstgerät freischalten)"</span>
-                                                    <textarea
-                                                        class="sm-composer-input"
-                                                        rows="3"
-                                                        readonly
-                                                    >
-                                                        {payload}
-                                                    </textarea>
-                                                </label>
+                                                {qr
+                                                    .map(|svg| {
+                                                        view! {
+                                                            <div
+                                                                class="sm-qr"
+                                                                role="group"
+                                                                aria-label="QR-Code zum Koppeln"
+                                                                inner_html=svg
+                                                            ></div>
+                                                        }
+                                                    })}
+                                                {secret
+                                                    .map(|code| {
+                                                        view! {
+                                                            <label class="sm-field">
+                                                                <span>"Kopplungs-Code (falls Scannen nicht geht)"</span>
+                                                                <input class="sm-code" readonly prop:value=code />
+                                                            </label>
+                                                        }
+                                                    })}
+                                                <details class="sm-link-manual">
+                                                    <summary>"Antrag als Text (manueller Weg)"</summary>
+                                                    <label class="sm-field">
+                                                        <span>"Diesen Antrag auf dem Erstgerät einfügen"</span>
+                                                        <textarea
+                                                            class="sm-composer-input"
+                                                            rows="3"
+                                                            readonly
+                                                        >
+                                                            {payload}
+                                                        </textarea>
+                                                    </label>
+                                                </details>
                                                 <div class="sm-field">
                                                     <label for="sm-linkpass">"Passwort des Kontos"</label>
                                                     <input

@@ -340,6 +340,51 @@ impl IdentityClient {
         expect_success(response).await
     }
 
+    /// `POST /provision`: legt einen verschlüsselten Kopplungs-Antrag unter
+    /// seiner Kanal-ID im Relay ab (QR-Kopplung). Tokenlos, weil das neue
+    /// Gerät noch nicht registriert ist und der Inhalt für den Dienst opak
+    /// bleibt. `409` (Kanal belegt) kommt als `ClientError::Api` zurück.
+    pub async fn provision_put(
+        &self,
+        channel: &str,
+        nonce: &str,
+        ciphertext: &str,
+    ) -> Result<(), ClientError> {
+        let body = ProvisionPutBody {
+            channel,
+            nonce,
+            ciphertext,
+        };
+        let response = self
+            .http
+            .post(self.url("/provision"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(transport)?;
+        expect_success(response).await
+    }
+
+    /// `GET /provision/{channel}`: holt den abgelegten Antrag (Nonce,
+    /// Chiffretext). `Ok(None)` bei `404`, also wenn nichts abgelegt oder der
+    /// Kanal verfallen ist; nur echte Fehler werden zum `ClientError`.
+    pub async fn provision_get(
+        &self,
+        channel: &str,
+    ) -> Result<Option<(String, String)>, ClientError> {
+        let response = self
+            .http
+            .get(self.url(&format!("/provision/{channel}")))
+            .send()
+            .await
+            .map_err(transport)?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let fetched: ProvisionFetched = parse_json(response).await?;
+        Ok(Some((fetched.nonce, fetched.ciphertext)))
+    }
+
     /// `DELETE /sessions`: meldet ab und widerruft die ganze Session-Familie.
     /// Der Dienst antwortet immer `204`, auch bei unbekanntem Token, damit die
     /// Antwort nichts über dessen Gültigkeit verrät.
@@ -353,6 +398,19 @@ impl IdentityClient {
             .map_err(transport)?;
         expect_success(response).await
     }
+}
+
+#[derive(Serialize)]
+struct ProvisionPutBody<'a> {
+    channel: &'a str,
+    nonce: &'a str,
+    ciphertext: &'a str,
+}
+
+#[derive(Deserialize)]
+struct ProvisionFetched {
+    nonce: String,
+    ciphertext: String,
 }
 
 #[derive(Serialize)]
