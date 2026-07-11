@@ -264,8 +264,21 @@ type WebDevice = Device<PersistentProtocolStore<BrowserStorage>>;
 #[derive(Serialize, Deserialize, Clone)]
 struct Profile {
     handle: String,
+    /// Konto-Wurzelschlüssel (Base64-Seed). Leer auf einem gekoppelten
+    /// Zweitgerät (der Browser als Zweitgerät hält nur seine Geräte-Identität,
+    /// nicht den Konto-Schlüssel; er kann senden und empfangen, aber keine
+    /// weiteren Geräte freischalten).
+    #[serde(default)]
     account_seed: String,
     device_id: String,
+    /// Die vom Server vergebene libsignal-Gerätenummer (ProtocolAddress-Teil).
+    /// Vorgabe 1 für Altprofile aus der Ein-Gerät-Zeit.
+    #[serde(default = "one_u16")]
+    protocol_device_id: u16,
+}
+
+fn one_u16() -> u16 {
+    1
 }
 
 /// Ein bekanntes Kontakt-Gerät, Format identisch zum CLI
@@ -493,6 +506,8 @@ async fn onboard(
             handle: handle.clone(),
             account_seed: BASE64.encode(account_key.to_seed()),
             device_id,
+            // Das erste Gerät ist immer Nummer 1 (der Server bestätigt es).
+            protocol_device_id: 1,
         },
     )?;
 
@@ -534,13 +549,151 @@ async fn login(storage: SharedStorage, password: String) -> Result<Onboarded, St
     // Senden neu aufgelöst.
     let _ = storage.borrow_mut().remove("sync/own_devices");
     let next_prekey_id = load_counter(&storage)?;
+    let protocol_device_id = u8::try_from(profile.protocol_device_id)
+        .map_err(|_| format!("Gerätenummer {} über 255", profile.protocol_device_id))?;
     let device = Device::with_store(
         &profile.handle,
-        1,
+        protocol_device_id,
         PersistentProtocolStore::open(storage.clone()),
         next_prekey_id,
     )
     .map_err(|e| e.to_string())?;
+    Ok(Onboarded {
+        core: Core {
+            device,
+            handle: profile.handle,
+            storage,
+        },
+        access_token: session.access_token,
+        refresh_token: session.refresh_token,
+        expires_in: session.expires_in,
+    })
+}
+
+/// Beginnt die Kopplung dieses Browsers als ZWEITGERÄT (Gegenstück zu
+/// `sm link`): erzeugt eine frische Geräte-Identität, legt ein vorläufiges
+/// Profil an (kein Konto-Wurzelschlüssel, Nummer 0 = noch nicht
+/// freigeschaltet) und liefert den Kopplungs-Antrag als eine Base64-Zeile.
+/// Der wird auf dem Erstgerät freigeschaltet, danach schließt `link_finish`
+/// ab. Bewusst noch unverschlüsselt: das Passwort ist erst nach der
+/// Server-Anmeldung bestätigt (wie bei `login`), und in diesem Zustand liegt
+/// nur die frische, noch nicht autorisierte Geräte-Identität in der Ablage,
+/// keine Nachrichten.
+async fn link_start(storage: SharedStorage, handle: String) -> Result<String, String> {
+    let mut rng = rand::rng();
+    let identity = IdentityKeyPair::generate(&mut rng);
+    let registration_id = rand::Rng::random_range(&mut rng, 1u32..16380);
+    store_own_identity(&storage, &identity.serialize(), registration_id)
+        .map_err(|e| e.to_string())?;
+    // Die Nummer steht erst nach dem Freischalten fest; für die
+    // Schlüsselerzeugung ist sie belanglos (der Identitätsschlüssel hängt
+    // nicht an der Adresse), deshalb hier 1.
+    let mut device = Device::with_store(
+        &handle,
+        1,
+        PersistentProtocolStore::open(storage.clone()),
+        1,
+    )
+    .map_err(|e| e.to_string())?;
+    let device_public = BASE64.encode(device.identity_public().await.map_err(|e| e.to_string())?);
+    let device_id = new_uuid();
+    save_profile(
+        &storage,
+        &Profile {
+            handle,
+            account_seed: String::new(),
+            device_id: device_id.clone(),
+            protocol_device_id: 0,
+        },
+    )?;
+    let request = LinkRequest {
+        device_id,
+        device_public_key: device_public,
+    };
+    Ok(BASE64.encode(serde_json::to_vec(&request).map_err(|e| e.to_string())?))
+}
+
+/// Rekonstruiert den Kopplungs-Antrag aus einem angefangenen (Nummer 0)
+/// Profil, damit ein Neuladen mitten in der Kopplung sie fortsetzen kann.
+async fn pending_link_payload(storage: &SharedStorage) -> Option<String> {
+    let profile = load_profile(storage)?;
+    if profile.protocol_device_id != 0 {
+        return None;
+    }
+    let mut device = Device::with_store(
+        &profile.handle,
+        1,
+        PersistentProtocolStore::open(storage.clone()),
+        1,
+    )
+    .ok()?;
+    let device_public = BASE64.encode(device.identity_public().await.ok()?);
+    let request = LinkRequest {
+        device_id: profile.device_id,
+        device_public_key: device_public,
+    };
+    Some(BASE64.encode(serde_json::to_vec(&request).ok()?))
+}
+
+/// Schließt die Kopplung ab, nachdem das Erstgerät den Antrag freigeschaltet
+/// hat (Gegenstück zu `sm link-finish`): meldet sich an (jetzt möglich, das
+/// Gerät ist freigeschaltet), liest die vom Server vergebene Nummer aus der
+/// eigenen Gerätemenge, verankert sie im Profil, verschlüsselt die Ablage
+/// unter dem bestätigten Passwort und veröffentlicht die Prekeys.
+async fn link_finish(storage: SharedStorage, password: String) -> Result<Onboarded, String> {
+    let profile = load_profile(&storage).ok_or_else(|| "Kein Profil in der Ablage".to_string())?;
+    let identity_client = IdentityClient::new(identity_url());
+    let session = identity_client
+        .login(&profile.handle, &password, &profile.device_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    // Die eigene Nummer aus der Gerätemenge holen (der Server hat sie beim
+    // Freischalten vergeben).
+    let devices = identity_client
+        .devices(&session.access_token)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mine = devices.iter().find(|d| d.id == profile.device_id).ok_or_else(|| {
+        "Dieses Gerät steht noch nicht in der Gerätemenge. Zuerst auf dem Erstgerät freischalten."
+            .to_string()
+    })?;
+    if mine.protocol_device_id == 0 {
+        return Err("Der Server hat keine Gerätenummer geliefert (zu alter Server?).".to_string());
+    }
+    let protocol_device_id = mine.protocol_device_id;
+    // Jetzt ist das Passwort server-bestätigt: die Ablage verschlüsseln.
+    storage.borrow_mut().adopt_passphrase(&password);
+    save_profile(
+        &storage,
+        &Profile {
+            handle: profile.handle.clone(),
+            account_seed: String::new(),
+            device_id: profile.device_id.clone(),
+            protocol_device_id,
+        },
+    )?;
+
+    let next_prekey_id = load_counter(&storage)?;
+    let number = u8::try_from(protocol_device_id)
+        .map_err(|_| format!("Gerätenummer {protocol_device_id} über 255"))?;
+    let mut device = Device::with_store(
+        &profile.handle,
+        number,
+        PersistentProtocolStore::open(storage.clone()),
+        next_prekey_id,
+    )
+    .map_err(|e| e.to_string())?;
+    let bundle = device
+        .publish_prekey_bundle()
+        .await
+        .map_err(|e| e.to_string())?;
+    let publication = publication_from_bundle(&bundle).map_err(|e| e.to_string())?;
+    DirectoryClient::new(directory_url())
+        .publish(&session.access_token, &publication)
+        .await
+        .map_err(|e| e.to_string())?;
+    save_counter(&storage, device.next_prekey_id())?;
+
     Ok(Onboarded {
         core: Core {
             device,
@@ -628,6 +781,15 @@ fn start_token_refresh(
     });
 }
 
+/// Die eigene libsignal-Gerätenummer aus der Geräteadresse (der
+/// ProtocolAddress-Teil). Sie stimmt mit der server-vergebenen Nummer aus
+/// dem Profil überein (onboard/login/link bauen das Gerät damit) und ist
+/// beim Senden die eine Quelle: das Erstgerät nutzt 1, ein gekoppeltes
+/// Zweitgerät seine zugewiesene Nummer.
+fn own_device_number(core: &Core) -> u32 {
+    u32::from(core.device.address().device_id())
+}
+
 /// Sendet eine Nachricht; baut beim ersten Kontakt die PQXDH-Sitzungen aus
 /// den Verzeichnis-Bündeln auf und merkt sich die Geräte des Kontakts in
 /// der Ablage (gleicher Fluss und gleiches Format wie im CLI).
@@ -704,7 +866,8 @@ async fn send_message(
     // Für versiegelten Versand einmal das Absender-Zertifikat besorgen
     // (gecacht in der Ablage, siehe sender_certificate_cached).
     let certificate = if sealed {
-        Some(sender_certificate_cached(token, &core.storage).await?)
+        let number = own_device_number(core);
+        Some(sender_certificate_cached(token, number, &core.storage).await?)
     } else {
         None
     };
@@ -729,7 +892,8 @@ async fn send_message(
                     .encrypt(&address, &franked.payload)
                     .await
                     .map_err(|e| format!("Verschlüsselung: {e}"))?;
-                wire::seal(&core.handle, PROTOCOL_DEVICE_ID, &message).map_err(|e| e.to_string())?
+                wire::seal(&core.handle, own_device_number(core), &message)
+                    .map_err(|e| e.to_string())?
             }
         };
         envelopes.push(OutgoingEnvelope {
@@ -768,9 +932,9 @@ async fn send_message(
 /// Self-Sync-Kopie (Gegenstück zur CLI). Die Geräteliste wird gecacht
 /// (`sync/own_devices`); Schlüssel-vorhanden heißt aufgelöst (auch leer =
 /// keine Zweitgeräte), damit ein Ein-Gerät-Konto nicht bei jedem Senden
-/// erneut auflöst und Prekeys verbraucht. Der Web-Client ist Erstgerät,
-/// seine eigene Nummer ist `PROTOCOL_DEVICE_ID`. Der Cache wird bei der
-/// Anmeldung geleert, damit ein neu gekoppeltes Gerät auftaucht.
+/// erneut auflöst und Prekeys verbraucht. Das eigene Gerät (Erst- oder
+/// gekoppeltes Zweitgerät) fällt über `own_device_number` heraus. Der Cache
+/// wird bei der Anmeldung geleert, damit ein neu gekoppeltes Gerät auftaucht.
 async fn build_sync_envelopes(
     core: &mut Core,
     token: ReadSignal<String>,
@@ -798,7 +962,7 @@ async fn build_sync_envelopes(
             for bundle_json in &bundles.devices {
                 let (bundle, protocol_device_id) =
                     bundle_from_directory(bundle_json).map_err(|e| e.to_string())?;
-                if protocol_device_id == PROTOCOL_DEVICE_ID {
+                if protocol_device_id == own_device_number(core) {
                     continue; // das eigene Gerät bekommt keine Kopie
                 }
                 let address = ProtocolAddress::new(
@@ -847,7 +1011,8 @@ async fn build_sync_envelopes(
                     .encrypt(&address, &payload)
                     .await
                     .map_err(|e| format!("Verschlüsselung (Sync): {e}"))?;
-                wire::seal(&core.handle, PROTOCOL_DEVICE_ID, &message).map_err(|e| e.to_string())?
+                wire::seal(&core.handle, own_device_number(core), &message)
+                    .map_err(|e| e.to_string())?
             }
         };
         out.push(OutgoingEnvelope {
@@ -890,6 +1055,7 @@ async fn sealed_trust_root_cached(storage: &SharedStorage) -> Result<Vec<u8>, St
 /// Zertifikat gilt 24 h, ein Abruf je Nachricht wäre Verschwendung).
 async fn sender_certificate_cached(
     token: ReadSignal<String>,
+    protocol_device_id: u32,
     storage: &SharedStorage,
 ) -> Result<Vec<u8>, String> {
     const KEY: &str = "sealed/certificate";
@@ -908,7 +1074,7 @@ async fn sender_certificate_cached(
         }
     }
     let issued = IdentityClient::new(identity_url())
-        .sender_certificate(&token.get_untracked(), PROTOCOL_DEVICE_ID)
+        .sender_certificate(&token.get_untracked(), protocol_device_id)
         .await
         .map_err(|e| format!("Absender-Zertifikat: {e}"))?;
     let record = serde_json::json!({
@@ -1407,6 +1573,11 @@ enum Boot {
     /// Verschlüsselte Ablage: Anmeldung nötig, aber der Handle ist vor dem
     /// Passwort unbekannt (der ganze Blob ist gesealt).
     Locked,
+    /// Eine begonnene Kopplung dieses Browsers als Zweitgerät (Profil liegt,
+    /// aber die Nummer ist 0 = noch nicht freigeschaltet). Trägt den
+    /// Kopplungs-Antrag zum Anzeigen; nach dem Freischalten auf dem Erstgerät
+    /// schließt der Nutzer hier ab.
+    Linking(String),
     /// Ablage nicht nutzbar (etwa privates Fenster ohne IndexedDB).
     Broken(String),
 }
@@ -1517,17 +1688,23 @@ fn App() -> impl IntoView {
                     // Verschlüsselte Ablage: der Handle ist erst nach dem
                     // Entsperren lesbar (Locked). Klartext (Migration) oder
                     // frisch: wie bisher entscheiden.
-                    let boot = {
-                        let s = storage.borrow();
-                        if !s.has_state() {
-                            Boot::Fresh
-                        } else if s.is_locked() {
-                            Boot::Locked
-                        } else {
-                            match load_profile(&storage).map(|p| p.handle) {
-                                Some(handle) => Boot::Known(handle),
-                                None => Boot::Fresh,
+                    // Kurze Borrows, keiner über ein await gehalten.
+                    let boot = if !storage.borrow().has_state() {
+                        Boot::Fresh
+                    } else if storage.borrow().is_locked() {
+                        Boot::Locked
+                    } else {
+                        match load_profile(&storage) {
+                            // Nummer 0 = eine begonnene Kopplung; den Antrag
+                            // rekonstruieren und die Kopplung fortsetzen.
+                            Some(p) if p.protocol_device_id == 0 => {
+                                match pending_link_payload(&storage).await {
+                                    Some(payload) => Boot::Linking(payload),
+                                    None => Boot::Known(p.handle),
+                                }
                             }
+                            Some(p) => Boot::Known(p.handle),
+                            None => Boot::Fresh,
                         }
                     };
                     *boot_storage.borrow_mut() = Some(storage);
@@ -1538,9 +1715,54 @@ fn App() -> impl IntoView {
         });
     }
 
-    let on_register = {
+    // Eine erfolgreiche An-/Neu-/Kopplungs-Anmeldung in den lebenden Zustand
+    // heben: Token übernehmen, Erneuerung und Hinweiskanal starten, Core
+    // aktiv setzen, Chats und Sealed-Vorgabe laden, angemeldet melden. Eine
+    // Quelle für alle drei Wege (Registrierung, Anmeldung, Kopplung).
+    let activate_session = {
         let core = core.clone();
+        SendWrapper::new(Rc::new(move |onboarded: Onboarded| {
+            let Onboarded {
+                core: new_core,
+                access_token: at,
+                refresh_token: rt,
+                expires_in,
+            } = onboarded;
+            set_access_token.set(at);
+            refresh_token.set_value(rt);
+            token_epoch.update_value(|e| *e += 1);
+            start_token_refresh(
+                token_epoch,
+                token_epoch.get_value(),
+                refresh_token,
+                set_access_token,
+                set_status,
+                expires_in,
+            );
+            channel_epoch.update_value(|e| *e += 1);
+            start_hint_channel(
+                access_token,
+                channel_epoch,
+                channel_epoch.get_value(),
+                set_hints,
+                set_status,
+                set_notifications,
+                set_connected,
+            );
+            let storage = new_core.storage.clone();
+            set_me.set(new_core.handle.clone());
+            *core.borrow_mut() = Some(new_core);
+            set_chats.set(load_summaries(&storage));
+            let sealed = load_sealed_default(&storage);
+            set_sealed_default.set(sealed);
+            set_sealed_choice.set(sealed);
+            set_logged_in.set(true);
+        }))
+    };
+
+    let on_register = {
         let boot_storage = boot_storage.clone();
+        let activate_session = activate_session.clone();
         move |_| {
             if busy.get_untracked() {
                 return;
@@ -1557,49 +1779,11 @@ fn App() -> impl IntoView {
             }
             set_busy.set(true);
             set_status.set("Konto wird angelegt ...".to_string());
-            let core = core.clone();
+            let activate_session = activate_session.clone();
             spawn_local(async move {
                 match onboard(storage, handle.clone(), password).await {
                     Ok(onboarded) => {
-                        let Onboarded {
-                            core: new_core,
-                            access_token: at,
-                            refresh_token: rt,
-                            expires_in,
-                        } = onboarded;
-                        // Token in die App-Signale übernehmen und die
-                        // Erneuerung starten, bevor der Core aktiv wird.
-                        set_access_token.set(at);
-                        refresh_token.set_value(rt);
-                        token_epoch.update_value(|e| *e += 1);
-                        start_token_refresh(
-                            token_epoch,
-                            token_epoch.get_value(),
-                            refresh_token,
-                            set_access_token,
-                            set_status,
-                            expires_in,
-                        );
-                        channel_epoch.update_value(|e| *e += 1);
-                        start_hint_channel(
-                            access_token,
-                            channel_epoch,
-                            channel_epoch.get_value(),
-                            set_hints,
-                            set_status,
-                            set_notifications,
-                            set_connected,
-                        );
-                        let storage = new_core.storage.clone();
-                        *core.borrow_mut() = Some(new_core);
-                        set_chats.set(load_summaries(&storage));
-                        // Persistierte Sealed-Vorgabe übernehmen (Composer
-                        // startet damit vorbelegt); bei frischer Ablage aus.
-                        let sealed = load_sealed_default(&storage);
-                        set_sealed_default.set(sealed);
-                        set_sealed_choice.set(sealed);
-                        set_me.set(handle);
-                        set_logged_in.set(true);
+                        activate_session(onboarded);
                         set_status.set("Bereit.".to_string());
                     }
                     Err(error) => set_status.set(format!("Fehlgeschlagen: {error}")),
@@ -1610,8 +1794,8 @@ fn App() -> impl IntoView {
     };
 
     let on_login = {
-        let core = core.clone();
         let boot_storage = boot_storage.clone();
+        let activate_session = activate_session.clone();
         move |_| {
             if busy.get_untracked() {
                 return;
@@ -1627,45 +1811,11 @@ fn App() -> impl IntoView {
             }
             set_busy.set(true);
             set_status.set("Anmeldung ...".to_string());
-            let core = core.clone();
+            let activate_session = activate_session.clone();
             spawn_local(async move {
                 match login(storage, password).await {
                     Ok(onboarded) => {
-                        let Onboarded {
-                            core: new_core,
-                            access_token: at,
-                            refresh_token: rt,
-                            expires_in,
-                        } = onboarded;
-                        set_access_token.set(at);
-                        refresh_token.set_value(rt);
-                        token_epoch.update_value(|e| *e += 1);
-                        start_token_refresh(
-                            token_epoch,
-                            token_epoch.get_value(),
-                            refresh_token,
-                            set_access_token,
-                            set_status,
-                            expires_in,
-                        );
-                        channel_epoch.update_value(|e| *e += 1);
-                        start_hint_channel(
-                            access_token,
-                            channel_epoch,
-                            channel_epoch.get_value(),
-                            set_hints,
-                            set_status,
-                            set_notifications,
-                            set_connected,
-                        );
-                        set_me.set(new_core.handle.clone());
-                        let storage = new_core.storage.clone();
-                        *core.borrow_mut() = Some(new_core);
-                        set_chats.set(load_summaries(&storage));
-                        let sealed = load_sealed_default(&storage);
-                        set_sealed_default.set(sealed);
-                        set_sealed_choice.set(sealed);
-                        set_logged_in.set(true);
+                        activate_session(onboarded);
                         set_status.set("Bereit; Sitzungen aus der Ablage geladen.".to_string());
                         // Was schon wartet, kündigt kein Hinweis mehr an:
                         // einmal initial abholen (wie sm listen).
@@ -1675,6 +1825,85 @@ fn App() -> impl IntoView {
                 }
                 set_busy.set(false);
             });
+        }
+    };
+
+    // Kopplung beginnen: diesen Browser als Zweitgerät eines bestehenden
+    // Kontos anmelden. Erzeugt die Geräte-Identität und zeigt den Antrag.
+    let on_link_start = {
+        let boot_storage = boot_storage.clone();
+        move |_| {
+            if busy.get_untracked() {
+                return;
+            }
+            let Some(storage) = boot_storage.borrow().clone() else {
+                set_status.set("Ablage noch nicht bereit.".to_string());
+                return;
+            };
+            let handle = handle_input.get_untracked();
+            if handle.is_empty() {
+                set_status.set("Handle des bestehenden Kontos angeben.".to_string());
+                return;
+            }
+            set_busy.set(true);
+            set_status.set("Kopplung wird vorbereitet ...".to_string());
+            spawn_local(async move {
+                match link_start(storage, handle).await {
+                    Ok(payload) => {
+                        set_boot.set(Boot::Linking(payload));
+                        set_status.set(String::new());
+                    }
+                    Err(error) => set_status.set(format!("Kopplung fehlgeschlagen: {error}")),
+                }
+                set_busy.set(false);
+            });
+        }
+    };
+
+    // Kopplung abschließen: nachdem das Erstgerät den Antrag freigeschaltet
+    // hat, anmelden und die Prekeys veröffentlichen (siehe link_finish).
+    let on_link_finish = {
+        let boot_storage = boot_storage.clone();
+        let activate_session = activate_session.clone();
+        move |_| {
+            if busy.get_untracked() {
+                return;
+            }
+            let Some(storage) = boot_storage.borrow().clone() else {
+                set_status.set("Ablage noch nicht bereit.".to_string());
+                return;
+            };
+            let password = password_input.get_untracked();
+            if password.is_empty() {
+                set_status.set("Passwort des Kontos angeben.".to_string());
+                return;
+            }
+            set_busy.set(true);
+            set_status.set("Kopplung wird abgeschlossen ...".to_string());
+            let activate_session = activate_session.clone();
+            spawn_local(async move {
+                match link_finish(storage, password).await {
+                    Ok(onboarded) => {
+                        activate_session(onboarded);
+                        set_status.set("Gekoppelt. Empfängt ab jetzt eigene Kopien.".to_string());
+                        set_hints.update(|n| *n += 1);
+                    }
+                    Err(error) => set_status.set(format!("Abschluss fehlgeschlagen: {error}")),
+                }
+                set_busy.set(false);
+            });
+        }
+    };
+
+    // Kopplung abbrechen: das vorläufige Profil verwerfen, zurück zur Wahl.
+    let on_link_cancel = {
+        let boot_storage = boot_storage.clone();
+        move |_| {
+            if let Some(storage) = boot_storage.borrow().clone() {
+                let _ = storage.borrow_mut().remove(PROFILE_KEY);
+            }
+            set_status.set(String::new());
+            set_boot.set(Boot::Fresh);
         }
     };
 
@@ -2815,13 +3044,6 @@ fn App() -> impl IntoView {
                                                         </div>
                                                         <div class="sm-set-row sm-set-plan">
                                                             <span class="sm-set-label">
-                                                                "Diesen Browser als Zweitgerät koppeln"
-                                                                <small>"Der Web-Client ist heute immer Erstgerät; link/link-finish im Browser ist der nächste Schnitt."</small>
-                                                            </span>
-                                                            <span class="sm-set-badge">"geplant"</span>
-                                                        </div>
-                                                        <div class="sm-set-row sm-set-plan">
-                                                            <span class="sm-set-label">
                                                                 "Verlaufs-Übernahme beim Koppeln"
                                                                 <small>"Ein frisch gekoppeltes Gerät sieht heute nur ab dann gesendete Nachrichten."</small>
                                                             </span>
@@ -3334,6 +3556,78 @@ fn App() -> impl IntoView {
                                                         disabled=busy
                                                     >
                                                         "Konto anlegen"
+                                                    </button>
+                                                </div>
+                                            </section>
+                                            <section class="sm-card" aria-label="Gerät koppeln">
+                                                <h2>"Bestehendes Konto: dieses Gerät koppeln"</h2>
+                                                <p class="sm-status">
+                                                    "Für ein Konto, das schon auf einem anderen Gerät "
+                                                    "liegt: oben das Handle eingeben und koppeln. Dieser "
+                                                    "Browser wird ein Zweitgerät (empfängt und sendet, "
+                                                    "schaltet aber keine weiteren Geräte frei)."
+                                                </p>
+                                                <div class="sm-row">
+                                                    <button
+                                                        type="button"
+                                                        class="sm-secondary"
+                                                        on:click=on_link_start.clone()
+                                                        disabled=busy
+                                                    >
+                                                        "Kopplung starten"
+                                                    </button>
+                                                </div>
+                                            </section>
+                                        }
+                                            .into_any()
+                                    }
+                                    Boot::Linking(payload) => {
+                                        view! {
+                                            <section class="sm-card" aria-label="Gerät koppeln">
+                                                <h2>"Gerät koppeln: freischalten und abschließen"</h2>
+                                                <p class="sm-status">
+                                                    "Diesen Antrag auf dem Erstgerät freischalten (dort "
+                                                    "'sm approve <Antrag>' im CLI, oder in den Einstellungen "
+                                                    "unter Geräte einfügen). Danach hier das Passwort "
+                                                    "eingeben und abschließen."
+                                                </p>
+                                                <label class="sm-field">
+                                                    <span>"Kopplungs-Antrag (auf dem Erstgerät freischalten)"</span>
+                                                    <textarea
+                                                        class="sm-composer-input"
+                                                        rows="3"
+                                                        readonly
+                                                    >
+                                                        {payload}
+                                                    </textarea>
+                                                </label>
+                                                <div class="sm-field">
+                                                    <label for="sm-linkpass">"Passwort des Kontos"</label>
+                                                    <input
+                                                        id="sm-linkpass"
+                                                        type="password"
+                                                        prop:value=password_input
+                                                        on:input=move |ev| {
+                                                            set_password_input.set(event_target_value(&ev))
+                                                        }
+                                                    />
+                                                </div>
+                                                <div class="sm-row">
+                                                    <button
+                                                        type="button"
+                                                        class="sm-primary"
+                                                        on:click=on_link_finish.clone()
+                                                        disabled=busy
+                                                    >
+                                                        "Kopplung abschließen"
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        class="sm-secondary"
+                                                        on:click=on_link_cancel.clone()
+                                                        disabled=busy
+                                                    >
+                                                        "Abbrechen"
                                                     </button>
                                                 </div>
                                             </section>
