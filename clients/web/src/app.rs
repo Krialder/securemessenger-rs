@@ -3401,20 +3401,6 @@ fn App() -> impl IntoView {
                                                                 "Verlauf senden"
                                                             </button>
                                                         </div>
-                                                        <div class="sm-set-row sm-set-plan">
-                                                            <span class="sm-set-label">
-                                                                "Kopplung per QR-Code"
-                                                                <small>"F030 nennt QR oder Bestätigung; der automatische Übertragungskanal zwischen den Geräten fehlt noch."</small>
-                                                            </span>
-                                                            <span class="sm-set-badge">"geplant"</span>
-                                                        </div>
-                                                        <div class="sm-set-row sm-set-plan">
-                                                            <span class="sm-set-label">
-                                                                "Verlaufs-Übernahme beim Koppeln"
-                                                                <small>"Ein frisch gekoppeltes Gerät sieht heute nur ab dann gesendete Nachrichten."</small>
-                                                            </span>
-                                                            <span class="sm-set-badge">"geplant"</span>
-                                                        </div>
                                                     </section>
 
                                                     <section class="sm-set-group" aria-label="Blockierte Kontakte">
