@@ -146,6 +146,25 @@ async fn deletion_schedule_cancel_and_purge() {
 }
 
 #[tokio::test]
+async fn display_name_update_roundtrip() {
+    let Some(pool) = pool().await else { return };
+    let store = PgAccountStore::new(pool);
+    let handle = unique_handle("pg-name");
+    store.create(account(&handle), device(40)).await.unwrap();
+
+    store.set_display_name(&handle, "Neuer Name").await.unwrap();
+    assert_eq!(
+        store.get(&handle).await.unwrap().unwrap().display_name,
+        "Neuer Name"
+    );
+
+    assert_eq!(
+        store.set_display_name("pg-gibt-es-nicht", "x").await,
+        Err(StoreError::AccountMissing)
+    );
+}
+
+#[tokio::test]
 async fn device_lifecycle() {
     let Some(pool) = pool().await else { return };
     let store = PgAccountStore::new(pool);

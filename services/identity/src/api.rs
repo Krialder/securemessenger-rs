@@ -161,7 +161,12 @@ impl AppState {
 pub fn app(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/", get(|| async { "SecureMessenger identity service" }))
-        .route("/accounts", post(register).delete(delete_account))
+        .route(
+            "/accounts",
+            post(register)
+                .delete(delete_account)
+                .patch(change_display_name),
+        )
         .route("/accounts/undelete", post(undelete_account))
         .route("/pow", get(pow_info))
         .route("/sessions", post(login).delete(logout))
@@ -440,6 +445,19 @@ struct DeleteAccountRequest {
     password: String,
 }
 
+/// Neuer Anzeigename (F010: getrennt vom Handle, jederzeit änderbar).
+#[derive(Deserialize)]
+struct DisplayNameRequest {
+    display_name: String,
+}
+
+/// Antwort auf die Änderung: der gespeicherte (getrimmte) Name, damit der
+/// Client die kanonische Form übernimmt statt seiner Roh-Eingabe.
+#[derive(Serialize)]
+struct DisplayNameResponse {
+    display_name: String,
+}
+
 /// Antwort auf die vorgemerkte Löschung: der Ablauf der Widerrufsfrist als
 /// Unix-Sekunden, damit der Client die Frist anzeigen und das Widerrufen
 /// anbieten kann.
@@ -469,6 +487,12 @@ struct SessionResponse {
     /// zu widerrufen.
     #[serde(skip_serializing_if = "Option::is_none")]
     deletion_pending_until: Option<u64>,
+    /// Anzeigename des Kontos (F010), damit der Client ihn nach der
+    /// Anmeldung zeigen und zum Ändern vorbelegen kann. Fehlt auf dem
+    /// Refresh-Pfad (der prüft nur das Token); der Client behält dann
+    /// seinen letzten Stand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
 }
 
 /// Einheitliches Fehlerformat nach schnittstellen.md.
@@ -718,6 +742,13 @@ async fn register(State(st): State<AppState>, Json(req): Json<RegisterRequest>) 
     if let Err(message) = validate_device_id(&req.device.id) {
         return api_error(StatusCode::BAD_REQUEST, "invalid_device", message);
     }
+    // Früh geprüft wie Handle und Passwort (vor Argon2); ohne eigenen
+    // Namen gilt der Handle.
+    let display_name = match normalize_display_name(req.display_name.as_deref()) {
+        Ok(Some(name)) => name,
+        Ok(None) => req.handle.clone(),
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_display_name", message),
+    };
     // Früher Duplikat-Check, damit ein vergebenes Handle keinen teuren
     // Argon2-Lauf kostet. Verbindlich bleibt der atomare create() darunter.
     match st.store.get(&req.handle).await {
@@ -757,10 +788,6 @@ async fn register(State(st): State<AppState>, Json(req): Json<RegisterRequest>) 
                 return internal();
             }
         };
-    let display_name = req
-        .display_name
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| req.handle.clone());
     let response = AccountResponse {
         handle: req.handle.clone(),
         display_name: display_name.clone(),
@@ -855,10 +882,15 @@ async fn login(State(st): State<AppState>, Json(req): Json<LoginRequest>) -> Res
     }
     // Auch bei unbekanntem Handle wird gegen einen Dummy-Hash geprüft,
     // damit die Antwortzeit keine Konto-Existenz verrät.
-    let (stored_hash, account_exists, deletion_pending_until) =
+    let (stored_hash, account_exists, deletion_pending_until, display_name) =
         match st.store.get(&req.handle).await {
-            Ok(Some(account)) => (account.password_hash, true, account.deletion_pending_until),
-            Ok(None) => (st.dummy_hash.to_string(), false, None),
+            Ok(Some(account)) => (
+                account.password_hash,
+                true,
+                account.deletion_pending_until,
+                Some(account.display_name),
+            ),
+            Ok(None) => (st.dummy_hash.to_string(), false, None, None),
             Err(error) => return store_failure(error),
         };
     let password = req.password;
@@ -882,6 +914,7 @@ async fn login(State(st): State<AppState>, Json(req): Json<LoginRequest>) -> Res
     }
     let (mut response, access_hash, refresh_hash) = new_token_pair(&st);
     response.deletion_pending_until = deletion_pending_until;
+    response.display_name = display_name;
     let created = st
         .sessions
         .create(
@@ -913,6 +946,7 @@ fn new_token_pair(st: &AppState) -> (SessionResponse, String, String) {
         token_type: "Bearer",
         expires_in: st.session_config.access_ttl.as_secs(),
         deletion_pending_until: None,
+        display_name: None,
     };
     (response, access_hash, refresh_hash)
 }
@@ -1111,6 +1145,42 @@ async fn delete_account(
             Json(DeletionScheduledResponse {
                 deletion_pending_until: deletion_at,
             }),
+        )
+            .into_response(),
+        Err(error) => store_failure(error),
+    }
+}
+
+/// `PATCH /accounts`: ändert den Anzeigenamen des angemeldeten Kontos
+/// (F010). Nur das Token nötig, anders als Löschung und Passwortwechsel:
+/// die Änderung ist umkehrbar und zerstört nichts, eine Passwort-Hürde
+/// wäre Reibung ohne Sicherheitsgewinn. Kein eigenes Rate-Limit: ein
+/// UPDATE ohne teure Arbeit, und der Angemeldete ändert nur sich selbst.
+async fn change_display_name(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<DisplayNameRequest>,
+) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return invalid_token(),
+        Err(error) => return session_failure(error),
+    };
+    let name = match normalize_display_name(Some(&req.display_name)) {
+        Ok(Some(name)) => name,
+        Ok(None) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_display_name",
+                "Anzeigename darf nicht leer sein",
+            )
+        }
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_display_name", message),
+    };
+    match st.store.set_display_name(&who.handle, &name).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(DisplayNameResponse { display_name: name }),
         )
             .into_response(),
         Err(error) => store_failure(error),
@@ -1425,6 +1495,63 @@ fn validate_handle(handle: &str) -> Result<(), &'static str> {
         return Err("Handle beginnt mit Buchstabe oder Ziffer");
     }
     Ok(())
+}
+
+/// Bidi-Steuerzeichen (LRM/RLM, LRE bis RLO samt PDF, LRI bis PDI): sie
+/// drehen die Leserichtung benachbarten Texts um und machen Namen
+/// spoofing-fähig („gnp.exe"-Muster), sobald eine spätere Etappe
+/// Anzeigenamen anderen Nutzern zeigt. An der Schreibstelle abgewiesen,
+/// weil Bestandsdaten nachträglich zu bereinigen teurer wäre.
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Unsichtbare Format-Zeichen (Zero-Width-Familie, Soft Hyphen, Word
+/// Joiner, BOM). Einzeln bleiben sie erlaubt, denn ZWJ/ZWNJ sind in
+/// Emoji-Sequenzen und persischen wie indischen Namen legitim; nur ein
+/// Name, der ausschließlich aus solchen Zeichen besteht, sähe leer aus.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}' | '\u{180E}' | '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}'
+    )
+}
+
+/// Anzeigename-Regel (F010): getrimmt 1 bis 64 Zeichen, keine Steuer-,
+/// Zeilentrenner- oder Bidi-Zeichen, mindestens ein sichtbares Zeichen.
+/// `Ok(None)` heißt: kein eigener Name angegeben (leer oder nur Weißraum),
+/// der Aufrufer wählt dann seinen Rückfall (bei der Registrierung der
+/// Handle). Der Deckel hält Anzeigen und Logs frei von Blob-Namen; anders
+/// als beim Handle bleibt der Zeichenvorrat offen (Namen tragen Umlaute,
+/// Leerzeichen, fremde Schriften).
+fn normalize_display_name(input: Option<&str>) -> Result<Option<String>, &'static str> {
+    let Some(trimmed) = input.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    if trimmed.chars().count() > 64 {
+        return Err("Anzeigename ist auf 64 Zeichen begrenzt");
+    }
+    // U+2028/U+2029 sind Zeilentrenner (Zl/Zp, nicht `is_control`), die
+    // Anzeigen und Logs genauso brechen wie Steuerzeichen.
+    if trimmed
+        .chars()
+        .any(|c| c.is_control() || is_bidi_control(c) || matches!(c, '\u{2028}' | '\u{2029}'))
+    {
+        return Err("Anzeigename darf keine Steuer- oder Richtungszeichen enthalten");
+    }
+    // Ein Name nur aus unsichtbaren Zeichen (Zero-Width-Space und
+    // Verwandte) erfüllte formal „nicht leer", sähe aber leer aus; der
+    // Fehlertext des Endpunkts verspricht das Gegenteil.
+    if !trimmed
+        .chars()
+        .any(|c| !c.is_whitespace() && !is_invisible_format(c))
+    {
+        return Err("Anzeigename braucht mindestens ein sichtbares Zeichen");
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 /// Längenregel statt Kompositionsregeln (NIST-Linie): mindestens 12 Zeichen,

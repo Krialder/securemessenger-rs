@@ -603,5 +603,13 @@ async fn account_deletion_schedule_and_undelete() {
     );
     uwe.run(&["login", "uwes-langes-passwort"]);
 
+    // Anzeigename ändern (F010): mehrere Argumente werden zu einem Namen
+    // verbunden, die CLI gibt die vom Server bestätigte Form aus.
+    let renamed = uwe.run(&["rename", "Uwe", "Ullmann"]);
+    assert!(
+        renamed.contains("Anzeigename geändert: Uwe Ullmann"),
+        "die CLI muss die gespeicherte Form bestätigen, stdout war: {renamed}"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }

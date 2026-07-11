@@ -425,6 +425,10 @@ struct Onboarded {
     /// Konto. Nur der `login`-Weg kann ihn tragen (der Server meldet ihn bei
     /// der Anmeldung); Registrierung und Kopplung setzen `None`.
     deletion_pending_until: Option<u64>,
+    /// Anzeigename des Kontos (F010) aus der Login-Antwort, zum Anzeigen
+    /// und Vorbelegen in den Einstellungen. Alle drei Wege (Registrierung,
+    /// Anmeldung, Kopplung) enden in einem Login und tragen ihn.
+    display_name: Option<String>,
 }
 
 type SharedCore = SendWrapper<Rc<RefCell<Option<Core>>>>;
@@ -661,6 +665,7 @@ async fn onboard(
         expires_in: session.expires_in,
         // Frisch registriert bzw. gekoppelt: keine Löschung vorgemerkt.
         deletion_pending_until: None,
+        display_name: session.display_name,
     })
 }
 
@@ -710,6 +715,7 @@ async fn login(storage: SharedStorage, password: String) -> Result<Onboarded, St
         expires_in: session.expires_in,
         // Nur die Anmeldung erfährt vom Server, ob eine Löschung läuft.
         deletion_pending_until: session.deletion_pending_until,
+        display_name: session.display_name,
     })
 }
 
@@ -877,6 +883,7 @@ async fn link_finish(storage: SharedStorage, password: String) -> Result<Onboard
         expires_in: session.expires_in,
         // Frisch registriert bzw. gekoppelt: keine Löschung vorgemerkt.
         deletion_pending_until: None,
+        display_name: session.display_name,
     })
 }
 
@@ -1956,6 +1963,10 @@ fn App() -> impl IntoView {
     // Passwort-Bestätigung im Lösch-Formular (die Löschung ist zerstörend,
     // deshalb ein bewusster Schritt statt eines Ein-Klick-Knopfes).
     let (delete_pw, set_delete_pw) = signal(String::new());
+    // Eingabefeld für den Anzeigenamen (F010, Einstellungen); die
+    // Login-Antwort belegt es mit dem aktuellen Namen vor, damit der Nutzer
+    // den Stand sieht und ändert statt blind zu tippen.
+    let (name_input, set_name_input) = signal(String::new());
     // Maschinen-Benachrichtigungen vom integrations-Dienst, getrennt vom
     // Krypto-Status und vom E2E-Chat (design-system.md, Status-Trennung).
     let (notifications, set_notifications) = signal(Vec::<String>::new());
@@ -2044,8 +2055,12 @@ fn App() -> impl IntoView {
                 refresh_token: rt,
                 expires_in,
                 deletion_pending_until,
+                display_name,
             } = onboarded;
             set_deletion_pending.set(deletion_pending_until);
+            // Das Eingabefeld mit dem aktuellen Namen vorbelegen; ohne
+            // Antwort-Feld (älterer Dienst) bleibt es leer.
+            set_name_input.set(display_name.unwrap_or_default());
             set_access_token.set(at);
             refresh_token.set_value(rt);
             token_epoch.update_value(|e| *e += 1);
@@ -2257,6 +2272,7 @@ fn App() -> impl IntoView {
             token_epoch.update_value(|e| *e += 1);
             set_connected.set(false);
             set_deletion_pending.set(None);
+            set_name_input.set(String::new());
             let token = access_token.get_untracked();
             set_access_token.set(String::new());
             refresh_token.set_value(String::new());
@@ -2983,6 +2999,34 @@ fn App() -> impl IntoView {
         });
     };
 
+    // Anzeigename ändern (F010): der Server trimmt und bestätigt die
+    // gespeicherte Form, das Feld übernimmt sie (kanonischer Stand statt
+    // Roh-Eingabe). Fängt nur Copy-Signale ein.
+    let on_rename = move |_| {
+        if busy.get_untracked() {
+            return;
+        }
+        let name = name_input.get_untracked();
+        if name.trim().is_empty() {
+            set_status.set("Anzeigename darf nicht leer sein.".to_string());
+            return;
+        }
+        set_busy.set(true);
+        spawn_local(async move {
+            let result = IdentityClient::new(identity_url())
+                .set_display_name(&access_token.get_untracked(), &name)
+                .await;
+            match result {
+                Ok(stored) => {
+                    set_name_input.set(stored);
+                    set_status.set("Anzeigename geändert.".to_string());
+                }
+                Err(error) => set_status.set(format!("Anzeigename: {error}")),
+            }
+            set_busy.set(false);
+        });
+    };
+
     // Geteilter Nachlade-Ablauf der Gerätemenge, von mehreren Handlern
     // genutzt (Öffnen, Freischalten, Entfernen).
     let refresh_devices = {
@@ -3400,14 +3444,34 @@ fn App() -> impl IntoView {
                                                             <span class="sm-set-label">"Handle"</span>
                                                             <span class="sm-set-value">{me}</span>
                                                         </div>
-                                                        <div class="sm-set-row sm-set-plan">
+                                                        <div class="sm-set-row">
                                                             <span class="sm-set-label">
-                                                                "Anzeigename ändern"
+                                                                "Anzeigename"
                                                                 <small>
-                                                                    "Anforderung F010 (getrennt vom Handle, jederzeit änderbar); der Dienst-Endpunkt fehlt noch."
+                                                                    "Getrennt vom Handle, jederzeit änderbar (F010); Kontakte adressieren weiter den Handle."
                                                                 </small>
                                                             </span>
-                                                            <span class="sm-set-badge">"geplant"</span>
+                                                            <div class="sm-set-inline">
+                                                                <input
+                                                                    type="text"
+                                                                    class="sm-set-input"
+                                                                    aria-label="Anzeigename"
+                                                                    placeholder="Anzeigename"
+                                                                    maxlength="64"
+                                                                    prop:value=name_input
+                                                                    on:input=move |ev| {
+                                                                        set_name_input.set(event_target_value(&ev))
+                                                                    }
+                                                                />
+                                                                <button
+                                                                    type="button"
+                                                                    class="sm-secondary"
+                                                                    on:click=on_rename
+                                                                    disabled=busy
+                                                                >
+                                                                    "Speichern"
+                                                                </button>
+                                                            </div>
                                                         </div>
                                                         <div class="sm-set-row sm-set-stack">
                                                             <span class="sm-set-label">

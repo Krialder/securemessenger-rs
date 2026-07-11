@@ -908,3 +908,112 @@ async fn account_deletion_schedules_reports_and_undeletes() {
     .await;
     assert!(body.get("deletion_pending_until").is_none());
 }
+
+#[tokio::test]
+async fn display_name_changes_and_shows_in_login() {
+    let app = test_app();
+    let identity = key(14);
+
+    let register = register_body(&identity, "rita", "ritas-langes-passwort", DEV_FIRST);
+    let (status, _) = send(&app, "POST", "/accounts", Some(register), None).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, body) = send(
+        &app,
+        "POST",
+        "/sessions",
+        Some(login_body("rita", "ritas-langes-passwort", DEV_FIRST)),
+        None,
+    )
+    .await;
+    let access = body["access_token"].as_str().unwrap().to_string();
+    // Ohne eigenen Namen gilt der Handle (Registrierungs-Rückfall).
+    assert_eq!(body["display_name"], "rita");
+
+    // Ohne Token: abgelehnt.
+    let (status, _) = send(
+        &app,
+        "PATCH",
+        "/accounts",
+        Some(json!({ "display_name": "Rita B." })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Nur Weißraum und Überlänge: abgelehnt.
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        "/accounts",
+        Some(json!({ "display_name": "   " })),
+        Some(&access),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_display_name");
+    let (status, _) = send(
+        &app,
+        "PATCH",
+        "/accounts",
+        Some(json!({ "display_name": "x".repeat(65) })),
+        Some(&access),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Nur unsichtbare Zeichen (Zero-Width-Space): sähe leer aus, abgelehnt.
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        "/accounts",
+        Some(json!({ "display_name": "\u{200B}\u{200B}" })),
+        Some(&access),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_display_name");
+
+    // Bidi-Override (RTL-Spoofing-Muster): abgelehnt.
+    let (status, _) = send(
+        &app,
+        "PATCH",
+        "/accounts",
+        Some(json!({ "display_name": "Alice\u{202E}gro.bank" })),
+        Some(&access),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // ZWJ in einer Emoji-Sequenz bleibt erlaubt (legitime Namen).
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        "/accounts",
+        Some(json!({ "display_name": "Rita \u{1F469}\u{200D}\u{1F4BB}" })),
+        Some(&access),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["display_name"], "Rita \u{1F469}\u{200D}\u{1F4BB}");
+
+    // Gültig: 200 mit der getrimmten Form; die nächste Anmeldung trägt sie.
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        "/accounts",
+        Some(json!({ "display_name": "  Rita B.  " })),
+        Some(&access),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["display_name"], "Rita B.");
+    let (_, body) = send(
+        &app,
+        "POST",
+        "/sessions",
+        Some(login_body("rita", "ritas-langes-passwort", DEV_FIRST)),
+        None,
+    )
+    .await;
+    assert_eq!(body["display_name"], "Rita B.");
+}

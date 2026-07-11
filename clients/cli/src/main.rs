@@ -123,6 +123,7 @@ async fn run() -> Result<(), String> {
         "unlink" => unlink(&args[1..]).await,
         "delete-account" => delete_account(&args[1..]).await,
         "undelete" => undelete().await,
+        "rename" => rename(&args[1..]).await,
         "publish-keys" => publish_keys().await,
         "send" => send(&args[1..]).await,
         "recv" => recv().await,
@@ -1305,6 +1306,25 @@ async fn undelete() -> Result<(), String> {
     Ok(())
 }
 
+/// `sm rename <anzeigename>`: ändert den Anzeigenamen des Kontos (F010,
+/// getrennt vom Handle; der Handle bleibt). Mehrere Argumente werden mit
+/// Leerzeichen verbunden, damit Namen mit Leerzeichen ohne Shell-Quoting
+/// funktionieren. Der Server trimmt und bestätigt die gespeicherte Form.
+async fn rename(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("Aufruf: sm rename <anzeigename>".to_string());
+    }
+    let name = args.join(" ");
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    let stored = IdentityClient::new(identity_url())
+        .set_display_name(&token, &name)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("Anzeigename geändert: {stored}");
+    Ok(())
+}
+
 /// `sm verify`: die KT-Selbstprüfung des eigenen Kontos
 /// (specs/key-transparency.md). Rechnet das Commitment aus Konto-Schlüssel
 /// und eigener Gerätemenge nach und verifiziert den Inklusionsbeweis gegen
@@ -1358,6 +1378,7 @@ fn print_usage() {
          \x20 unlink <geraete-id>            ein Geraet entfernen (Revocation)\n\
          \x20 delete-account <passwort>     Konto-Loeschung vormerken (Widerrufsfrist)\n\
          \x20 undelete                      vorgemerkte Loeschung widerrufen\n\
+         \x20 rename <anzeigename>          Anzeigename aendern (Handle bleibt)\n\
          \x20 publish-keys                   Prekey-Satz im Verzeichnis veröffentlichen\n\
          \x20 send <handle> <text> [--ttl s] [--sealed]  E2EE senden (--ttl: verschwindet; --sealed: ohne Absender-Klartext)\n\
          \x20 recv                           wartende Nachrichten abholen und entschlüsseln\n\

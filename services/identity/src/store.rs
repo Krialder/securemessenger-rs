@@ -69,6 +69,11 @@ pub trait AccountStore: Send + Sync {
     /// die Ablage tauscht nur den Wert. `AccountMissing`, wenn das Konto
     /// nicht existiert (über die authentifizierte API nicht erreichbar).
     async fn set_password_hash(&self, handle: &str, password_hash: &str) -> Result<(), StoreError>;
+    /// Setzt den Anzeigenamen des Kontos (F010: getrennt vom Handle,
+    /// jederzeit änderbar). Der Aufrufer validiert und trimmt; die Ablage
+    /// tauscht nur den Wert. `AccountMissing`, wenn das Konto nicht
+    /// existiert (über die authentifizierte API nicht erreichbar).
+    async fn set_display_name(&self, handle: &str, display_name: &str) -> Result<(), StoreError>;
     /// Merkt eine Konto-Löschung vor (NF030, Widerrufsfrist): setzt den
     /// Ablauf der Frist (`deletion_at`, Unix-Sekunden). Bis dahin kann der
     /// Nutzer widerrufen; danach entfernt `purge_deleted` das Konto.
@@ -182,6 +187,16 @@ impl AccountStore for InMemoryStore {
             .get_mut(handle)
             .ok_or(StoreError::AccountMissing)?;
         record.account.password_hash = password_hash.to_string();
+        Ok(())
+    }
+
+    async fn set_display_name(&self, handle: &str, display_name: &str) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().expect("Store-Lock nicht vergiftet");
+        let record = inner
+            .records
+            .get_mut(handle)
+            .ok_or(StoreError::AccountMissing)?;
+        record.account.display_name = display_name.to_string();
         Ok(())
     }
 
@@ -455,6 +470,23 @@ mod tests {
 
         assert_eq!(
             store.schedule_deletion("gibt-es-nicht", 1).await,
+            Err(StoreError::AccountMissing)
+        );
+    }
+
+    #[tokio::test]
+    async fn display_name_is_replaceable() {
+        let store = InMemoryStore::default();
+        store.create(account("erik"), device("d1")).await.unwrap();
+
+        store.set_display_name("erik", "Erik B.").await.unwrap();
+        assert_eq!(
+            store.get("erik").await.unwrap().unwrap().display_name,
+            "Erik B."
+        );
+
+        assert_eq!(
+            store.set_display_name("gibt-es-nicht", "x").await,
             Err(StoreError::AccountMissing)
         );
     }

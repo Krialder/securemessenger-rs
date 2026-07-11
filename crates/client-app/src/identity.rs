@@ -109,6 +109,10 @@ pub struct Session {
     /// damit direkt nach dem Login, dass eine Löschung läuft.
     #[serde(default)]
     pub deletion_pending_until: Option<u64>,
+    /// Anzeigename des Kontos (F010); `None` auf dem Refresh-Pfad und bei
+    /// älteren Diensten, der Client behält dann seinen letzten Stand.
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 impl IdentityClient {
@@ -406,6 +410,27 @@ impl IdentityClient {
         expect_success(response).await
     }
 
+    /// `PATCH /accounts`: ändert den Anzeigenamen (F010, getrennt vom
+    /// Handle, jederzeit änderbar; Bearer genügt). Liefert den vom Server
+    /// gespeicherten (getrimmten) Namen zurück, damit der Aufrufer die
+    /// kanonische Form übernimmt.
+    pub async fn set_display_name(
+        &self,
+        access_token: &str,
+        display_name: &str,
+    ) -> Result<String, ClientError> {
+        let response = self
+            .http
+            .patch(self.url("/accounts"))
+            .bearer_auth(access_token)
+            .json(&DisplayNameBody { display_name })
+            .send()
+            .await
+            .map_err(transport)?;
+        let renamed: DisplayNamed = parse_json(response).await?;
+        Ok(renamed.display_name)
+    }
+
     /// `POST /provision`: legt einen verschlüsselten Kopplungs-Antrag unter
     /// seiner Kanal-ID im Relay ab (QR-Kopplung). Tokenlos, weil das neue
     /// Gerät noch nicht registriert ist und der Inhalt für den Dienst opak
@@ -474,6 +499,16 @@ struct DeleteAccountBody<'a> {
 #[derive(Deserialize)]
 struct DeletionScheduled {
     deletion_pending_until: u64,
+}
+
+#[derive(Serialize)]
+struct DisplayNameBody<'a> {
+    display_name: &'a str,
+}
+
+#[derive(Deserialize)]
+struct DisplayNamed {
+    display_name: String,
 }
 
 #[derive(Serialize)]

@@ -185,6 +185,19 @@ impl AccountStore for PgAccountStore {
         Ok(())
     }
 
+    async fn set_display_name(&self, handle: &str, display_name: &str) -> Result<(), StoreError> {
+        let result = sqlx::query("UPDATE accounts SET display_name = $2 WHERE handle = $1")
+            .bind(handle)
+            .bind(display_name)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::AccountMissing);
+        }
+        Ok(())
+    }
+
     async fn schedule_deletion(&self, handle: &str, deletion_at: u64) -> Result<(), StoreError> {
         // Die Frist als Unix-Sekunden in TIMESTAMPTZ setzen (to_timestamp),
         // status auf deletion_pending. Reines SQL, keine Rust-Zeitarithmetik.
