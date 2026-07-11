@@ -114,6 +114,26 @@ fn save_summaries(storage: &SharedStorage, summaries: &[ChatSummary]) {
     }
 }
 
+/// Ablage-Schlüssel der Einstellung "versiegelt senden als Vorgabe". Ein
+/// Byte (0/1), damit die Wahl über Neuladen und Neuanmeldung erhalten
+/// bleibt; sie liegt im selben verschlüsselten Zustandsblob wie der Rest.
+const SEALED_DEFAULT_KEY: &str = "settings/sealed_default";
+
+fn load_sealed_default(storage: &SharedStorage) -> bool {
+    storage
+        .borrow()
+        .get(SEALED_DEFAULT_KEY)
+        .ok()
+        .flatten()
+        .is_some_and(|bytes| bytes.first() == Some(&1))
+}
+
+fn save_sealed_default(storage: &SharedStorage, on: bool) {
+    let _ = storage
+        .borrow_mut()
+        .put(SEALED_DEFAULT_KEY, &[u8::from(on)]);
+}
+
 fn load_history(storage: &SharedStorage, peer: &str) -> Vec<StoredLine> {
     storage
         .borrow()
@@ -1441,11 +1461,19 @@ fn App() -> impl IntoView {
     // die Liste nach dem Chat-Öffnen vom Dienst geladen ist; der Knopf
     // erscheint erst dann, damit er nie den falschen Zustand anbietet.
     let (blocked, set_blocked) = signal(Option::<bool>::None);
-    // Geräteverwaltung: ob das Panel offen ist, die geladene Gerätemenge
-    // und der eingefügte Kopplungs-Antrag eines neuen Geräts.
-    let (devices_open, set_devices_open) = signal(false);
+    // Geräteverwaltung: die geladene Gerätemenge und der eingefügte
+    // Kopplungs-Antrag eines neuen Geräts (in der Einstellungen-Ansicht).
     let (device_rows, set_device_rows) = signal(Vec::<DeviceRow>::new());
     let (link_input, set_link_input) = signal(String::new());
+    // Ob die Einstellungen-Ansicht offen ist (statt des Chat-Threads im
+    // Haupt-Bereich). Beim Öffnen laufen die Nachlader (Geräte, Blockliste).
+    let (settings_open, set_settings_open) = signal(false);
+    // "Versiegelt senden als Vorgabe": persistierte Startwahl des
+    // Composer-Sealed-Hakens für neue Sitzungen (Einstellungen).
+    let (sealed_default, set_sealed_default) = signal(false);
+    // Die globale Blockliste (alle blockierten Handles) für die
+    // Einstellungen-Ansicht; `None`, solange nicht geladen.
+    let (block_list, set_block_list) = signal(Option::<Vec<String>>::None);
     // Maschinen-Benachrichtigungen vom integrations-Dienst, getrennt vom
     // Krypto-Status und vom E2E-Chat (design-system.md, Status-Trennung).
     let (notifications, set_notifications) = signal(Vec::<String>::new());
@@ -1565,6 +1593,11 @@ fn App() -> impl IntoView {
                         let storage = new_core.storage.clone();
                         *core.borrow_mut() = Some(new_core);
                         set_chats.set(load_summaries(&storage));
+                        // Persistierte Sealed-Vorgabe übernehmen (Composer
+                        // startet damit vorbelegt); bei frischer Ablage aus.
+                        let sealed = load_sealed_default(&storage);
+                        set_sealed_default.set(sealed);
+                        set_sealed_choice.set(sealed);
                         set_me.set(handle);
                         set_logged_in.set(true);
                         set_status.set("Bereit.".to_string());
@@ -1629,6 +1662,9 @@ fn App() -> impl IntoView {
                         let storage = new_core.storage.clone();
                         *core.borrow_mut() = Some(new_core);
                         set_chats.set(load_summaries(&storage));
+                        let sealed = load_sealed_default(&storage);
+                        set_sealed_default.set(sealed);
+                        set_sealed_choice.set(sealed);
                         set_logged_in.set(true);
                         set_status.set("Bereit; Sitzungen aus der Ablage geladen.".to_string());
                         // Was schon wartet, kündigt kein Hinweis mehr an:
@@ -1679,6 +1715,10 @@ fn App() -> impl IntoView {
             set_kt_info.set(None);
             set_key_info.set(None);
             set_blocked.set(None);
+            set_settings_open.set(false);
+            set_device_rows.set(Vec::new());
+            set_block_list.set(None);
+            set_sealed_default.set(false);
             set_notifications.set(Vec::new());
             set_password_input.set(String::new());
             set_text_input.set(String::new());
@@ -2089,6 +2129,8 @@ fn App() -> impl IntoView {
             set_safety_info.set(None);
             set_key_info.set(None);
             set_blocked.set(None);
+            // Einen Chat zu öffnen verlässt die Einstellungen-Ansicht.
+            set_settings_open.set(false);
             set_selected.set(Some(peer.clone()));
             // Blockier-Zustand des Kontakts nachladen; das Ergebnis zählt
             // nur, wenn der Chat beim Eintreffen noch offen ist.
@@ -2212,16 +2254,70 @@ fn App() -> impl IntoView {
         }))
     };
 
-    // Geräte-Panel auf/zu; beim Öffnen die Menge frisch laden.
-    let on_devices_toggle = {
+    // Die globale Blockliste (Einstellungen) frisch vom Dienst laden.
+    let refresh_block_list = SendWrapper::new(Rc::new(move || {
+        spawn_local(async move {
+            match DeliveryClient::new(delivery_url())
+                .blocks(&access_token.get_untracked())
+                .await
+            {
+                Ok(list) => set_block_list.set(Some(list)),
+                Err(error) => set_status.set(format!("Blockliste laden: {error}")),
+            }
+        });
+    }));
+
+    // Einstellungen öffnen: den Chat-Thread beiseitelegen und die
+    // serverseitigen Listen (Geräte, Blockliste) frisch laden.
+    let open_settings = {
         let refresh_devices = refresh_devices.clone();
+        let refresh_block_list = refresh_block_list.clone();
         move |_| {
-            let open = !devices_open.get_untracked();
-            set_devices_open.set(open);
-            if open {
-                refresh_devices();
+            set_settings_open.set(true);
+            set_status.set(String::new());
+            refresh_devices();
+            refresh_block_list();
+        }
+    };
+    let close_settings = move |_| set_settings_open.set(false);
+
+    // "Versiegelt senden als Vorgabe" umschalten: die Wahl persistieren und
+    // sofort auf den Composer-Haken anwenden.
+    let on_sealed_default_toggle = {
+        let current_storage = current_storage.clone();
+        move |ev: web_sys::Event| {
+            let on = event_target_checked(&ev);
+            set_sealed_default.set(on);
+            set_sealed_choice.set(on);
+            if let Some(storage) = current_storage() {
+                save_sealed_default(&storage, on);
             }
         }
+    };
+
+    // Ein Handle aus der globalen Blockliste entblocken.
+    let on_unblock = {
+        let refresh_block_list = refresh_block_list.clone();
+        SendWrapper::new(Rc::new(move |handle: String| {
+            if busy.get_untracked() {
+                return;
+            }
+            set_busy.set(true);
+            let refresh_block_list = refresh_block_list.clone();
+            spawn_local(async move {
+                let result = DeliveryClient::new(delivery_url())
+                    .unblock(&access_token.get_untracked(), &handle)
+                    .await;
+                match result {
+                    Ok(()) => {
+                        set_status.set(format!("{handle} ist nicht mehr blockiert."));
+                        refresh_block_list();
+                    }
+                    Err(error) => set_status.set(format!("Entblocken: {error}")),
+                }
+                set_busy.set(false);
+            });
+        }))
     };
 
     // Ein neues Gerät freischalten (Web als Erstgerät).
@@ -2311,23 +2407,33 @@ fn App() -> impl IntoView {
                             })
                     }
                 }
-                <div class="sm-theme-switch">
-                    <label for="sm-theme-select">"Darstellung"</label>
-                    <select
-                        id="sm-theme-select"
-                        prop:value=theme
-                        on:change=move |ev| {
-                            let choice = event_target_value(&ev);
-                            apply_theme(&choice);
-                            set_theme.set(choice);
-                        }
-                    >
-                        <option value="system">"System"</option>
-                        <option value="hell">"Hell"</option>
-                        <option value="dunkel">"Dunkel"</option>
-                        <option value="midnight">"Mitternacht"</option>
-                    </select>
-                </div>
+                {move || {
+                    // Vor der Anmeldung lebt der Darstellungs-Umschalter in
+                    // der Kopfleiste (es gibt dann keine Einstellungen-Seite);
+                    // danach steht er dort, um ihn nicht doppelt zu führen.
+                    (!logged_in.get())
+                        .then(|| {
+                            view! {
+                                <div class="sm-theme-switch">
+                                    <label for="sm-theme-select">"Darstellung"</label>
+                                    <select
+                                        id="sm-theme-select"
+                                        prop:value=theme
+                                        on:change=move |ev| {
+                                            let choice = event_target_value(&ev);
+                                            apply_theme(&choice);
+                                            set_theme.set(choice);
+                                        }
+                                    >
+                                        <option value="system">"System"</option>
+                                        <option value="hell">"Hell"</option>
+                                        <option value="dunkel">"Dunkel"</option>
+                                        <option value="midnight">"Mitternacht"</option>
+                                    </select>
+                                </div>
+                            }
+                        })
+                }}
             </header>
 
             {move || {
@@ -2346,6 +2452,14 @@ fn App() -> impl IntoView {
                     let on_send = on_send.clone();
                     let on_fetch = on_fetch.clone();
                     let on_message_key = on_message_key.clone();
+                    // Handler der Einstellungen-Ansicht (eigener Zweig des
+                    // Haupt-Bereichs), frisch geklont wie die Thread-Handler.
+                    let on_kt_check = on_kt_check.clone();
+                    let on_approve = on_approve.clone();
+                    let on_revoke = on_revoke.clone();
+                    let on_unblock = on_unblock.clone();
+                    let on_sealed_default_toggle = on_sealed_default_toggle.clone();
+                    let open_settings = open_settings.clone();
                     view! {
                         <div class="sm-shell">
                             <nav class="sm-sidebar" aria-label="Konversationen">
@@ -2468,140 +2582,316 @@ fn App() -> impl IntoView {
                                 <div class="sm-sidebar-foot">
                                     <button
                                         type="button"
-                                        class="sm-secondary"
-                                        on:click=on_kt_check.clone()
-                                        disabled=busy
+                                        class="sm-secondary sm-settings-open"
+                                        on:click=open_settings
                                     >
-                                        "Schlüssel prüfen (KT)"
+                                        "Einstellungen"
                                     </button>
-                                    {move || {
-                                        kt_info
-                                            .get()
-                                            .map(|(ok, message)| {
-                                                if ok {
-                                                    view! { <p class="sm-note sm-ok">{message}</p> }
-                                                        .into_any()
-                                                } else {
-                                                    view! {
-                                                        <p class="sm-note sm-warn" role="alert">
-                                                            {message}
-                                                        </p>
-                                                    }
-                                                        .into_any()
-                                                }
-                                            })
-                                    }}
-                                    <button
-                                        type="button"
-                                        class="sm-secondary"
-                                        on:click=on_devices_toggle.clone()
-                                        aria-expanded=move || devices_open.get().to_string()
-                                    >
-                                        {move || {
-                                            if devices_open.get() {
-                                                "Geräte ausblenden"
-                                            } else {
-                                                "Geräte verwalten"
-                                            }
-                                        }}
-                                    </button>
-                                    {
-                                        let on_revoke_outer = on_revoke.clone();
-                                        let on_approve_outer = on_approve.clone();
-                                        move || {
-                                            let on_revoke = on_revoke_outer.clone();
-                                            let on_approve = on_approve_outer.clone();
-                                            devices_open
-                                                .get()
-                                                .then(move || {
-                                                    view! {
-                                                        <div
-                                                            class="sm-devices"
-                                                            role="group"
-                                                            aria-label="Geräte des Kontos"
-                                                        >
-                                                            <ul class="sm-device-list">
-                                                                {move || {
-                                                                    let on_revoke = on_revoke.clone();
-                                                                    device_rows
-                                                                        .get()
-                                                                        .into_iter()
-                                                                        .map(|d| {
-                                                                            let revoke = on_revoke.clone();
-                                                                            let id = d.id.clone();
-                                                                            view! {
-                                                                                <li class="sm-device">
-                                                                                    <span class="sm-device-num">
-                                                                                        {format!("Nr. {}", d.protocol_device_id)}
-                                                                                    </span>
-                                                                                    <span class="sm-device-name">
-                                                                                        {d.name.clone()}
-                                                                                    </span>
-                                                                                    {if d.is_own {
-                                                                                        view! {
-                                                                                            <span class="sm-device-own">
-                                                                                                "dieses Gerät"
-                                                                                            </span>
-                                                                                        }
-                                                                                            .into_any()
-                                                                                    } else {
-                                                                                        view! {
-                                                                                            <button
-                                                                                                type="button"
-                                                                                                class="sm-device-revoke"
-                                                                                                on:click=move |_| revoke(id.clone())
-                                                                                                disabled=busy
-                                                                                            >
-                                                                                                "Entfernen"
-                                                                                            </button>
-                                                                                        }
-                                                                                            .into_any()
-                                                                                    }}
-                                                                                </li>
-                                                                            }
-                                                                        })
-                                                                        .collect_view()
-                                                                }}
-                                                            </ul>
-                                                            <label class="sm-field sm-link-field">
-                                                                <span>
-                                                                    "Neues Gerät koppeln: Antrag aus 'sm link' einfügen"
-                                                                </span>
-                                                                <textarea
-                                                                    class="sm-composer-input"
-                                                                    rows="2"
-                                                                    prop:value=link_input
-                                                                    on:input=move |ev| {
-                                                                        set_link_input.set(event_target_value(&ev))
-                                                                    }
-                                                                ></textarea>
-                                                            </label>
-                                                            <button
-                                                                type="button"
-                                                                class="sm-secondary"
-                                                                on:click=on_approve
-                                                                disabled=busy
-                                                            >
-                                                                "Freischalten"
-                                                            </button>
-                                                        </div>
-                                                    }
-                                                })
-                                        }
-                                    }
-                                    <p class="sm-caution">
-                                        "Geräte-Identität, Sitzungen und Kontakte liegen mit dem "
-                                        "Passwort verschlüsselt in IndexedDB (Argon2id plus "
-                                        "ChaCha20-Poly1305). Solange die App offen ist, hält sie den "
-                                        "Schlüssel im Speicher; der Browser bleibt laut sicherheit.md "
-                                        "das schwächste Glied (kein OS-Keystore, XSS-Fläche)."
-                                    </p>
                                 </div>
                             </nav>
 
                             <main class="sm-thread" aria-label="Unterhaltung">
-                                {move || {
-                                    match selected.get() {
+                                {
+                                    // Einstellungen als eigener Zweig des
+                                    // Haupt-Bereichs; die Handler frisch je
+                                    // Aufbau klonen (settings_open reaktiv).
+                                    let on_kt_check = on_kt_check.clone();
+                                    let on_approve = on_approve.clone();
+                                    let on_revoke = on_revoke.clone();
+                                    let on_unblock = on_unblock.clone();
+                                    let on_sealed_default_toggle = on_sealed_default_toggle.clone();
+                                    move || {
+                                        if settings_open.get() {
+                                            let on_revoke = on_revoke.clone();
+                                            let on_unblock = on_unblock.clone();
+                                            return view! {
+                                                <div class="sm-settings" aria-label="Einstellungen">
+                                                    <div class="sm-settings-head">
+                                                        <h2 tabindex="-1">"Einstellungen"</h2>
+                                                        <button
+                                                            type="button"
+                                                            class="sm-secondary"
+                                                            on:click=close_settings
+                                                        >
+                                                            "Zurück"
+                                                        </button>
+                                                    </div>
+
+                                                    <section class="sm-set-group" aria-label="Darstellung">
+                                                        <h3>"Darstellung"</h3>
+                                                        <div class="sm-set-row">
+                                                            <span class="sm-set-label">
+                                                                "Modus"
+                                                                <small>
+                                                                    "Wirkt sofort; die Wahl bleibt auf diesem Gerät gespeichert."
+                                                                </small>
+                                                            </span>
+                                                            <select
+                                                                aria-label="Darstellung"
+                                                                prop:value=theme
+                                                                on:change=move |ev| {
+                                                                    let choice = event_target_value(&ev);
+                                                                    apply_theme(&choice);
+                                                                    set_theme.set(choice);
+                                                                }
+                                                            >
+                                                                <option value="system">"System"</option>
+                                                                <option value="hell">"Hell"</option>
+                                                                <option value="dunkel">"Dunkel"</option>
+                                                                <option value="midnight">"Mitternacht"</option>
+                                                            </select>
+                                                        </div>
+                                                    </section>
+
+                                                    <section class="sm-set-group" aria-label="Konto">
+                                                        <h3>"Konto"</h3>
+                                                        <div class="sm-set-row">
+                                                            <span class="sm-set-label">"Handle"</span>
+                                                            <span class="sm-set-value">{me}</span>
+                                                        </div>
+                                                        <div class="sm-set-row sm-set-plan">
+                                                            <span class="sm-set-label">
+                                                                "Anzeigename ändern"
+                                                                <small>
+                                                                    "Anforderung F010 (getrennt vom Handle, jederzeit änderbar); der Dienst-Endpunkt fehlt noch."
+                                                                </small>
+                                                            </span>
+                                                            <span class="sm-set-badge">"geplant"</span>
+                                                        </div>
+                                                        <div class="sm-set-row sm-set-plan">
+                                                            <span class="sm-set-label">
+                                                                "Passwort ändern"
+                                                                <small>"Kein Endpunkt im identity-Dienst; folgt mit der Konto-Härtung."</small>
+                                                            </span>
+                                                            <span class="sm-set-badge">"geplant"</span>
+                                                        </div>
+                                                        <div class="sm-set-row sm-set-plan">
+                                                            <span class="sm-set-label sm-set-danger">
+                                                                "Konto löschen"
+                                                                <small>"NF030: Löschung mit Widerrufsfrist über Crypto-Shredding; braucht den Dienst-Unterbau."</small>
+                                                            </span>
+                                                            <span class="sm-set-badge">"geplant"</span>
+                                                        </div>
+                                                    </section>
+
+                                                    <section class="sm-set-group" aria-label="Sicherheit">
+                                                        <h3>"Sicherheit"</h3>
+                                                        <label class="sm-set-row">
+                                                            <span class="sm-set-label">
+                                                                "Versiegelt senden als Vorgabe"
+                                                                <small>
+                                                                    "Neue Chats starten mit gesetztem Sealed-Haken; je Nachricht bleibt er im Composer umschaltbar."
+                                                                </small>
+                                                            </span>
+                                                            <input
+                                                                type="checkbox"
+                                                                prop:checked=sealed_default
+                                                                on:change=on_sealed_default_toggle.clone()
+                                                            />
+                                                        </label>
+                                                        <div class="sm-set-row">
+                                                            <span class="sm-set-label">
+                                                                "Key-Transparency-Selbstprüfung"
+                                                                <small>
+                                                                    "Rechnet das eigene Commitment nach und prüft den Beweis gegen die signierte Wurzel."
+                                                                </small>
+                                                            </span>
+                                                            <button
+                                                                type="button"
+                                                                class="sm-secondary"
+                                                                on:click=on_kt_check.clone()
+                                                                disabled=busy
+                                                            >
+                                                                "Jetzt prüfen"
+                                                            </button>
+                                                        </div>
+                                                        {move || {
+                                                            kt_info
+                                                                .get()
+                                                                .map(|(ok, message)| {
+                                                                    if ok {
+                                                                        view! {
+                                                                            <p class="sm-note sm-ok">{message}</p>
+                                                                        }
+                                                                            .into_any()
+                                                                    } else {
+                                                                        view! {
+                                                                            <p class="sm-note sm-warn" role="alert">
+                                                                                {message}
+                                                                            </p>
+                                                                        }
+                                                                            .into_any()
+                                                                    }
+                                                                })
+                                                        }}
+                                                        <p class="sm-caution">
+                                                            "Geräte-Identität, Sitzungen und Kontakte liegen mit dem "
+                                                            "Passwort verschlüsselt in IndexedDB (Argon2id plus "
+                                                            "ChaCha20-Poly1305). Solange die App offen ist, hält sie den "
+                                                            "Schlüssel im Speicher; der Browser bleibt laut sicherheit.md "
+                                                            "das schwächste Glied (kein OS-Keystore, XSS-Fläche)."
+                                                        </p>
+                                                        <div class="sm-set-row sm-set-plan">
+                                                            <span class="sm-set-label">
+                                                                "Rotation des Konto-Wurzelschlüssels"
+                                                                <small>"Als dringlich vermerkte offene Frage; braucht ein Protokoll-Design, keinen Schalter vorher."</small>
+                                                            </span>
+                                                            <span class="sm-set-badge">"geplant"</span>
+                                                        </div>
+                                                    </section>
+
+                                                    <section class="sm-set-group" aria-label="Geräte">
+                                                        <h3>"Geräte"</h3>
+                                                        <ul class="sm-device-list">
+                                                            {move || {
+                                                                let on_revoke = on_revoke.clone();
+                                                                device_rows
+                                                                    .get()
+                                                                    .into_iter()
+                                                                    .map(|d| {
+                                                                        let revoke = on_revoke.clone();
+                                                                        let id = d.id.clone();
+                                                                        view! {
+                                                                            <li class="sm-device">
+                                                                                <span class="sm-device-num">
+                                                                                    {format!("Nr. {}", d.protocol_device_id)}
+                                                                                </span>
+                                                                                <span class="sm-device-name">
+                                                                                    {d.name.clone()}
+                                                                                </span>
+                                                                                {if d.is_own {
+                                                                                    view! {
+                                                                                        <span class="sm-device-own">
+                                                                                            "dieses Gerät"
+                                                                                        </span>
+                                                                                    }
+                                                                                        .into_any()
+                                                                                } else {
+                                                                                    view! {
+                                                                                        <button
+                                                                                            type="button"
+                                                                                            class="sm-device-revoke"
+                                                                                            on:click=move |_| revoke(id.clone())
+                                                                                            disabled=busy
+                                                                                        >
+                                                                                            "Entfernen"
+                                                                                        </button>
+                                                                                    }
+                                                                                        .into_any()
+                                                                                }}
+                                                                            </li>
+                                                                        }
+                                                                    })
+                                                                    .collect_view()
+                                                            }}
+                                                        </ul>
+                                                        <label class="sm-field sm-link-field">
+                                                            <span>
+                                                                "Neues Gerät koppeln: Antrag aus 'sm link' einfügen"
+                                                            </span>
+                                                            <textarea
+                                                                class="sm-composer-input"
+                                                                rows="2"
+                                                                prop:value=link_input
+                                                                on:input=move |ev| {
+                                                                    set_link_input.set(event_target_value(&ev))
+                                                                }
+                                                            ></textarea>
+                                                        </label>
+                                                        <button
+                                                            type="button"
+                                                            class="sm-secondary"
+                                                            on:click=on_approve.clone()
+                                                            disabled=busy
+                                                        >
+                                                            "Freischalten"
+                                                        </button>
+                                                        <div class="sm-set-row sm-set-plan">
+                                                            <span class="sm-set-label">
+                                                                "Kopplung per QR-Code"
+                                                                <small>"F030 nennt QR oder Bestätigung; der automatische Übertragungskanal zwischen den Geräten fehlt noch."</small>
+                                                            </span>
+                                                            <span class="sm-set-badge">"geplant"</span>
+                                                        </div>
+                                                        <div class="sm-set-row sm-set-plan">
+                                                            <span class="sm-set-label">
+                                                                "Diesen Browser als Zweitgerät koppeln"
+                                                                <small>"Der Web-Client ist heute immer Erstgerät; link/link-finish im Browser ist der nächste Schnitt."</small>
+                                                            </span>
+                                                            <span class="sm-set-badge">"geplant"</span>
+                                                        </div>
+                                                        <div class="sm-set-row sm-set-plan">
+                                                            <span class="sm-set-label">
+                                                                "Verlaufs-Übernahme beim Koppeln"
+                                                                <small>"Ein frisch gekoppeltes Gerät sieht heute nur ab dann gesendete Nachrichten."</small>
+                                                            </span>
+                                                            <span class="sm-set-badge">"geplant"</span>
+                                                        </div>
+                                                    </section>
+
+                                                    <section class="sm-set-group" aria-label="Blockierte Kontakte">
+                                                        <h3>"Blockierte Kontakte"</h3>
+                                                        {move || {
+                                                            let on_unblock = on_unblock.clone();
+                                                            match block_list.get() {
+                                                                None => {
+                                                                    view! { <p class="sm-set-empty">"Wird geladen ..."</p> }
+                                                                        .into_any()
+                                                                }
+                                                                Some(list) if list.is_empty() => {
+                                                                    view! {
+                                                                        <p class="sm-set-empty">
+                                                                            "Niemand blockiert. Blockieren sitzt im jeweiligen Chat-Kopf; hier steht die Gesamtliste."
+                                                                        </p>
+                                                                    }
+                                                                        .into_any()
+                                                                }
+                                                                Some(list) => {
+                                                                    view! {
+                                                                        <ul class="sm-block-list">
+                                                                            {list
+                                                                                .into_iter()
+                                                                                .map(|handle| {
+                                                                                    let unblock = on_unblock.clone();
+                                                                                    let h = handle.clone();
+                                                                                    view! {
+                                                                                        <li class="sm-set-row">
+                                                                                            <span class="sm-set-label">{handle}</span>
+                                                                                            <button
+                                                                                                type="button"
+                                                                                                class="sm-secondary"
+                                                                                                on:click=move |_| unblock(h.clone())
+                                                                                                disabled=busy
+                                                                                            >
+                                                                                                "Blockierung aufheben"
+                                                                                            </button>
+                                                                                        </li>
+                                                                                    }
+                                                                                })
+                                                                                .collect_view()}
+                                                                        </ul>
+                                                                    }
+                                                                        .into_any()
+                                                                }
+                                                            }
+                                                        }}
+                                                    </section>
+
+                                                    <section class="sm-set-group" aria-label="Benachrichtigungen">
+                                                        <h3>"Benachrichtigungen"</h3>
+                                                        <div class="sm-set-row sm-set-plan">
+                                                            <span class="sm-set-label">
+                                                                "Push auf Mobilgeräte"
+                                                                <small>"F200; braucht echte APNs/FCM-Konten und das Push-Gateway."</small>
+                                                            </span>
+                                                            <span class="sm-set-badge sm-set-extern">"extern"</span>
+                                                        </div>
+                                                    </section>
+                                                </div>
+                                            }
+                                            .into_any();
+                                        }
+                                        match selected.get() {
                                         None => {
                                             view! {
                                                 <div class="sm-empty">

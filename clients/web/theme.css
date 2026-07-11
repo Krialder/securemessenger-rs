@@ -821,16 +821,15 @@ button:disabled {
   white-space: nowrap;
 }
 
-/* Entfernen ist eine zerstörende Aktion, deshalb der Fehler-Ton statt der
-   ruhigen Sekundärfarbe; --sm-error ist gegen den Flächen-Grund im
-   Kontrast-Test verankert. Der Text (nicht nur die Farbe) trägt die
-   Bedeutung (SC 1.4.1). */
+/* Entfernen ist eine zerstörende Aktion, deshalb der Gefahr-Ton statt der
+   ruhigen Sekundärfarbe (--sm-danger, in allen Modi definiert). Der Text
+   (nicht nur die Farbe) trägt die Bedeutung (SC 1.4.1). */
 .sm-device-revoke {
   padding: 0;
   border: none;
   background: transparent;
   font-size: 0.8rem;
-  color: var(--sm-error);
+  color: var(--sm-danger);
   text-decoration: underline;
   cursor: pointer;
   white-space: nowrap;
@@ -959,6 +958,108 @@ button:disabled {
 
 .sm-empty p {
   max-inline-size: 30rem;
+}
+
+/* Einstellungen-Ansicht: eine scrollende Seite mit gruppierten Abschnitten
+   (design-system.md, Einstellungen-IA). Sie ersetzt im Haupt-Bereich den
+   Chat-Thread, deshalb erbt sie dessen Scroll-Verhalten. */
+.sm-settings {
+  block-size: 100%;
+  overflow-y: auto;
+  padding: var(--sm-space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-4);
+}
+.sm-settings-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sm-space-3);
+}
+.sm-settings-head h2 {
+  margin: 0;
+  font-size: 1.15rem;
+}
+.sm-settings-head .sm-secondary {
+  margin-inline-start: auto;
+}
+
+.sm-set-group {
+  background: var(--sm-surface-container);
+  border: 1px solid var(--sm-divider);
+  border-radius: var(--sm-radius-lg);
+  padding: var(--sm-space-4);
+}
+.sm-set-group > h3 {
+  margin: 0 0 var(--sm-space-2);
+  font-size: 0.95rem;
+}
+
+/* Eine Einstellungszeile: Beschriftung links (dehnt sich), Steuerung
+   rechts; bricht auf schmalen Ansichten um. Die Trennlinie zwischen den
+   Zeilen strukturiert ohne Container je Zeile. */
+.sm-set-row,
+.sm-block-list .sm-set-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sm-space-3);
+  flex-wrap: wrap;
+  padding: var(--sm-space-2) 0;
+  border-block-start: 1px solid var(--sm-divider);
+}
+.sm-set-group > .sm-set-row:first-of-type,
+.sm-set-group > label.sm-set-row:first-of-type {
+  border-block-start: none;
+}
+.sm-set-label {
+  flex: 1 1 14rem;
+}
+.sm-set-label small {
+  display: block;
+  color: var(--sm-on-surface-muted);
+  font-size: 0.78rem;
+  margin-block-start: 2px;
+}
+.sm-set-value {
+  font-family: var(--sm-font-mono);
+  font-size: 0.85rem;
+  color: var(--sm-on-surface-muted);
+}
+/* Ein zerstoerender Eintrag traegt den Gefahr-Ton im Klartext-Label, nicht
+   nur ueber Farbe (SC 1.4.1). */
+.sm-set-danger {
+  color: var(--sm-danger);
+}
+
+/* Geplante Funktionen: sichtbar, aber erkennbar inaktiv, mit Grund im
+   small-Text. Kein klickbares, funktionsloses Steuerelement (NN/g zu
+   Disabled-States); nur eine Marke rechts. */
+.sm-set-plan .sm-set-label {
+  color: var(--sm-on-surface-muted);
+}
+.sm-set-badge {
+  flex: none;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--sm-on-surface-muted);
+  border: 1px dashed var(--sm-border);
+  border-radius: 999px;
+  padding: 0 var(--sm-space-2);
+}
+.sm-set-extern {
+  border-style: solid;
+}
+
+.sm-set-empty {
+  color: var(--sm-on-surface-muted);
+  font-size: 0.85rem;
+  margin: 0;
+}
+.sm-block-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
 }
 
 /* Benachrichtigungszentrale als eigene Landmarke am unteren Rand. */
