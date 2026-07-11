@@ -1058,6 +1058,29 @@ button:disabled {
   font-size: 0.85rem;
   color: var(--sm-on-surface-muted);
 }
+
+/* Eine Zeile mit eigenem Formular (Passwort aendern): Label oben, die
+   Eingaben darunter als Spalte statt in einer Reihe. */
+.sm-set-stack {
+  flex-direction: column;
+  align-items: stretch;
+}
+.sm-set-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-2);
+  margin-block-start: var(--sm-space-2);
+  max-inline-size: 22rem;
+}
+.sm-set-input {
+  font: inherit;
+  font-size: 0.9rem;
+  padding: var(--sm-space-2);
+  border: 1px solid var(--sm-border);
+  border-radius: var(--sm-radius);
+  background: var(--sm-surface);
+  color: var(--sm-on-surface);
+}
 /* Ein zerstoerender Eintrag traegt den Gefahr-Ton im Klartext-Label, nicht
    nur ueber Farbe (SC 1.4.1). */
 .sm-set-danger {

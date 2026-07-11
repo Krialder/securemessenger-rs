@@ -165,6 +165,7 @@ pub fn app(state: AppState) -> Router {
         .route("/pow", get(pow_info))
         .route("/sessions", post(login).delete(logout))
         .route("/sessions/refresh", post(refresh))
+        .route("/sessions/password", post(change_password))
         .route("/devices", get(list_devices).post(add_device))
         .route("/devices/{id}", delete(remove_device))
         // QR-Kopplung: das neue Gerät legt seinen verschlüsselten Antrag ab
@@ -420,6 +421,15 @@ struct LoginRequest {
     /// Sessions sind gerätegebunden: das Gerät muss registriert und nicht
     /// revoziert sein.
     device_id: String,
+}
+
+/// Passwortwechsel des angemeldeten Kontos: das alte Passwort belegt, dass
+/// der Aufrufer es kennt (ein gestohlenes Token allein soll das Passwort
+/// nicht tauschen können), das neue ersetzt es.
+#[derive(Deserialize)]
+struct PasswordChangeRequest {
+    current_password: String,
+    new_password: String,
 }
 
 #[derive(Deserialize)]
@@ -914,6 +924,97 @@ async fn refresh(State(st): State<AppState>, Json(req): Json<RefreshRequest>) ->
             )
         }
     }
+}
+
+/// `POST /sessions/password`: ändert das Konto-Passwort. Bearer-
+/// authentifiziert, aber das ALTE Passwort muss zusätzlich stimmen: ein
+/// gestohlenes Access-Token allein soll das Passwort nicht tauschen können
+/// (sonst sperrte ein Dieb den Besitzer aus). Nach dem Wechsel werden die
+/// Sessions ALLER ANDEREN Geräte widerrufen, damit ein Angreifer mit einem
+/// alten Token auf einem anderen Gerät ausgesperrt wird; das anfragende
+/// Gerät behält seine Session. Der Client verschlüsselt danach seine lokale
+/// Ablage unter dem neuen Passwort neu (keystore), sonst scheiterte die
+/// nächste Anmeldung.
+async fn change_password(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<PasswordChangeRequest>,
+) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return invalid_token(),
+        Err(error) => return session_failure(error),
+    };
+    // Bremst das Durchprobieren des alten Passworts (ein Angreifer mit
+    // gestohlenem Token, aber ohne Passwort) je Handle.
+    if let Err(retry_after) = st
+        .limiter
+        .check(&format!("passwd:{}", who.handle), LOGIN_RATE_LIMIT)
+    {
+        return common::rate::too_many_requests(retry_after);
+    }
+    let account = match st.store.get(&who.handle).await {
+        Ok(Some(account)) => account,
+        Ok(None) => {
+            tracing::error!(handle = %who.handle, "Session ohne zugehöriges Konto");
+            return internal();
+        }
+        Err(error) => return store_failure(error),
+    };
+    if let Err(message) = validate_password(&req.new_password) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_password", message);
+    }
+    // Altes Passwort prüfen und neues hashen laufen auf einem Blocking-Thread
+    // (Argon2 ist bewusst teuer).
+    let current = req.current_password;
+    let new = req.new_password;
+    let stored = account.password_hash;
+    let hashed = tokio::task::spawn_blocking(move || {
+        if !auth::verify_password(&current, &stored) {
+            return None;
+        }
+        auth::hash_password(&new).ok()
+    })
+    .await;
+    let new_hash = match hashed {
+        Ok(Some(hash)) => hash,
+        Ok(None) => {
+            return api_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_credentials",
+                "Das aktuelle Passwort ist falsch",
+            )
+        }
+        Err(error) => {
+            tracing::error!(%error, "spawn_blocking beim Passwortwechsel abgebrochen");
+            return internal();
+        }
+    };
+    // Zuerst alle ANDEREN Geräte abmelden, DANN das Passwort setzen: so gilt
+    // "204 heißt: Passwort gewechselt UND alle anderen Sessions widerrufen".
+    // Scheitert der Widerruf (Ablage-Fehler), bricht der Wechsel ab, bevor
+    // das Passwort geändert ist; die anderen Geräte melden sich dann mit dem
+    // (unveränderten) alten Passwort neu an. Die Gegenreihenfolge (erst
+    // Passwort, dann Widerruf) ließe bei einem Fehler ein fremdes Gerät mit
+    // altem Token bis zu 30 Tage angemeldet, während der Nutzer Erfolg sieht.
+    // Das anfragende Gerät (who.device_id) bleibt verschont.
+    let devices = match st.store.devices(&who.handle).await {
+        Ok(devices) => devices,
+        Err(error) => return store_failure(error),
+    };
+    for device in devices
+        .iter()
+        .filter(|d| d.id != who.device_id && !d.revoked)
+    {
+        if let Err(error) = st.sessions.revoke_device(&who.handle, &device.id).await {
+            tracing::error!(%error, device = %device.id, "Session vor Passwortwechsel nicht widerrufen");
+            return internal();
+        }
+    }
+    if let Err(error) = st.store.set_password_hash(&who.handle, &new_hash).await {
+        return store_failure(error);
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Response {

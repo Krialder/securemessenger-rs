@@ -166,6 +166,19 @@ impl AccountStore for PgAccountStore {
         }))
     }
 
+    async fn set_password_hash(&self, handle: &str, password_hash: &str) -> Result<(), StoreError> {
+        let result = sqlx::query("UPDATE accounts SET password_hash = $2 WHERE handle = $1")
+            .bind(handle)
+            .bind(password_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::AccountMissing);
+        }
+        Ok(())
+    }
+
     async fn add_device(&self, handle: &str, device: Device) -> Result<u16, StoreError> {
         let device_key = decode_checked(&device.public_key, "Geräteschlüssel")?;
         let credential = decode_checked(&device.credential, "Credential")?;

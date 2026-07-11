@@ -171,6 +171,24 @@ impl BrowserStorage {
         self.persist();
     }
 
+    /// Bereitet die Neuversiegelung unter einer NEUEN Passphrase vor
+    /// (Passwortwechsel): ersetzt den Sealer bedingungslos und liefert den
+    /// unter dem neuen Schlüssel versiegelten Blob zum Schreiben zurück. Der
+    /// Aufrufer schreibt ihn anschließend mit [`write_state`] und wartet das
+    /// Ergebnis ab, damit ein fehlgeschlagener IndexedDB-Schreibvorgang nicht
+    /// still bleibt (dann stünde der Dienst auf dem neuen, die Ablage aber auf
+    /// dem alten Passwort, und die nächste Anmeldung sperrte sich aus). Bewusst
+    /// getrennt vom Schreiben, damit der `RefCell`-Borrow nicht über das
+    /// `await` gehalten wird. Nötig, weil die lokale Ablage unter dem
+    /// Login-Passwort verschlüsselt ist.
+    pub fn reseal_prepare(&mut self, passphrase: &str) -> String {
+        let sealer = keystore::Sealer::create(passphrase);
+        let json = encode_state(&self.values);
+        let stored = BASE64.encode(sealer.seal(json.as_bytes()));
+        self.sealer = Some(sealer);
+        stored
+    }
+
     /// Serialisiert synchron (der Zustand ist klein, wenige KiB), sealt ihn
     /// mit dem Sealer, falls gesetzt, und schreibt asynchron; Fehler landen
     /// in der Konsole, weil der synchrone Trait sie nicht mehr zurückgeben
@@ -194,7 +212,10 @@ impl BrowserStorage {
     }
 }
 
-async fn write_state(stored: String) -> Result<(), String> {
+/// Schreibt den (bereits kodierten) Zustands-Blob nach IndexedDB und wartet
+/// die Bestätigung ab. Öffentlich, damit `reseal_prepare` und der Aufrufer
+/// den Schreibvorgang getrennt vom `RefCell`-Borrow abwarten können.
+pub async fn write_state(stored: String) -> Result<(), String> {
     let db = open_database().await?;
     let tx = db
         .transaction(STORE_NAME)

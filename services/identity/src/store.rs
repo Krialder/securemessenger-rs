@@ -64,6 +64,11 @@ pub trait AccountStore: Send + Sync {
     async fn create(&self, account: Account, first_device: Device) -> Result<(), StoreError>;
     /// Liest ein Konto anhand des Handles, falls vorhanden.
     async fn get(&self, handle: &str) -> Result<Option<Account>, StoreError>;
+    /// Setzt den Passwort-Hash eines Kontos neu (Passwort ändern). Der
+    /// Aufrufer hat das alte Passwort schon geprüft und das neue gehasht;
+    /// die Ablage tauscht nur den Wert. `AccountMissing`, wenn das Konto
+    /// nicht existiert (über die authentifizierte API nicht erreichbar).
+    async fn set_password_hash(&self, handle: &str, password_hash: &str) -> Result<(), StoreError>;
     /// Fügt einem Konto ein weiteres Gerät hinzu und vergibt ihm die
     /// nächste freie Protokollnummer (max der vorhandenen, auch revozierter,
     /// plus 1). Liefert die vergebene Nummer zurück, damit der Client sie
@@ -153,6 +158,16 @@ impl AccountStore for InMemoryStore {
             .records
             .get(handle)
             .map(|r| r.account.clone()))
+    }
+
+    async fn set_password_hash(&self, handle: &str, password_hash: &str) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().expect("Store-Lock nicht vergiftet");
+        let record = inner
+            .records
+            .get_mut(handle)
+            .ok_or(StoreError::AccountMissing)?;
+        record.account.password_hash = password_hash.to_string();
+        Ok(())
     }
 
     async fn add_device(&self, handle: &str, device: Device) -> Result<u16, StoreError> {

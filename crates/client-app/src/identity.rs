@@ -340,6 +340,33 @@ impl IdentityClient {
         expect_success(response).await
     }
 
+    /// `POST /sessions/password`: ändert das Konto-Passwort. Bearer, plus das
+    /// alte Passwort zur Bestätigung. Nach Erfolg sind die Sessions aller
+    /// anderen Geräte widerrufen; der Aufrufer muss seine lokale, unter dem
+    /// Passwort verschlüsselte Ablage neu versiegeln (das liegt beim Client,
+    /// nicht beim Dienst). `401` (`invalid_credentials`) heißt: altes
+    /// Passwort falsch.
+    pub async fn change_password(
+        &self,
+        access_token: &str,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<(), ClientError> {
+        let body = PasswordChangeBody {
+            current_password,
+            new_password,
+        };
+        let response = self
+            .http
+            .post(self.url("/sessions/password"))
+            .bearer_auth(access_token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(transport)?;
+        expect_success(response).await
+    }
+
     /// `POST /provision`: legt einen verschlüsselten Kopplungs-Antrag unter
     /// seiner Kanal-ID im Relay ab (QR-Kopplung). Tokenlos, weil das neue
     /// Gerät noch nicht registriert ist und der Inhalt für den Dienst opak
@@ -398,6 +425,12 @@ impl IdentityClient {
             .map_err(transport)?;
         expect_success(response).await
     }
+}
+
+#[derive(Serialize)]
+struct PasswordChangeBody<'a> {
+    current_password: &'a str,
+    new_password: &'a str,
 }
 
 #[derive(Serialize)]

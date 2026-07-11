@@ -114,6 +114,7 @@ async fn run() -> Result<(), String> {
         "register" => register(&args[1..]).await,
         "login" => login(&args[1..]).await,
         "logout" => logout().await,
+        "passwd" => passwd(&args[1..]).await,
         "whoami" => whoami(),
         "link" => link(&args[1..]).await,
         "approve" => approve(&args[1..]).await,
@@ -225,6 +226,25 @@ async fn login(args: &[String]) -> Result<(), String> {
         "Angemeldet als {} (Token läuft in {}s ab)",
         profile.handle, session.expires_in
     );
+    Ok(())
+}
+
+/// `sm passwd <altes> <neues>`: ändert das Konto-Passwort. Der Dienst prüft
+/// das alte Passwort und meldet danach alle ANDEREN Geräte ab; dieses Gerät
+/// behält seine Session. Anders als der Web-Client verschlüsselt das CLI die
+/// lokale Ablage nicht unter dem Konto-Passwort, sondern unter der separaten
+/// SM_PASSPHRASE, deshalb ist hier keine Neuversiegelung nötig.
+async fn passwd(args: &[String]) -> Result<(), String> {
+    let [current, new] = args else {
+        return Err("Aufruf: sm passwd <altes-passwort> <neues-passwort>".to_string());
+    };
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    IdentityClient::new(identity_url())
+        .change_password(&token, current, new)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("Passwort geändert. Andere Geräte sind abgemeldet.");
     Ok(())
 }
 
@@ -1291,6 +1311,7 @@ fn print_usage() {
          \x20 register <handle> <passwort>   Konto und erstes Gerät anlegen\n\
          \x20 login <passwort>               Gerät anmelden, Token speichern\n\
          \x20 logout                         Session abmelden\n\
+         \x20 passwd <altes> <neues>         Konto-Passwort aendern (meldet andere Geraete ab)\n\
          \x20 whoami                         Profil anzeigen\n\
          \x20 link <handle> <passwort>       neues Zweitgeraet koppeln: Antrag ausgeben\n\
          \x20 approve <antrag>               Zweitgeraet freischalten (nur Erstgeraet)\n\

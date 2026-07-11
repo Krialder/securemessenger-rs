@@ -1922,6 +1922,11 @@ fn App() -> impl IntoView {
     // Die globale Blockliste (alle blockierten Handles) für die
     // Einstellungen-Ansicht; `None`, solange nicht geladen.
     let (block_list, set_block_list) = signal(Option::<Vec<String>>::None);
+    // Passwortwechsel (Einstellungen, Konto): altes und neues Passwort samt
+    // Wiederholung. Nach Erfolg werden alle Felder geleert.
+    let (pw_current, set_pw_current) = signal(String::new());
+    let (pw_new, set_pw_new) = signal(String::new());
+    let (pw_confirm, set_pw_confirm) = signal(String::new());
     // Maschinen-Benachrichtigungen vom integrations-Dienst, getrennt vom
     // Krypto-Status und vom E2E-Chat (design-system.md, Status-Trennung).
     let (notifications, set_notifications) = signal(Vec::<String>::new());
@@ -2811,6 +2816,90 @@ fn App() -> impl IntoView {
         }
     };
 
+    // Passwortwechsel (Einstellungen, Konto): altes Passwort prüfen lassen,
+    // neues setzen, danach die lokale Ablage unter dem neuen Passwort neu
+    // versiegeln (sonst scheitert die nächste Anmeldung am Entsperren). Der
+    // Dienst meldet die anderen Geräte ab; dieses Gerät behält seine Session.
+    let on_change_password = {
+        let current_storage = current_storage.clone();
+        move |_| {
+            if busy.get_untracked() {
+                return;
+            }
+            let current = pw_current.get_untracked();
+            let new = pw_new.get_untracked();
+            let confirm = pw_confirm.get_untracked();
+            if current.is_empty() || new.is_empty() {
+                set_status.set("Aktuelles und neues Passwort angeben.".to_string());
+                return;
+            }
+            if new.chars().count() < 12 {
+                set_status.set("Das neue Passwort braucht mindestens 12 Zeichen.".to_string());
+                return;
+            }
+            if new.chars().count() > 128 {
+                set_status.set("Das neue Passwort ist auf 128 Zeichen begrenzt.".to_string());
+                return;
+            }
+            if new != confirm {
+                set_status.set(
+                    "Die Wiederholung stimmt nicht mit dem neuen Passwort überein.".to_string(),
+                );
+                return;
+            }
+            let Some(storage) = current_storage() else {
+                set_status.set("Nicht angemeldet.".to_string());
+                return;
+            };
+            set_busy.set(true);
+            set_status.set("Passwort wird geändert ...".to_string());
+            spawn_local(async move {
+                let result = IdentityClient::new(identity_url())
+                    .change_password(&access_token.get_untracked(), &current, &new)
+                    .await;
+                match result {
+                    Ok(()) => {
+                        // Erst nach der Server-Bestätigung neu versiegeln:
+                        // scheitert der Wechsel, bleibt die Ablage unter dem
+                        // alten Passwort stimmig. Das Versiegeln (synchron,
+                        // Borrow sofort freigegeben) vom Schreiben trennen und
+                        // das Schreiben abwarten, damit ein fehlgeschlagener
+                        // IndexedDB-Schreibvorgang nicht still bleibt (sonst
+                        // stünde der Dienst auf dem neuen, die Ablage auf dem
+                        // alten Passwort, und die nächste Anmeldung sperrte
+                        // sich aus).
+                        let stored = storage.borrow_mut().reseal_prepare(&new);
+                        match crate::storage::write_state(stored).await {
+                            Ok(()) => {
+                                set_pw_current.set(String::new());
+                                set_pw_new.set(String::new());
+                                set_pw_confirm.set(String::new());
+                                set_status.set(
+                                    "Passwort geändert. Andere Geräte sind abgemeldet.".to_string(),
+                                );
+                            }
+                            Err(error) => set_status.set(format!(
+                                "Passwort beim Dienst geändert, aber die lokale Ablage nicht neu \
+                                 verschlüsselt ({error}). Bitte neu laden und mit dem NEUEN Passwort \
+                                 anmelden; gelingt das nicht, ist eine Neukopplung nötig."
+                            )),
+                        }
+                    }
+                    // Transportfehler ist mehrdeutig: der Server kann den
+                    // Wechsel schon vollzogen haben, während die Antwort verloren
+                    // ging. Nicht als reinen Fehlschlag melden, damit der Nutzer
+                    // beim nächsten Anmelden das neue Passwort probiert.
+                    Err(ClientError::Transport(detail)) => set_status.set(format!(
+                        "Ungewiss, ob der Wechsel durchlief ({detail}). Beim nächsten Anmelden \
+                         zuerst das NEUE Passwort versuchen."
+                    )),
+                    Err(error) => set_status.set(format!("Passwortwechsel: {error}")),
+                }
+                set_busy.set(false);
+            });
+        }
+    };
+
     // Geteilter Nachlade-Ablauf der Gerätemenge, von mehreren Handlern
     // genutzt (Öffnen, Freischalten, Entfernen).
     let refresh_devices = {
@@ -3034,6 +3123,7 @@ fn App() -> impl IntoView {
                     let on_unblock = on_unblock.clone();
                     let on_sealed_default_toggle = on_sealed_default_toggle.clone();
                     let on_push_history = on_push_history.clone();
+                    let on_change_password = on_change_password.clone();
                     let open_settings = open_settings.clone();
                     view! {
                         <div class="sm-shell">
@@ -3176,10 +3266,12 @@ fn App() -> impl IntoView {
                                     let on_unblock = on_unblock.clone();
                                     let on_sealed_default_toggle = on_sealed_default_toggle.clone();
                                     let on_push_history = on_push_history.clone();
+                                    let on_change_password = on_change_password.clone();
                                     move || {
                                         if settings_open.get() {
                                             let on_revoke = on_revoke.clone();
                                             let on_unblock = on_unblock.clone();
+                                            let on_change_password = on_change_password.clone();
                                             return view! {
                                                 <div class="sm-settings" aria-label="Einstellungen">
                                                     <div class="sm-settings-head">
@@ -3234,12 +3326,53 @@ fn App() -> impl IntoView {
                                                             </span>
                                                             <span class="sm-set-badge">"geplant"</span>
                                                         </div>
-                                                        <div class="sm-set-row sm-set-plan">
+                                                        <div class="sm-set-row sm-set-stack">
                                                             <span class="sm-set-label">
                                                                 "Passwort ändern"
-                                                                <small>"Kein Endpunkt im identity-Dienst; folgt mit der Konto-Härtung."</small>
+                                                                <small>"Das neue Passwort verschlüsselt auch die lokale Ablage neu; andere Geräte werden abgemeldet."</small>
                                                             </span>
-                                                            <span class="sm-set-badge">"geplant"</span>
+                                                            <div class="sm-set-form">
+                                                                <input
+                                                                    type="password"
+                                                                    class="sm-set-input"
+                                                                    aria-label="Aktuelles Passwort"
+                                                                    placeholder="Aktuelles Passwort"
+                                                                    prop:value=pw_current
+                                                                    on:input=move |ev| {
+                                                                        set_pw_current.set(event_target_value(&ev))
+                                                                    }
+                                                                />
+                                                                <input
+                                                                    type="password"
+                                                                    class="sm-set-input"
+                                                                    aria-label="Neues Passwort (12 bis 128 Zeichen)"
+                                                                    placeholder="Neues Passwort (12-128)"
+                                                                    maxlength="128"
+                                                                    prop:value=pw_new
+                                                                    on:input=move |ev| {
+                                                                        set_pw_new.set(event_target_value(&ev))
+                                                                    }
+                                                                />
+                                                                <input
+                                                                    type="password"
+                                                                    class="sm-set-input"
+                                                                    aria-label="Neues Passwort wiederholen"
+                                                                    placeholder="Wiederholen"
+                                                                    maxlength="128"
+                                                                    prop:value=pw_confirm
+                                                                    on:input=move |ev| {
+                                                                        set_pw_confirm.set(event_target_value(&ev))
+                                                                    }
+                                                                />
+                                                                <button
+                                                                    type="button"
+                                                                    class="sm-secondary"
+                                                                    on:click=on_change_password
+                                                                    disabled=busy
+                                                                >
+                                                                    "Passwort ändern"
+                                                                </button>
+                                                            </div>
                                                         </div>
                                                         <div class="sm-set-row sm-set-plan">
                                                             <span class="sm-set-label sm-set-danger">

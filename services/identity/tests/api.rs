@@ -722,3 +722,109 @@ async fn provision_relay_round_trips_and_404s() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "invalid_channel");
 }
+
+#[tokio::test]
+async fn password_change_verifies_old_revokes_others_and_relogins() {
+    let app = test_app();
+    let identity = key(9);
+
+    // Konto mit Erstgerät, plus ein Zweitgerät.
+    let register = register_body(&identity, "pia", "altes-langes-passwort", DEV_FIRST);
+    let (status, _) = send(&app, "POST", "/accounts", Some(register), None).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, body) = send(
+        &app,
+        "POST",
+        "/sessions",
+        Some(login_body("pia", "altes-langes-passwort", DEV_FIRST)),
+        None,
+    )
+    .await;
+    let first_access = body["access_token"].as_str().unwrap().to_string();
+
+    let device2 = signed_device(&identity, "pia", DEV_SECOND, 20);
+    let (status, _) = send(&app, "POST", "/devices", Some(device2), Some(&first_access)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, body) = send(
+        &app,
+        "POST",
+        "/sessions",
+        Some(login_body("pia", "altes-langes-passwort", DEV_SECOND)),
+        None,
+    )
+    .await;
+    let second_access = body["access_token"].as_str().unwrap().to_string();
+
+    // Falsches altes Passwort: abgelehnt, nichts geändert.
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/sessions/password",
+        Some(json!({ "current_password": "falsch", "new_password": "neues-langes-passwort" })),
+        Some(&first_access),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], "invalid_credentials");
+
+    // Ohne Token: abgelehnt (ein Passwortwechsel braucht eine Session).
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/sessions/password",
+        Some(json!({ "current_password": "altes-langes-passwort", "new_password": "neues-langes-passwort" })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Zu kurzes neues Passwort: 400.
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/sessions/password",
+        Some(json!({ "current_password": "altes-langes-passwort", "new_password": "kurz" })),
+        Some(&first_access),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_password");
+
+    // Korrekt: 204.
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/sessions/password",
+        Some(json!({ "current_password": "altes-langes-passwort", "new_password": "neues-langes-passwort" })),
+        Some(&first_access),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Das anfragende Gerät behält seine Session ...
+    let (status, _) = send(&app, "GET", "/devices", None, Some(&first_access)).await;
+    assert_eq!(status, StatusCode::OK);
+    // ... das andere Gerät ist abgemeldet (Session widerrufen).
+    let (status, _) = send(&app, "GET", "/devices", None, Some(&second_access)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Anmeldung: altes Passwort scheitert, neues klappt.
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/sessions",
+        Some(login_body("pia", "altes-langes-passwort", DEV_FIRST)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/sessions",
+        Some(login_body("pia", "neues-langes-passwort", DEV_FIRST)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}

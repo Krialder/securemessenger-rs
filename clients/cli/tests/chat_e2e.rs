@@ -510,3 +510,57 @@ async fn second_device_receives_own_copy() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Passwortwechsel: das alte Passwort wird geprüft, das andere Gerät
+/// abgemeldet, und die Neuanmeldung klappt nur mit dem neuen Passwort.
+#[tokio::test(flavor = "multi_thread")]
+async fn password_change_relogins_and_revokes_other_device() {
+    let urls = start_stack().await;
+    let dir = std::env::temp_dir().join(format!("sm-passwd-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("Testverzeichnis");
+
+    // Erstgerät koppelt ein Zweitgerät (wie im Multi-Device-Test).
+    let dev1 = CliUser::new(&dir, "pw1", &urls);
+    dev1.run(&["register", "pia7", "altes-langes-passwort"]);
+    dev1.run(&["login", "altes-langes-passwort"]);
+    dev1.run(&["publish-keys"]);
+    let dev2 = CliUser::new(&dir, "pw2", &urls);
+    let link_out = dev2.run(&["link", "pia7", "altes-langes-passwort"]);
+    let payload = link_out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("sm approve "))
+        .expect("Kopplungs-Antrag")
+        .to_string();
+    dev1.run(&["approve", &payload]);
+    dev2.run(&["link-finish", "pia7", "altes-langes-passwort"]);
+
+    // Falsches altes Passwort scheitert.
+    let wrong = dev1
+        .command(&["passwd", "falsch", "neues-langes-passwort"])
+        .output()
+        .expect("sm startet");
+    assert!(
+        !wrong.status.success(),
+        "falsches altes Passwort muss scheitern"
+    );
+
+    // Korrekt: Wechsel meldet die anderen Geräte ab.
+    let ok = dev1.run(&["passwd", "altes-langes-passwort", "neues-langes-passwort"]);
+    assert!(ok.contains("Passwort geändert"), "stdout war: {ok}");
+
+    // Das Erstgerät (dieses Gerät) arbeitet weiter: whoami braucht kein Token,
+    // aber ein frischer Login mit dem NEUEN Passwort muss klappen und mit dem
+    // alten scheitern.
+    let old_login = dev1
+        .command(&["login", "altes-langes-passwort"])
+        .output()
+        .expect("sm startet");
+    assert!(
+        !old_login.status.success(),
+        "altes Passwort darf nicht mehr anmelden"
+    );
+    let new_login = dev1.run(&["login", "neues-langes-passwort"]);
+    assert!(new_login.contains("Angemeldet"), "stdout war: {new_login}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
