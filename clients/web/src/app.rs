@@ -203,6 +203,55 @@ fn record_message(
     summaries
 }
 
+/// Spielt einen nachgelieferten Verlauf (Koppeln) in die Ablage ein: die
+/// Zeilen werden mit dem lokalen Verlauf des Chats zusammengeführt, nach
+/// Zeit sortiert und auf `HISTORY_LIMIT` gekappt. Duplikate (dieselbe Zeile
+/// aus Live-Empfang und Nachzug) fallen über (Absender, Text, Zeit) heraus,
+/// sodass ein doppelter Nachzug oder eine Überschneidung mit schon
+/// vorhandenen Zeilen nichts verdoppelt. Aktualisiert die Seitenleiste und
+/// liefert die neue Liste; der Nachzug zählt nie ungelesen.
+fn merge_history(
+    storage: &SharedStorage,
+    peer: &str,
+    incoming: &[client_app::sync::HistLine],
+) -> Vec<ChatSummary> {
+    let mut history = load_history(storage, peer);
+    for hl in incoming {
+        let dup = history
+            .iter()
+            .any(|l| l.from == hl.from && l.text == hl.text && l.at == hl.at);
+        if !dup {
+            history.push(StoredLine {
+                from: hl.from.clone(),
+                text: hl.text.clone(),
+                at: hl.at,
+                report_id: None,
+            });
+        }
+    }
+    history.sort_by_key(|l| l.at);
+    save_history(storage, peer, &history);
+
+    let snippet = history.last().map(|l| l.text.clone()).unwrap_or_default();
+    let mut summaries = load_summaries(storage);
+    if let Some(pos) = summaries.iter().position(|s| s.peer == peer) {
+        let mut summary = summaries.remove(pos);
+        summary.snippet = snippet;
+        summaries.insert(0, summary);
+    } else {
+        summaries.insert(
+            0,
+            ChatSummary {
+                peer: peer.to_string(),
+                snippet,
+                unread: 0,
+            },
+        );
+    }
+    save_summaries(storage, &summaries);
+    summaries
+}
+
 /// Stellt sicher, dass eine (auch leere) Unterhaltung im Index steht,
 /// damit ein neu begonnener Chat sofort in der Liste auftaucht.
 fn ensure_chat(storage: &SharedStorage, peer: &str) -> Vec<ChatSummary> {
@@ -308,9 +357,10 @@ struct DeviceRow {
     is_own: bool,
 }
 
-/// Was ein Abruf je Hülle liefert: eine gewöhnliche eingehende Nachricht
-/// oder eine Self-Sync-Kopie einer selbst (auf einem anderen Gerät)
-/// gesendeten Nachricht, die als ausgehend in den Verlauf gehört.
+/// Was ein Abruf je Hülle liefert: eine gewöhnliche eingehende Nachricht,
+/// eine Self-Sync-Kopie einer selbst (auf einem anderen Gerät) gesendeten
+/// Nachricht (als ausgehend in den Verlauf), oder ein Verlaufs-Nachzug eines
+/// anderen eigenen Geräts beim Koppeln (mehrere Zeilen für einen Chat).
 enum Incoming {
     Message {
         from: String,
@@ -321,6 +371,20 @@ enum Incoming {
         peer: String,
         text: String,
     },
+    SyncedHistory {
+        peer: String,
+        lines: Vec<client_app::sync::HistLine>,
+    },
+}
+
+/// Übersetzt ein entschlüsseltes Self-Sync-Ergebnis in einen `Incoming`.
+fn incoming_from_sync(synced: client_app::sync::Synced) -> Incoming {
+    match synced {
+        client_app::sync::Synced::Message { peer, text } => Incoming::Synced { peer, text },
+        client_app::sync::Synced::History { peer, lines } => {
+            Incoming::SyncedHistory { peer, lines }
+        }
+    }
 }
 
 /// Der lebende Client-Zustand hinter der Oberfläche. In einem
@@ -935,6 +999,59 @@ async fn send_message(
 /// erneut auflöst und Prekeys verbraucht. Das eigene Gerät (Erst- oder
 /// gekoppeltes Zweitgerät) fällt über `own_device_number` heraus. Der Cache
 /// wird bei der Anmeldung geleert, damit ein neu gekoppeltes Gerät auftaucht.
+///
+/// Löst die eigenen ANDEREN Geräte auf und baut je Gerät eine Sitzung, mit
+/// Cache in der Ablage (`sync/own_devices`): Schlüssel-vorhanden heißt
+/// aufgelöst (auch leer = keine Zweitgeräte), damit ein Ein-Gerät-Konto
+/// nicht bei jedem Senden erneut auflöst und Prekeys verbraucht. Das eigene
+/// Gerät fällt über `own_device_number` heraus. Der Cache wird nach
+/// Freischalten und bei der Anmeldung geleert, damit ein neu gekoppeltes
+/// Gerät auftaucht. Geteilt von Self-Sync und Verlaufs-Nachzug.
+async fn own_siblings(
+    core: &mut Core,
+    token: ReadSignal<String>,
+) -> Result<Vec<ContactDevice>, String> {
+    const OWN_KEY: &str = "sync/own_devices";
+    let cached = core
+        .storage
+        .borrow()
+        .get(OWN_KEY)
+        .map_err(|e| e.to_string())?;
+    if let Some(bytes) = cached {
+        return serde_json::from_slice(&bytes).map_err(|e| format!("Eigene Geräte unlesbar: {e}"));
+    }
+    let bundles = DirectoryClient::new(directory_url())
+        .bundles(&token.get_untracked(), &core.handle)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut siblings = Vec::new();
+    for bundle_json in &bundles.devices {
+        let (bundle, protocol_device_id) =
+            bundle_from_directory(bundle_json).map_err(|e| e.to_string())?;
+        if protocol_device_id == own_device_number(core) {
+            continue; // das eigene Gerät bekommt keine Kopie
+        }
+        let address = ProtocolAddress::new(
+            core.handle.clone(),
+            device_id_from_u32(protocol_device_id).map_err(|e| e.to_string())?,
+        );
+        core.device
+            .establish_session(&address, &bundle)
+            .await
+            .map_err(|e| format!("Sitzungsaufbau (eigenes Gerät): {e}"))?;
+        siblings.push(ContactDevice {
+            server_device_id: bundle_json.device_id.clone(),
+            protocol_device_id,
+        });
+    }
+    let json = serde_json::to_vec(&siblings).map_err(|e| e.to_string())?;
+    core.storage
+        .borrow_mut()
+        .put(OWN_KEY, &json)
+        .map_err(|e| e.to_string())?;
+    Ok(siblings)
+}
+
 async fn build_sync_envelopes(
     core: &mut Core,
     token: ReadSignal<String>,
@@ -943,49 +1060,7 @@ async fn build_sync_envelopes(
     text: &str,
     expires_at: Option<u64>,
 ) -> Result<Vec<OutgoingEnvelope>, String> {
-    const OWN_KEY: &str = "sync/own_devices";
-    let cached = core
-        .storage
-        .borrow()
-        .get(OWN_KEY)
-        .map_err(|e| e.to_string())?;
-    let siblings: Vec<ContactDevice> = match cached {
-        Some(bytes) => {
-            serde_json::from_slice(&bytes).map_err(|e| format!("Eigene Geräte unlesbar: {e}"))?
-        }
-        None => {
-            let bundles = DirectoryClient::new(directory_url())
-                .bundles(&token.get_untracked(), &core.handle)
-                .await
-                .map_err(|e| e.to_string())?;
-            let mut siblings = Vec::new();
-            for bundle_json in &bundles.devices {
-                let (bundle, protocol_device_id) =
-                    bundle_from_directory(bundle_json).map_err(|e| e.to_string())?;
-                if protocol_device_id == own_device_number(core) {
-                    continue; // das eigene Gerät bekommt keine Kopie
-                }
-                let address = ProtocolAddress::new(
-                    core.handle.clone(),
-                    device_id_from_u32(protocol_device_id).map_err(|e| e.to_string())?,
-                );
-                core.device
-                    .establish_session(&address, &bundle)
-                    .await
-                    .map_err(|e| format!("Sitzungsaufbau (eigenes Gerät): {e}"))?;
-                siblings.push(ContactDevice {
-                    server_device_id: bundle_json.device_id.clone(),
-                    protocol_device_id,
-                });
-            }
-            let json = serde_json::to_vec(&siblings).map_err(|e| e.to_string())?;
-            core.storage
-                .borrow_mut()
-                .put(OWN_KEY, &json)
-                .map_err(|e| e.to_string())?;
-            siblings
-        }
-    };
+    let siblings = own_siblings(core, token).await?;
     if siblings.is_empty() {
         return Ok(Vec::new());
     }
@@ -1025,6 +1100,122 @@ async fn build_sync_envelopes(
         });
     }
     Ok(out)
+}
+
+/// Die jüngsten Verlaufszeilen, die als ein `smsync.v1`-history-Payload
+/// unter das Hüllen-Größenlimit der Zustellung passen (64 KiB je Hülle; hier
+/// mit Sicherheitsmarge auf 48 KiB Klartext gedeckelt, weil Verschlüsselung
+/// und Base64 noch zulegen). Bei sehr langen Chats fehlen die ältesten
+/// Zeilen; das ist die ehrliche Grenze eines einzelnen Nachzugs.
+fn cap_history_lines(
+    peer: &str,
+    lines: &[client_app::sync::HistLine],
+) -> Vec<client_app::sync::HistLine> {
+    const MAX_PLAINTEXT: usize = 48 * 1024;
+    let mut start = 0;
+    while start < lines.len() {
+        let slice = &lines[start..];
+        if client_app::sync::encode_history(peer, slice).len() <= MAX_PLAINTEXT {
+            return slice.to_vec();
+        }
+        start += 1;
+    }
+    Vec::new()
+}
+
+/// Liefert den gespeicherten Verlauf an frisch gekoppelte eigene Geräte
+/// (Verlaufs-Nachzug): je Chat eine `history`-Sync-Hülle an jedes
+/// Geschwister-Gerät, das den Verlauf noch nicht bekam (Marker
+/// `sync/history_sent/<geräte-id>` gegen Doppel-Lieferung). Nur der
+/// Web-Client hält überhaupt einen Verlauf, deshalb ist dies der Web->Web-
+/// Weg; ein Empfänger ohne persistenten Verlauf (CLI) behandelt die Hülle
+/// gutartig. Liefert die Zahl der belieferten neuen Geräte.
+async fn push_history(core: &mut Core, token: ReadSignal<String>) -> Result<usize, String> {
+    let siblings = own_siblings(core, token).await?;
+    if siblings.is_empty() {
+        return Ok(0);
+    }
+    // Chats mit nicht-leerem Verlauf einsammeln (peer + Zeilen).
+    let chats: Vec<(String, Vec<client_app::sync::HistLine>)> = load_summaries(&core.storage)
+        .iter()
+        .filter_map(|s| {
+            let hist = load_history(&core.storage, &s.peer);
+            if hist.is_empty() {
+                return None;
+            }
+            let lines = hist
+                .iter()
+                .map(|l| client_app::sync::HistLine {
+                    from: l.from.clone(),
+                    text: l.text.clone(),
+                    at: l.at,
+                })
+                .collect();
+            Some((s.peer.clone(), lines))
+        })
+        .collect();
+    if chats.is_empty() {
+        return Ok(0);
+    }
+
+    let mut envelopes = Vec::new();
+    let mut markers = Vec::new();
+    for sib in &siblings {
+        let marker = format!("sync/history_sent/{}", sib.server_device_id);
+        let already = core
+            .storage
+            .borrow()
+            .get(&marker)
+            .map_err(|e| e.to_string())?
+            .is_some();
+        if already {
+            continue;
+        }
+        markers.push(marker);
+        let address = ProtocolAddress::new(
+            core.handle.clone(),
+            device_id_from_u32(sib.protocol_device_id).map_err(|e| e.to_string())?,
+        );
+        for (peer, lines) in &chats {
+            let capped = cap_history_lines(peer, lines);
+            if capped.is_empty() {
+                continue;
+            }
+            let payload = client_app::sync::encode_history(peer, &capped);
+            let message = core
+                .device
+                .encrypt(&address, &payload)
+                .await
+                .map_err(|e| format!("Verschlüsselung (Verlauf): {e}"))?;
+            let envelope = wire::seal(&core.handle, own_device_number(core), &message)
+                .map_err(|e| e.to_string())?;
+            envelopes.push(OutgoingEnvelope {
+                id: new_uuid(),
+                recipient: core.handle.clone(),
+                device_id: sib.server_device_id.clone(),
+                envelope,
+                franking_tag: None,
+                expires_at: None,
+            });
+        }
+    }
+    if envelopes.is_empty() {
+        return Ok(0);
+    }
+    // In Batches (delivery deckelt bei 100 Hüllen je Aufruf) zustellen.
+    let delivery = DeliveryClient::new(delivery_url());
+    for chunk in envelopes.chunks(100) {
+        delivery
+            .submit(&token.get_untracked(), chunk)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    // Erst nach erfolgreicher Zustellung merken, sonst wird ein
+    // fehlgeschlagener Nachzug beim nächsten Versuch wiederholt.
+    for marker in &markers {
+        let _ = core.storage.borrow_mut().put(marker, &[1u8]);
+    }
+    Ok(markers.len())
 }
 
 /// Der Trust Root zum Entsiegeln, gepinnt in der Ablage
@@ -1166,10 +1357,7 @@ async fn fetch_messages(
                 Ok(unsealed) => {
                     if unsealed.sender == core.handle {
                         match client_app::sync::decode(&unsealed.plaintext) {
-                            Ok(synced) => received.push(Incoming::Synced {
-                                peer: synced.peer,
-                                text: synced.text,
-                            }),
+                            Ok(synced) => received.push(incoming_from_sync(synced)),
                             Err(error) => {
                                 leptos::logging::warn!(
                                     "Sync-Hülle {} unlesbar: {error}",
@@ -1213,10 +1401,7 @@ async fn fetch_messages(
             Ok(payload) => {
                 if opened.from == core.handle {
                     match client_app::sync::decode(&payload) {
-                        Ok(synced) => received.push(Incoming::Synced {
-                            peer: synced.peer,
-                            text: synced.text,
-                        }),
+                        Ok(synced) => received.push(incoming_from_sync(synced)),
                         Err(error) => {
                             leptos::logging::warn!("Sync-Hülle {} unlesbar: {error}", message.id)
                         }
@@ -2072,6 +2257,17 @@ fn App() -> impl IntoView {
                                 let own = me.get_untracked();
                                 let mut summaries = None;
                                 for item in received {
+                                    // Ein Verlaufs-Nachzug (Koppeln) bringt
+                                    // mehrere Zeilen für einen Chat; sie werden
+                                    // in die Ablage gemischt statt einzeln
+                                    // angehängt.
+                                    if let Incoming::SyncedHistory { peer, lines } = item {
+                                        summaries = Some(merge_history(&storage, &peer, &lines));
+                                        if open.as_deref() == Some(peer.as_str()) {
+                                            set_messages.set(load_history(&storage, &peer));
+                                        }
+                                        continue;
+                                    }
                                     // Ausgehend (Self-Sync) gehört in den Chat
                                     // mit dem Empfänger und zählt nie ungelesen;
                                     // eingehend zählt ungelesen, wenn der Chat
@@ -2101,6 +2297,8 @@ fn App() -> impl IntoView {
                                             },
                                             true,
                                         ),
+                                        // History ist oben behandelt.
+                                        Incoming::SyncedHistory { .. } => unreachable!(),
                                     };
                                     let for_open = open.as_deref() == Some(chat_peer.as_str());
                                     let bump = !outgoing && !for_open;
@@ -2466,6 +2664,39 @@ fn App() -> impl IntoView {
         }
     };
 
+    // Verlauf an frisch gekoppelte eigene Geräte nachliefern (siehe
+    // push_history). Vom Nutzer ausgelöst, wenn das neue Gerät bereit ist.
+    let on_push_history = {
+        let core = core.clone();
+        move |_| {
+            if busy.get_untracked() {
+                return;
+            }
+            set_busy.set(true);
+            set_status.set("Verlauf wird an neue Geräte gesendet ...".to_string());
+            let core = core.clone();
+            spawn_local(async move {
+                let taken = core.borrow_mut().take();
+                match taken {
+                    Some(mut active) => {
+                        let result = push_history(&mut active, access_token).await;
+                        *core.borrow_mut() = Some(active);
+                        match result {
+                            Ok(0) => set_status
+                                .set("Kein neues Gerät oder kein Verlauf zu senden.".to_string()),
+                            Ok(n) => {
+                                set_status.set(format!("Verlauf an {n} neue(s) Gerät(e) gesendet."))
+                            }
+                            Err(error) => set_status.set(format!("Verlauf senden: {error}")),
+                        }
+                    }
+                    None => set_status.set("Nicht angemeldet.".to_string()),
+                }
+                set_busy.set(false);
+            });
+        }
+    };
+
     // Geteilter Nachlade-Ablauf der Gerätemenge, von mehreren Handlern
     // genutzt (Öffnen, Freischalten, Entfernen).
     let refresh_devices = {
@@ -2688,6 +2919,7 @@ fn App() -> impl IntoView {
                     let on_revoke = on_revoke.clone();
                     let on_unblock = on_unblock.clone();
                     let on_sealed_default_toggle = on_sealed_default_toggle.clone();
+                    let on_push_history = on_push_history.clone();
                     let open_settings = open_settings.clone();
                     view! {
                         <div class="sm-shell">
@@ -2829,6 +3061,7 @@ fn App() -> impl IntoView {
                                     let on_revoke = on_revoke.clone();
                                     let on_unblock = on_unblock.clone();
                                     let on_sealed_default_toggle = on_sealed_default_toggle.clone();
+                                    let on_push_history = on_push_history.clone();
                                     move || {
                                         if settings_open.get() {
                                             let on_revoke = on_revoke.clone();
@@ -3035,6 +3268,24 @@ fn App() -> impl IntoView {
                                                         >
                                                             "Freischalten"
                                                         </button>
+                                                        <div class="sm-set-row">
+                                                            <span class="sm-set-label">
+                                                                "Verlauf an neue Geräte senden"
+                                                                <small>
+                                                                    "Schickt den gespeicherten Chat-Verlauf an frisch "
+                                                                    "gekoppelte eigene Geräte (sobald sie bereit sind). "
+                                                                    "Ein Gerät erhält ihn nur einmal."
+                                                                </small>
+                                                            </span>
+                                                            <button
+                                                                type="button"
+                                                                class="sm-secondary"
+                                                                on:click=on_push_history.clone()
+                                                                disabled=busy
+                                                            >
+                                                                "Verlauf senden"
+                                                            </button>
+                                                        </div>
                                                         <div class="sm-set-row sm-set-plan">
                                                             <span class="sm-set-label">
                                                                 "Kopplung per QR-Code"

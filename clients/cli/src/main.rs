@@ -675,9 +675,15 @@ fn print_and_remember(
 ) -> Result<(), String> {
     if from == own_handle {
         match client_app::sync::decode(payload) {
-            Ok(synced) => println!(
-                "[-> {}] {}  (auf anderem Gerät gesendet)",
-                synced.peer, synced.text
+            Ok(client_app::sync::Synced::Message { peer, text }) => {
+                println!("[-> {peer}] {text}  (auf anderem Gerät gesendet)")
+            }
+            // Das CLI hält keinen persistenten Verlauf, deshalb ist ein
+            // Verlaufs-Nachzug hier nur eine kurze Ausgabe (der Web-Client
+            // spielt ihn in seine Ablage ein).
+            Ok(client_app::sync::Synced::History { peer, lines }) => println!(
+                "[Verlaufs-Nachzug zu {peer}: {} Zeile(n) von einem anderen Gerät]",
+                lines.len()
             ),
             Err(error) => eprintln!("Sync-Hülle {message_id} unlesbar: {error}"),
         }
