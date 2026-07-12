@@ -291,9 +291,99 @@ const GROUP_CHAT_PREFIX: &str = "grp:";
 const MLS_STATE_KEY: &str = "mls/state";
 /// Ablage-Schlüssel der lokalen Gruppenliste (ID plus Mitglieder).
 const GROUPS_INDEX_KEY: &str = "groups/index";
+/// Ablage-Schlüssel der offenen Einladungen (Gruppen-IDs, deren Welcome
+/// vorgemerkt, aber noch nicht angenommen ist), Konvention wie im CLI.
+const INVITES_INDEX_KEY: &str = "invites/index";
+/// Höchstzahl gepufferter Hüllen je offener Einladung (gegen das Fluten
+/// der Ablage vor einer Ablehnung), wie im CLI.
+const INVITE_BUFFER_MAX: usize = 64;
 /// Wie viele MLS-KeyPackages je Anmeldung nachgelegt werden (das
 /// Verzeichnis konsumiert je Einladung eines), wie beim CLI.
 const MLS_KEY_PACKAGE_BATCH: usize = 4;
+
+fn invite_key(group_id: &str) -> String {
+    format!("group/{group_id}/invite")
+}
+
+fn invite_buffer_key(group_id: &str) -> String {
+    format!("group/{group_id}/buffer")
+}
+
+fn load_invites(storage: &SharedStorage) -> Vec<String> {
+    storage
+        .borrow()
+        .get(INVITES_INDEX_KEY)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_invites(storage: &SharedStorage, invites: &[String]) -> Result<(), String> {
+    let bytes = serde_json::to_vec(invites).map_err(|e| e.to_string())?;
+    storage.borrow_mut().put(INVITES_INDEX_KEY, &bytes)
+}
+
+/// Merkt eine Einladung vor (Welcome-Blob ablegen, ID in die Liste),
+/// ohne den Welcome zu verarbeiten. Liefert `true`, wenn sie neu ist.
+fn remember_invite(
+    storage: &SharedStorage,
+    group_id: &str,
+    welcome_blob: &[u8],
+) -> Result<bool, String> {
+    let mut invites = load_invites(storage);
+    if invites.iter().any(|id| id == group_id) {
+        return Ok(false);
+    }
+    storage
+        .borrow_mut()
+        .put(&invite_key(group_id), welcome_blob)?;
+    invites.push(group_id.to_string());
+    save_invites(storage, &invites)?;
+    Ok(true)
+}
+
+/// Verwirft eine Einladung samt gepuffertem Verkehr (Annahme/Ablehnung).
+fn forget_invite(storage: &SharedStorage, group_id: &str) -> Result<(), String> {
+    let mut invites = load_invites(storage);
+    invites.retain(|id| id != group_id);
+    save_invites(storage, &invites)?;
+    let _ = storage.borrow_mut().remove(&invite_key(group_id));
+    let _ = storage.borrow_mut().remove(&invite_buffer_key(group_id));
+    Ok(())
+}
+
+/// Puffert eine vor der Annahme eintreffende Gruppen-Hülle (etwa den
+/// Roster), damit sie beim Beitritt nachgespielt werden kann. Base64 in
+/// einer JSON-Liste.
+fn buffer_invite_blob(storage: &SharedStorage, group_id: &str, blob: &[u8]) -> Result<(), String> {
+    let key = invite_buffer_key(group_id);
+    let mut buffered: Vec<String> = storage
+        .borrow()
+        .get(&key)?
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    // Puffer deckeln (der Roster kommt zuerst): kein Fluten der Ablage vor
+    // einer Ablehnung.
+    if buffered.len() >= INVITE_BUFFER_MAX {
+        return Ok(());
+    }
+    buffered.push(BASE64.encode(blob));
+    let bytes = serde_json::to_vec(&buffered).map_err(|e| e.to_string())?;
+    storage.borrow_mut().put(&key, &bytes)
+}
+
+fn load_invite_buffer(storage: &SharedStorage, group_id: &str) -> Result<Vec<Vec<u8>>, String> {
+    let encoded: Vec<String> = storage
+        .borrow()
+        .get(&invite_buffer_key(group_id))?
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    encoded
+        .iter()
+        .map(|s| BASE64.decode(s).map_err(|e| e.to_string()))
+        .collect()
+}
 
 fn group_chat_key(group_id: &str) -> String {
     format!("{GROUP_CHAT_PREFIX}{group_id}")
@@ -594,12 +684,6 @@ enum Incoming {
         from: String,
         text: String,
     },
-    /// Ein vollzogener Gruppen-Beitritt (Welcome verarbeitet); die
-    /// Mitglieder kommen aus dem Ratchet-Tree.
-    GroupJoined {
-        group_id: String,
-        members: Vec<String>,
-    },
     /// Ein fremder Commit hat die Mitgliederliste geändert (Entfernung
     /// durch ein anderes Mitglied); Label nachführen.
     GroupUpdated {
@@ -609,6 +693,11 @@ enum Incoming {
     /// Ein fremder Commit hat DIESES Mitglied entfernt; der lokale
     /// Zustand ist schon aufgeräumt, die UI sagt es an.
     GroupRemovedSelf {
+        group_id: String,
+    },
+    /// Eine Einladung in eine Gruppe (Welcome vorgemerkt, noch nicht
+    /// beigetreten); die UI bietet Annehmen/Ablehnen an.
+    GroupInvite {
         group_id: String,
     },
 }
@@ -709,29 +798,27 @@ fn handle_group_envelope(
             }
         }
         None => {
-            // `load` hat das Mitglied konsumiert; für den Beitritt frisch
-            // aus der (unveränderten) Ablage wiederherstellen.
-            let member = load_or_new_member(storage, own_handle)?;
-            let session = GroupSession::join_group(member, blob)
-                .map_err(|e| format!("Hülle einer unbekannten Gruppe, Beitritt scheitert: {e}"))?;
-            let members: Vec<String> = session
-                .member_identities()
-                .into_iter()
-                .map(|identity| String::from_utf8_lossy(&identity).to_string())
-                .collect();
-            save_member_state(storage, &session.export_state()?)?;
-            remember_group(
-                storage,
-                GroupEntry {
-                    id: group_id.to_string(),
-                    members: members.clone(),
-                    status: GroupStatus::Active,
-                },
-            )?;
-            Ok(Some(Incoming::GroupJoined {
-                group_id: group_id.to_string(),
-                members,
-            }))
+            // Unbekannte Gruppe: ein Welcome ist eine EINLADUNG, die nur
+            // vorgemerkt wird (kein automatischer Beitritt; sonst könnte
+            // jeder Authentifizierte ein Gerät in seine Gruppe ziehen). Der
+            // Welcome wird nicht verarbeitet, damit eine abgelehnte oder
+            // Spam-Einladung kein KeyPackage kostet. Verkehr, der vor der
+            // Annahme eintrifft (etwa der Roster), wird gepuffert.
+            if GroupSession::is_welcome(blob) {
+                if remember_invite(storage, group_id, blob)? {
+                    Ok(Some(Incoming::GroupInvite {
+                        group_id: group_id.to_string(),
+                    }))
+                } else {
+                    Ok(None)
+                }
+            } else if load_invites(storage).iter().any(|id| id == group_id) {
+                buffer_invite_blob(storage, group_id, blob)?;
+                Ok(None)
+            } else {
+                // Nachricht einer Gruppe, in der wir nicht sind: verwerfen.
+                Ok(None)
+            }
         }
     }
 }
@@ -2055,6 +2142,61 @@ async fn remove_group_member(
     Ok(members)
 }
 
+/// Nimmt eine vorgemerkte Einladung an (wie `sm group-accept`): tritt der
+/// Gruppe bei (verarbeitet den Welcome, verbraucht das KeyPackage) und
+/// spielt den vor der Annahme gepufferten Verkehr nach (vor allem den
+/// Geräte-Roster). Liefert die Mitgliederliste. Kein Netzwerk nötig: die
+/// Gruppe ist beim Dienst schon angelegt.
+fn accept_invite(
+    storage: &SharedStorage,
+    own_handle: &str,
+    group_id: &str,
+) -> Result<Vec<String>, String> {
+    let welcome = storage
+        .borrow()
+        .get(&invite_key(group_id))?
+        .ok_or_else(|| "Keine offene Einladung zu dieser Gruppe.".to_string())?;
+    let member = load_or_new_member(storage, own_handle)?;
+    let mut session = GroupSession::join_group(member, &welcome)
+        .map_err(|e| format!("Beitritt scheitert: {e}"))?;
+    save_member_state(storage, &session.export_state()?)?;
+
+    let mut roster_devices = None;
+    for buffered in load_invite_buffer(storage, group_id)? {
+        match session.process(&buffered) {
+            Ok(GroupInbound::Application(application)) => {
+                if let Ok(GroupPayload::Roster { devices }) =
+                    grouptext::decode(&application.plaintext)
+                {
+                    roster_devices = Some(devices);
+                }
+            }
+            Ok(_) => {}
+            Err(error) => leptos::logging::warn!("gepufferte Hülle übersprungen: {error}"),
+        }
+    }
+    save_member_state(storage, &session.export_state()?)?;
+    if let Some(devices) = roster_devices {
+        save_roster(storage, group_id, &devices)?;
+    }
+
+    let members: Vec<String> = session
+        .member_identities()
+        .into_iter()
+        .map(|identity| String::from_utf8_lossy(&identity).to_string())
+        .collect();
+    remember_group(
+        storage,
+        GroupEntry {
+            id: group_id.to_string(),
+            members: members.clone(),
+            status: GroupStatus::Active,
+        },
+    )?;
+    forget_invite(storage, group_id)?;
+    Ok(members)
+}
+
 /// Verlässt die Gruppe lokal (wie `sm group-leave`): Ansage an die
 /// Verbliebenen, dann eigenen Zustand samt Einträgen löschen. Der Verlauf
 /// des Chats bleibt in der Ablage; kryptografisch entfernt einen erst der
@@ -2597,6 +2739,11 @@ fn App() -> impl IntoView {
     // aus der Ablage geladen und bei Gründung/Beitritt fortgeschrieben.
     let (group_labels, set_group_labels) =
         signal(std::collections::HashMap::<String, GroupUi>::new());
+    // Offene Gruppen-Einladungen (Gruppen-IDs, Welcome vorgemerkt, noch
+    // nicht beigetreten); als Banner mit Annehmen/Ablehnen in der
+    // Seitenleiste. Aus der Ablage geladen, damit sie ein Neuladen
+    // überleben.
+    let (invites, set_invites) = signal(Vec::<String>::new());
     // Ob die Sicherheitsnummer im Thread aufgeklappt ist.
     let (safety_open, set_safety_open) = signal(false);
     // Bleibender Verbindungszustand des Echtzeit-Kanals (Chat-Kopf).
@@ -2763,6 +2910,7 @@ fn App() -> impl IntoView {
             let storage = new_core.storage.clone();
             set_me.set(new_core.handle.clone());
             set_group_labels.set(load_group_labels(&storage, &new_core.handle));
+            set_invites.set(load_invites(&storage));
             *core.borrow_mut() = Some(new_core);
             set_chats.set(load_summaries(&storage));
             let sealed = load_sealed_default(&storage);
@@ -2953,6 +3101,7 @@ fn App() -> impl IntoView {
             set_deletion_pending.set(None);
             set_name_input.set(String::new());
             set_group_labels.set(std::collections::HashMap::new());
+            set_invites.set(Vec::new());
             set_group_input.set(String::new());
             let token = access_token.get_untracked();
             set_access_token.set(String::new());
@@ -3145,24 +3294,6 @@ fn App() -> impl IntoView {
                                         }
                                         continue;
                                     }
-                                    // Ein Gruppen-Beitritt legt den Chat an
-                                    // und merkt den Anzeigenamen; Nachrichten
-                                    // dazu folgen als eigene Posten.
-                                    if let Incoming::GroupJoined { group_id, members } = item {
-                                        let key = group_chat_key(&group_id);
-                                        summaries = Some(ensure_chat(&storage, &key));
-                                        set_group_labels.update(|labels| {
-                                            labels.insert(
-                                                key,
-                                                GroupUi {
-                                                    label: group_label(&members, &own),
-                                                    members,
-                                                    forgotten: false,
-                                                },
-                                            );
-                                        });
-                                        continue;
-                                    }
                                     // Eine geänderte Mitgliederliste führt nur
                                     // den Anzeigenamen nach.
                                     if let Incoming::GroupUpdated { group_id, members } = item {
@@ -3195,6 +3326,21 @@ fn App() -> impl IntoView {
                                         set_status.set(
                                             "Du wurdest aus einer Gruppe entfernt; der Verlauf \
                                              bleibt lesbar, senden geht nicht mehr."
+                                                .to_string(),
+                                        );
+                                        continue;
+                                    }
+                                    // Eine Einladung: in die Banner-Liste, der
+                                    // Nutzer entscheidet (Welcome ist schon
+                                    // vorgemerkt, kein Beitritt).
+                                    if let Incoming::GroupInvite { group_id } = item {
+                                        set_invites.update(|list| {
+                                            if !list.contains(&group_id) {
+                                                list.push(group_id);
+                                            }
+                                        });
+                                        set_status.set(
+                                            "Du wurdest in eine Gruppe eingeladen (siehe links)."
                                                 .to_string(),
                                         );
                                         continue;
@@ -3249,9 +3395,9 @@ fn App() -> impl IntoView {
                                         // History und Gruppen-Ereignisse sind
                                         // oben behandelt.
                                         Incoming::SyncedHistory { .. }
-                                        | Incoming::GroupJoined { .. }
                                         | Incoming::GroupUpdated { .. }
-                                        | Incoming::GroupRemovedSelf { .. } => unreachable!(),
+                                        | Incoming::GroupRemovedSelf { .. }
+                                        | Incoming::GroupInvite { .. } => unreachable!(),
                                     };
                                     let for_open = open.as_deref() == Some(chat_peer.as_str());
                                     let bump = !outgoing && !for_open;
@@ -3714,6 +3860,66 @@ fn App() -> impl IntoView {
                 set_busy.set(false);
             });
         }
+    };
+
+    // Eine Einladung annehmen: jetzt erst der Beitritt (verarbeitet den
+    // Welcome), der gepufferte Roster wird nachgespielt, der Gruppen-Chat
+    // öffnet sich. Kein Netzwerk nötig (die Gruppe ist beim Dienst schon
+    // angelegt).
+    let on_invite_accept = {
+        let open_chat = open_chat.clone();
+        let current_storage = current_storage.clone();
+        SendWrapper::new(Rc::new(move |group_id: String| {
+            if busy.get_untracked() {
+                return;
+            }
+            let Some(storage) = current_storage() else {
+                return;
+            };
+            let own = me.get_untracked();
+            let open_chat = open_chat.clone();
+            set_busy.set(true);
+            spawn_local(async move {
+                match accept_invite(&storage, &own, &group_id) {
+                    Ok(members) => {
+                        let key = group_chat_key(&group_id);
+                        set_group_labels.update(|labels| {
+                            labels.insert(
+                                key.clone(),
+                                GroupUi {
+                                    label: group_label(&members, &own),
+                                    members,
+                                    forgotten: false,
+                                },
+                            );
+                        });
+                        set_invites.update(|list| list.retain(|id| id != &group_id));
+                        set_chats.set(ensure_chat(&storage, &key));
+                        set_status.set("Einladung angenommen.".to_string());
+                        open_chat(key);
+                    }
+                    Err(error) => set_status.set(format!("Annehmen: {error}")),
+                }
+                set_busy.set(false);
+            });
+        }))
+    };
+
+    // Eine Einladung ablehnen: den Welcome verwerfen (kein KeyPackage
+    // verbraucht), aus der Banner-Liste nehmen.
+    let on_invite_decline = {
+        let current_storage = current_storage.clone();
+        SendWrapper::new(Rc::new(move |group_id: String| {
+            let Some(storage) = current_storage() else {
+                return;
+            };
+            if let Err(error) = forget_invite(&storage, &group_id) {
+                set_status.set(format!("Ablehnen: {error}"));
+                return;
+            }
+            set_invites.update(|list| list.retain(|id| id != &group_id));
+            set_status.set("Einladung abgelehnt.".to_string());
+        }))
     };
 
     // Fokus-Mitführung beim Chat-Wechsel (SC 2.4.3): der Kontaktname im
@@ -4192,6 +4398,8 @@ fn App() -> impl IntoView {
                     let on_key_check = on_key_check.clone();
                     let on_group_remove = on_group_remove.clone();
                     let on_group_leave = on_group_leave.clone();
+                    let on_invite_accept = on_invite_accept.clone();
+                    let on_invite_decline = on_invite_decline.clone();
                     let run_report = run_report.clone();
                     let on_send = on_send.clone();
                     let on_fetch = on_fetch.clone();
@@ -4281,6 +4489,53 @@ fn App() -> impl IntoView {
                                                         "Gruppe gründen"
                                                     </button>
                                                 </div>
+                                            }
+                                        })
+                                }}
+                                {move || {
+                                    // Offene Einladungen als Banner mit
+                                    // Annehmen/Ablehnen. Kein automatischer
+                                    // Beitritt: der Nutzer entscheidet.
+                                    let list = invites.get();
+                                    (!list.is_empty())
+                                        .then(|| {
+                                            let accept = on_invite_accept.clone();
+                                            let decline = on_invite_decline.clone();
+                                            view! {
+                                                <ul class="sm-invites" aria-label="Einladungen">
+                                                    {list
+                                                        .into_iter()
+                                                        .map(|group_id| {
+                                                            let accept = accept.clone();
+                                                            let decline = decline.clone();
+                                                            let id_a = group_id.clone();
+                                                            let id_d = group_id.clone();
+                                                            view! {
+                                                                <li class="sm-invite">
+                                                                    <span>"Einladung in eine Gruppe"</span>
+                                                                    <div class="sm-invite-actions">
+                                                                        <button
+                                                                            type="button"
+                                                                            class="sm-primary"
+                                                                            disabled=busy
+                                                                            on:click=move |_| (accept)(id_a.clone())
+                                                                        >
+                                                                            "Annehmen"
+                                                                        </button>
+                                                                        <button
+                                                                            type="button"
+                                                                            class="sm-secondary"
+                                                                            disabled=busy
+                                                                            on:click=move |_| (decline)(id_d.clone())
+                                                                        >
+                                                                            "Ablehnen"
+                                                                        </button>
+                                                                    </div>
+                                                                </li>
+                                                            }
+                                                        })
+                                                        .collect_view()}
+                                                </ul>
                                             }
                                         })
                                 }}

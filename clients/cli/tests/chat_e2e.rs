@@ -653,18 +653,34 @@ async fn group_chat_over_separate_cli_processes() {
         "stdout war: {created}"
     );
 
-    // Bert und Carl holen ab: Beitritt (Welcome) und Geräte-Roster kommen
-    // im selben Lauf über den normalen Abholweg.
+    // Bert und Carl holen ab: kein automatischer Beitritt mehr, sondern
+    // eine EINLADUNG, die vorgemerkt wird (Schutz vor aufgezwungenen
+    // Gruppen).
     let bert_recv = bert.run(&["recv"]);
     assert!(
-        bert_recv.contains("beigetreten") && bert_recv.contains("Roster"),
-        "Bert muss beitreten und den Roster übernehmen, stdout war: {bert_recv}"
+        bert_recv.contains("eingeladen") && !bert_recv.contains("beigetreten"),
+        "Bert darf nicht automatisch beitreten, stdout war: {bert_recv}"
     );
-    let carl_recv = carl.run(&["recv"]);
+    // Die Einladung steht in der Liste.
+    let bert_invites = bert.run(&["invites"]);
     assert!(
-        carl_recv.contains("beigetreten"),
-        "Carl muss beitreten, stdout war: {carl_recv}"
+        bert_invites.contains(&group_id),
+        "die Einladung muss in 'invites' stehen, stdout war: {bert_invites}"
     );
+    // Annehmen: jetzt erst der Beitritt (Mitglieder aus dem Ratchet-Tree),
+    // und der vor der Annahme gepufferte Geräte-Roster wird nachgespielt.
+    let bert_accept = bert.run(&["group-accept", &group_id]);
+    assert!(
+        bert_accept.contains("beigetreten") && bert_accept.contains("anna"),
+        "die Annahme muss beitreten, stdout war: {bert_accept}"
+    );
+    assert!(
+        bert_accept.contains("Roster ist da"),
+        "der gepufferte Roster muss beim Beitritt nachgespielt werden, stdout war: {bert_accept}"
+    );
+    // Carl nimmt ebenfalls an (die Ablehnung prüft ein eigener Test).
+    carl.run(&["recv"]);
+    carl.run(&["group-accept", &group_id]);
 
     // Die Gruppe steht in Berts lokaler Liste (samt Mitgliedern aus dem
     // MLS-Ratchet-Tree, nicht aus einer Server-Antwort).
@@ -744,6 +760,61 @@ async fn group_chat_over_separate_cli_processes() {
     assert!(
         anna_notice.contains("bert verlässt die Gruppe"),
         "stdout war: {anna_notice}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Eine Einladung wird NICHT automatisch angenommen (Schutz vor
+/// aufgezwungenen Gruppen), und ein Ablehnen verwirft sie samt Welcome,
+/// ohne beizutreten. Eine Nachricht der Gruppe erreicht den Ablehnenden
+/// dann nicht mehr als lesbaren Inhalt.
+#[tokio::test(flavor = "multi_thread")]
+async fn group_invite_can_be_declined() {
+    let urls = start_stack().await;
+    let dir = std::env::temp_dir().join(format!("sm-inv-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("Testverzeichnis");
+
+    let ida = CliUser::new(&dir, "ida", &urls);
+    let jan = CliUser::new(&dir, "jan", &urls);
+    for (user, handle) in [(&ida, "ida"), (&jan, "jan")] {
+        user.run(&["register", handle, "ein-langes-gruppen-passwort"]);
+        user.run(&["login", "ein-langes-gruppen-passwort"]);
+        user.run(&["publish-keys"]);
+    }
+
+    let created = ida.run(&["group-create", "jan"]);
+    let group_id = created
+        .split_whitespace()
+        .nth(1)
+        .expect("Gruppen-ID")
+        .to_string();
+
+    // jan holt ab: eine Einladung, kein Beitritt.
+    let jan_recv = jan.run(&["recv"]);
+    assert!(
+        jan_recv.contains("eingeladen") && !jan_recv.contains("beigetreten"),
+        "stdout war: {jan_recv}"
+    );
+    // Ablehnen: die Einladung ist weg, jan ist keiner Gruppe beigetreten.
+    let declined = jan.run(&["group-decline", &group_id]);
+    assert!(declined.contains("abgelehnt"), "stdout war: {declined}");
+    assert!(
+        jan.run(&["groups"]).contains("Keine Gruppen"),
+        "jan darf keiner Gruppe beigetreten sein"
+    );
+    assert!(
+        jan.run(&["invites"]).contains("Keine offenen Einladungen"),
+        "die Einladung muss verschwunden sein"
+    );
+
+    // idas Gruppen-Nachricht erreicht jan nicht als lesbaren Inhalt
+    // (er ist der Gruppe nie beigetreten), wird aber sauber verworfen.
+    ida.run(&["group-send", &group_id, "hallo trotzdem"]);
+    let jan_after = jan.run(&["recv"]);
+    assert!(
+        !jan_after.contains("hallo trotzdem"),
+        "der Ablehnende darf den Inhalt nicht lesen, stdout war: {jan_after}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

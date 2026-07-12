@@ -283,6 +283,18 @@ impl GroupSession {
         Ok(Self { member, group })
     }
 
+    /// Prüft rein aus dem Wire-Format, ob ein Blob eine Welcome-Nachricht
+    /// ist, OHNE ihn zu verarbeiten (das Verarbeiten verbraucht das
+    /// eingeladene KeyPackage). Damit trennt der Client eine Einladung
+    /// (zum Vormerken) von einer gewöhnlichen Gruppennachricht einer noch
+    /// unbekannten Gruppe (die er nicht lesen kann), ohne für eine
+    /// abgelehnte oder Spam-Einladung KeyPackages zu opfern.
+    pub fn is_welcome(blob: &[u8]) -> bool {
+        MlsMessageIn::tls_deserialize_exact(blob)
+            .map(|message| matches!(message.extract(), MlsMessageBodyIn::Welcome(_)))
+            .unwrap_or(false)
+    }
+
     /// Lädt Mitglieder über ihre KeyPackage-Blobs ein. Liefert den
     /// Commit-Blob (für die schon vorhandenen Mitglieder) und den
     /// Welcome-Blob (für die neuen); der Aufrufer verteilt beide über den

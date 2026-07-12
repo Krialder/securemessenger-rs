@@ -1087,6 +1087,32 @@ button:disabled {
   color: var(--sm-danger);
 }
 
+/* Offene Gruppen-Einladungen als Banner ueber der Chat-Liste: bewusst
+   sichtbar abgesetzt, damit der Nutzer sie bemerkt, aber ohne Zwang zum
+   Beitritt (Annehmen/Ablehnen). */
+.sm-invites {
+  list-style: none;
+  margin: 0;
+  padding: var(--sm-space-2);
+  border-bottom: 1px solid var(--sm-border);
+}
+.sm-invite {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-1);
+  padding: var(--sm-space-2);
+  border: 1px solid var(--sm-border);
+  border-radius: var(--sm-radius);
+  background: var(--sm-surface);
+}
+.sm-invite + .sm-invite {
+  margin-top: var(--sm-space-2);
+}
+.sm-invite-actions {
+  display: flex;
+  gap: var(--sm-space-2);
+}
+
 /* Passwortfeld plus Knopf des Loesch-Eintrags nebeneinander (umbrechend auf
    schmalen Ansichten). */
 .sm-set-inline {

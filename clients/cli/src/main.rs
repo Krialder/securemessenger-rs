@@ -61,6 +61,12 @@ const COUNTER_KEY: &str = "counter/next_prekey_id";
 const MLS_STATE_KEY: &str = "mls/state";
 /// Storage-Schlüssel der lokalen Gruppenliste (`sm groups`).
 const GROUPS_INDEX_KEY: &str = "groups/index";
+/// Storage-Schlüssel der Liste offener Einladungen (Gruppen-IDs, deren
+/// Welcome vorgemerkt, aber noch nicht angenommen ist).
+const INVITES_INDEX_KEY: &str = "invites/index";
+/// Höchstzahl gepufferter Hüllen je offener Einladung (gegen das Fluten
+/// der Ablage vor einer Ablehnung; der Roster kommt als erste Hülle).
+const INVITE_BUFFER_MAX: usize = 64;
 /// Wie viele MLS-KeyPackages `sm publish-keys` je Lauf nachlegt. Das
 /// Verzeichnis konsumiert je Einladung eines, ein kleiner Vorrat erlaubt
 /// mehrere Einladungen zwischen zwei Läufen.
@@ -145,6 +151,9 @@ async fn run() -> Result<(), String> {
         "group-send" => group_send(&args[1..]).await,
         "group-remove" => group_remove(&args[1..]).await,
         "group-leave" => group_leave(&args[1..]).await,
+        "invites" => invites_list(),
+        "group-accept" => group_accept(&args[1..]).await,
+        "group-decline" => group_decline(&args[1..]),
         "send" => send(&args[1..]).await,
         "recv" => recv().await,
         "listen" => listen(&args[1..]).await,
@@ -1454,6 +1463,108 @@ fn remember_group(storage: &SharedStorage, entry: GroupEntry) -> Result<(), Stri
     save_group_index(storage, &index)
 }
 
+fn invite_key(group_id: &str) -> String {
+    format!("group/{group_id}/invite")
+}
+
+fn load_invites(storage: &SharedStorage) -> Result<Vec<String>, String> {
+    let raw = storage
+        .borrow()
+        .get(INVITES_INDEX_KEY)
+        .map_err(|e| e.to_string())?;
+    match raw {
+        Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn save_invites(storage: &SharedStorage, invites: &[String]) -> Result<(), String> {
+    let bytes = serde_json::to_vec(invites).map_err(|e| e.to_string())?;
+    storage
+        .borrow_mut()
+        .put(INVITES_INDEX_KEY, &bytes)
+        .map_err(|e| e.to_string())
+}
+
+/// Merkt eine Einladung vor: legt den Welcome-Blob ab und trägt die
+/// Gruppen-ID in die Einladungsliste ein (doppelte werden ignoriert). Der
+/// Welcome wird bewusst NICHT verarbeitet, sonst wäre das eingeladene
+/// KeyPackage schon für eine noch nicht angenommene (oder Spam-)
+/// Einladung verbraucht.
+fn remember_invite(
+    storage: &SharedStorage,
+    group_id: &str,
+    welcome_blob: &[u8],
+) -> Result<bool, String> {
+    let mut invites = load_invites(storage)?;
+    if invites.iter().any(|id| id == group_id) {
+        return Ok(false);
+    }
+    storage
+        .borrow_mut()
+        .put(&invite_key(group_id), welcome_blob)
+        .map_err(|e| e.to_string())?;
+    invites.push(group_id.to_string());
+    save_invites(storage, &invites)?;
+    Ok(true)
+}
+
+/// Entfernt eine vorgemerkte Einladung samt gepuffertem Verkehr (nach
+/// Annahme oder Ablehnung).
+fn forget_invite(storage: &SharedStorage, group_id: &str) -> Result<(), String> {
+    let mut invites = load_invites(storage)?;
+    invites.retain(|id| id != group_id);
+    save_invites(storage, &invites)?;
+    let _ = storage.borrow_mut().remove(&invite_key(group_id));
+    let _ = storage.borrow_mut().remove(&invite_buffer_key(group_id));
+    Ok(())
+}
+
+fn invite_buffer_key(group_id: &str) -> String {
+    format!("group/{group_id}/buffer")
+}
+
+/// Puffert eine Gruppen-Hülle, die vor der Annahme einer Einladung
+/// eintrifft (etwa der Geräte-Roster, den der Gründer gleich nach der
+/// Gründung schickt). Ohne den Puffer ginge sie verloren, weil eine noch
+/// nicht beigetretene Gruppe sie nicht verarbeiten kann; bei der Annahme
+/// werden die gepufferten Hüllen der Reihe nach nachgespielt. Als Base64
+/// abgelegt (die Ablage hält Bytes; eine JSON-Liste ist so lesbar).
+fn buffer_invite_blob(storage: &SharedStorage, group_id: &str, blob: &[u8]) -> Result<(), String> {
+    let key = invite_buffer_key(group_id);
+    let mut buffered: Vec<String> = match storage.borrow().get(&key).map_err(|e| e.to_string())? {
+        Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string())?,
+        None => Vec::new(),
+    };
+    // Puffer deckeln: das Wichtige (der Roster) kommt zuerst; ein
+    // gedeckelter Puffer verhindert, dass ein Einladender die Ablage vor
+    // der Ablehnung mit beliebig vielen Hüllen füllt.
+    if buffered.len() >= INVITE_BUFFER_MAX {
+        return Ok(());
+    }
+    buffered.push(BASE64.encode(blob));
+    let bytes = serde_json::to_vec(&buffered).map_err(|e| e.to_string())?;
+    storage
+        .borrow_mut()
+        .put(&key, &bytes)
+        .map_err(|e| e.to_string())
+}
+
+fn load_invite_buffer(storage: &SharedStorage, group_id: &str) -> Result<Vec<Vec<u8>>, String> {
+    let raw = storage
+        .borrow()
+        .get(&invite_buffer_key(group_id))
+        .map_err(|e| e.to_string())?;
+    let encoded: Vec<String> = match raw {
+        Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string())?,
+        None => Vec::new(),
+    };
+    encoded
+        .iter()
+        .map(|s| BASE64.decode(s).map_err(|e| e.to_string()))
+        .collect()
+}
+
 fn save_roster(
     storage: &SharedStorage,
     group_id: &str,
@@ -1839,6 +1950,106 @@ async fn group_leave(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `sm invites`: die offenen Einladungen (Gruppen-IDs, deren Welcome
+/// vorgemerkt, aber noch nicht angenommen ist).
+fn invites_list() -> Result<(), String> {
+    let storage = open_storage()?;
+    let invites = load_invites(&storage)?;
+    if invites.is_empty() {
+        println!("Keine offenen Einladungen.");
+        return Ok(());
+    }
+    for id in invites {
+        println!("{id}  (annehmen: 'sm group-accept {id}')");
+    }
+    Ok(())
+}
+
+/// `sm group-accept <gruppen-id>`: nimmt eine vorgemerkte Einladung an,
+/// tritt also jetzt erst der Gruppe bei (verarbeitet den Welcome, was das
+/// eingeladene KeyPackage verbraucht). Die Mitgliederliste kommt aus dem
+/// Ratchet-Tree; der Geräte-Roster folgt mit dem nächsten `sm recv`.
+async fn group_accept(args: &[String]) -> Result<(), String> {
+    let [group_id] = args else {
+        return Err("Aufruf: sm group-accept <gruppen-id>".to_string());
+    };
+    let profile = load_profile()?;
+    let storage = open_storage()?;
+    let welcome = storage
+        .borrow()
+        .get(&invite_key(group_id))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Keine offene Einladung zu Gruppe {group_id} ('sm invites')."))?;
+    let member = load_or_new_member(&storage, &profile.handle)?;
+    let mut session = GroupSession::join_group(member, &welcome)
+        .map_err(|e| format!("Beitritt scheitert: {e}"))?;
+    save_member_state(&storage, &session.export_state()?)?;
+
+    // Vor der Annahme eingetroffenen Verkehr nachspielen (vor allem den
+    // Geräte-Roster). Der Reihe nach, wie er ankam; Fehler übersprungen
+    // (eine einzelne unlesbare Hülle darf den Beitritt nicht scheitern).
+    let mut roster_devices = None;
+    for buffered in load_invite_buffer(&storage, group_id)? {
+        match session.process(&buffered) {
+            Ok(GroupInbound::Application(application)) => {
+                if let Ok(GroupPayload::Roster { devices }) =
+                    grouptext::decode(&application.plaintext)
+                {
+                    roster_devices = Some(devices);
+                }
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("[gruppe {group_id}] gepufferte Hülle übersprungen: {error}"),
+        }
+    }
+    save_member_state(&storage, &session.export_state()?)?;
+    if let Some(devices) = roster_devices {
+        save_roster(&storage, group_id, &devices)?;
+    }
+
+    let members: Vec<String> = session
+        .member_identities()
+        .into_iter()
+        .map(|identity| String::from_utf8_lossy(&identity).to_string())
+        .collect();
+    remember_group(
+        &storage,
+        GroupEntry {
+            id: group_id.clone(),
+            members: members.clone(),
+        },
+    )?;
+    forget_invite(&storage, group_id)?;
+    let roster_note = if load_roster(&storage, group_id).is_ok() {
+        "Der Geräte-Roster ist da, du kannst senden."
+    } else {
+        "Den Geräte-Roster holt der nächste 'sm recv'."
+    };
+    println!(
+        "Einladung angenommen, Gruppe {group_id} beigetreten ({} Mitglieder: {}). {roster_note}",
+        members.len(),
+        members.join(", ")
+    );
+    Ok(())
+}
+
+/// `sm group-decline <gruppen-id>`: lehnt eine vorgemerkte Einladung ab.
+/// Der Welcome wird verworfen, KEIN KeyPackage verbraucht. Kryptografisch
+/// bleibt man in der Gerätemenge des Einladenden, liest aber nichts; ein
+/// späterer Wunsch beizutreten braucht eine neue Einladung.
+fn group_decline(args: &[String]) -> Result<(), String> {
+    let [group_id] = args else {
+        return Err("Aufruf: sm group-decline <gruppen-id>".to_string());
+    };
+    let storage = open_storage()?;
+    if !load_invites(&storage)?.iter().any(|id| id == group_id) {
+        return Err(format!("Keine offene Einladung zu Gruppe {group_id}."));
+    }
+    forget_invite(&storage, group_id)?;
+    println!("Einladung zu Gruppe {group_id} abgelehnt.");
+    Ok(())
+}
+
 /// Die Zustell-Ziele aus einem Roster: alle Geräte AUSSER den eigenen
 /// (das eigene MLS-Leaf kann die eigene Nachricht nicht entschlüsseln,
 /// eine Kopie an sich selbst wäre nur eine Fehlermeldung beim Abholen).
@@ -1943,29 +2154,30 @@ fn handle_group_envelope(
             Ok(())
         }
         None => {
-            // `load` hat das Mitglied konsumiert; für den Beitritt frisch
-            // aus der (unveränderten) Ablage wiederherstellen.
-            let member = load_or_new_member(storage, own_handle)?;
-            let session = GroupSession::join_group(member, blob)
-                .map_err(|e| format!("Hülle einer unbekannten Gruppe, Beitritt scheitert: {e}"))?;
-            let members: Vec<String> = session
-                .member_identities()
-                .into_iter()
-                .map(|identity| String::from_utf8_lossy(&identity).to_string())
-                .collect();
-            save_member_state(storage, &session.export_state()?)?;
-            remember_group(
-                storage,
-                GroupEntry {
-                    id: group_id.to_string(),
-                    members: members.clone(),
-                },
-            )?;
-            println!(
-                "[gruppe {group_id}] beigetreten ({} Mitglieder: {})",
-                members.len(),
-                members.join(", ")
-            );
+            // Unbekannte Gruppe: eine Welcome-Nachricht ist eine EINLADUNG,
+            // die nur vorgemerkt wird (kein automatischer Beitritt, sonst
+            // könnte jeder Authentifizierte ein Gerät in seine Gruppe
+            // ziehen und Nachrichten aufzwingen). Der Welcome wird bewusst
+            // nicht verarbeitet, damit eine abgelehnte oder Spam-Einladung
+            // kein KeyPackage kostet. Ein Nicht-Welcome-Blob (Anwendung
+            // oder Commit einer Gruppe, in der wir nicht sind) wird
+            // verworfen (der Aufrufer bestätigt ihn).
+            if GroupSession::is_welcome(blob) {
+                if remember_invite(storage, group_id, blob)? {
+                    println!(
+                        "[einladung] Du wurdest zu Gruppe {group_id} eingeladen. Annehmen mit \
+                         'sm group-accept {group_id}', ablehnen mit 'sm group-decline {group_id}'."
+                    );
+                }
+            } else if load_invites(storage)?.iter().any(|id| id == group_id) {
+                // Verkehr, der vor der Annahme eintrifft (etwa der Roster):
+                // puffern, damit er beim Beitritt nachgespielt werden kann.
+                buffer_invite_blob(storage, group_id, blob)?;
+            } else {
+                eprintln!(
+                    "[gruppe {group_id}] Nachricht einer Gruppe, in der du nicht bist, verworfen."
+                );
+            }
             Ok(())
         }
     }
@@ -2031,6 +2243,9 @@ fn print_usage() {
          \x20 group-send <id> <text>         E2EE-Gruppennachricht senden\n\
          \x20 group-remove <id> <handle>     Mitglied entfernen (MLS-Neuschluesseln)\n\
          \x20 group-leave <id>               Gruppe verlassen (lokal + Ansage)\n\
+         \x20 invites                        offene Gruppen-Einladungen anzeigen\n\
+         \x20 group-accept <id>              Einladung annehmen (beitreten)\n\
+         \x20 group-decline <id>             Einladung ablehnen\n\
          \x20 send <handle> <text> [--ttl s] [--sealed]  E2EE senden (--ttl: verschwindet; --sealed: ohne Absender-Klartext)\n\
          \x20 recv                           wartende Nachrichten abholen und entschlüsseln\n\
          \x20 listen [--once]                Hinweiskanal halten und bei Hinweisen abholen\n\
