@@ -30,18 +30,20 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use client_app::account::IdentityKeypair;
 use client_app::delivery::{
-    parse_ws_event, ws_auth_frame, DeliveryClient, OutgoingEnvelope, WsEvent,
+    parse_ws_event, ws_auth_frame, DeliveryClient, GroupOutgoing, OutgoingEnvelope, WsEvent,
 };
 use client_app::directory::DirectoryClient;
+use client_app::grouptext::{self, GroupPayload, RosterDevice};
 use client_app::identity::DeviceEnrollment;
 use client_app::kt::KtClient;
 use client_app::prekeys::{
-    bundle_from_directory, device_id_from_u32, new_uuid, publication_from_bundle,
+    bundle_from_directory, device_id_from_u32, new_uuid, publication_from_bundle, DirectoryPrekey,
     PROTOCOL_DEVICE_ID,
 };
 use client_app::protocol_store::{store_own_identity, PersistentProtocolStore};
 use client_app::storage::KeyValueStorage as _;
 use client_app::{wire, ClientError, IdentityClient, NewAccount};
+use client_core::group::{GroupMember, GroupSession};
 use client_core::libsignal_protocol::{IdentityKeyPair, ProtocolAddress};
 use client_core::onetoone::Device;
 use futures_util::future::{select, Either};
@@ -280,6 +282,137 @@ fn mark_read(storage: &SharedStorage, peer: &str) -> Vec<ChatSummary> {
     summaries
 }
 
+/// Chat-Schlüssel einer Gruppe in Verlauf und Chatliste: `grp:<uuid>`.
+/// Handles kennen keinen Doppelpunkt (Handle-Regel des identity-Dienstes),
+/// der Präfix kollidiert also nie mit einem Kontakt-Chat.
+const GROUP_CHAT_PREFIX: &str = "grp:";
+/// Ablage-Schlüssel des persistenten MLS-Zustands (smmls.v1-Blob; EIN
+/// Mitglied je Gerät für alle Gruppen), Konvention identisch zum CLI.
+const MLS_STATE_KEY: &str = "mls/state";
+/// Ablage-Schlüssel der lokalen Gruppenliste (ID plus Mitglieder).
+const GROUPS_INDEX_KEY: &str = "groups/index";
+/// Wie viele MLS-KeyPackages je Anmeldung nachgelegt werden (das
+/// Verzeichnis konsumiert je Einladung eines), wie beim CLI.
+const MLS_KEY_PACKAGE_BATCH: usize = 4;
+
+fn group_chat_key(group_id: &str) -> String {
+    format!("{GROUP_CHAT_PREFIX}{group_id}")
+}
+
+fn group_id_of(chat_key: &str) -> Option<&str> {
+    chat_key.strip_prefix(GROUP_CHAT_PREFIX)
+}
+
+/// Ein Eintrag der lokalen Gruppenliste, Format identisch zum CLI.
+#[derive(Serialize, Deserialize, Clone)]
+struct GroupEntry {
+    id: String,
+    members: Vec<String>,
+}
+
+fn roster_storage_key(group_id: &str) -> String {
+    format!("group/{group_id}/roster")
+}
+
+/// Lädt das MLS-Mitglied aus der Ablage oder legt ein frisches an und
+/// persistiert es sofort (die KeyPackage-Privatteile müssen jedes
+/// Neuladen überleben, sonst wäre ein späterer Welcome wertlos).
+fn load_or_new_member(storage: &SharedStorage, handle: &str) -> Result<GroupMember, String> {
+    let existing = storage.borrow().get(MLS_STATE_KEY)?;
+    match existing {
+        Some(state) => GroupMember::restore(handle.as_bytes(), &state),
+        None => {
+            let member = GroupMember::new(handle.as_bytes())?;
+            save_member_state(storage, &member.export_state()?)?;
+            Ok(member)
+        }
+    }
+}
+
+fn save_member_state(storage: &SharedStorage, state: &[u8]) -> Result<(), String> {
+    storage.borrow_mut().put(MLS_STATE_KEY, state)
+}
+
+fn load_group_index(storage: &SharedStorage) -> Vec<GroupEntry> {
+    storage
+        .borrow()
+        .get(GROUPS_INDEX_KEY)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Merkt eine Gruppe in der lokalen Liste vor (ersetzt einen bestehenden
+/// Eintrag derselben ID).
+fn remember_group(storage: &SharedStorage, entry: GroupEntry) -> Result<(), String> {
+    let mut index = load_group_index(storage);
+    index.retain(|g| g.id != entry.id);
+    index.push(entry);
+    let bytes = serde_json::to_vec(&index).map_err(|e| e.to_string())?;
+    storage.borrow_mut().put(GROUPS_INDEX_KEY, &bytes)
+}
+
+fn save_roster(
+    storage: &SharedStorage,
+    group_id: &str,
+    devices: &[RosterDevice],
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec(devices).map_err(|e| e.to_string())?;
+    storage
+        .borrow_mut()
+        .put(&roster_storage_key(group_id), &bytes)
+}
+
+fn load_roster(storage: &SharedStorage, group_id: &str) -> Result<Vec<RosterDevice>, String> {
+    match storage.borrow().get(&roster_storage_key(group_id))? {
+        Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
+        None => Err(
+            "Geräte-Roster dieser Gruppe fehlt noch (der Gründer schickt ihn als erste \
+             Gruppen-Nachricht; ein Abruf holt ihn)."
+                .to_string(),
+        ),
+    }
+}
+
+/// Der Anzeigename einer Gruppe: die anderen Mitglieder, damit die Zeile
+/// wie ein Gespräch liest („Gruppe: bert, carl").
+fn group_label(members: &[String], own: &str) -> String {
+    let others: Vec<&str> = members
+        .iter()
+        .filter(|m| m.as_str() != own)
+        .map(String::as_str)
+        .collect();
+    if others.is_empty() {
+        "Gruppe (nur ich)".to_string()
+    } else {
+        format!("Gruppe: {}", others.join(", "))
+    }
+}
+
+/// Alle Gruppen-Anzeigenamen aus der Ablage, für die Chatliste (Schlüssel
+/// ist der `grp:`-Chat-Schlüssel).
+fn load_group_labels(
+    storage: &SharedStorage,
+    own: &str,
+) -> std::collections::HashMap<String, String> {
+    load_group_index(storage)
+        .iter()
+        .map(|entry| (group_chat_key(&entry.id), group_label(&entry.members, own)))
+        .collect()
+}
+
+/// Die Zustell-Ziele aus einem Roster: alle Geräte AUSSER den eigenen
+/// (das eigene MLS-Leaf kann die eigene Nachricht nicht entschlüsseln).
+fn fanout_targets<'a>(
+    roster: &'a [RosterDevice],
+    own_handle: &'a str,
+) -> impl Iterator<Item = &'a RosterDevice> {
+    roster
+        .iter()
+        .filter(move |device| device.handle != own_handle)
+}
+
 /// Die Initiale für den Avatar: der erste Buchstabe des Handles, groß.
 fn avatar_initial(handle: &str) -> String {
     handle
@@ -387,6 +520,19 @@ enum Incoming {
         peer: String,
         lines: Vec<client_app::sync::HistLine>,
     },
+    /// Eine MLS-Gruppennachricht; der Absender kommt aus der von MLS
+    /// geprüften Credential, nicht aus der Transport-Hülle.
+    Group {
+        group_id: String,
+        from: String,
+        text: String,
+    },
+    /// Ein vollzogener Gruppen-Beitritt (Welcome verarbeitet); die
+    /// Mitglieder kommen aus dem Ratchet-Tree.
+    GroupJoined {
+        group_id: String,
+        members: Vec<String>,
+    },
 }
 
 /// Übersetzt ein entschlüsseltes Self-Sync-Ergebnis in einen `Incoming`.
@@ -395,6 +541,68 @@ fn incoming_from_sync(synced: client_app::sync::Synced) -> Incoming {
         client_app::sync::Synced::Message { peer, text } => Incoming::Synced { peer, text },
         client_app::sync::Synced::History { peer, lines } => {
             Incoming::SyncedHistory { peer, lines }
+        }
+    }
+}
+
+/// Verarbeitet eine eingehende Gruppen-Hülle, wie im CLI: bekannte Gruppe
+/// heißt MLS `process` (Text anzeigen, Roster übernehmen, fremde Commits
+/// anwenden), unbekannte heißt Welcome-Beitritt. Der MLS-Zustand wird
+/// nach JEDER Verarbeitung gesichert (der Ratchet ist weitergelaufen);
+/// ein Abbruch davor läuft beim nächsten Abruf auf denselben Zustand auf.
+fn handle_group_envelope(
+    storage: &SharedStorage,
+    own_handle: &str,
+    group_id: &str,
+    blob: &[u8],
+) -> Result<Option<Incoming>, String> {
+    let member = load_or_new_member(storage, own_handle)?;
+    match GroupSession::load(member, group_id.as_bytes())? {
+        Some(mut session) => {
+            let inbound = session.process(blob)?;
+            save_member_state(storage, &session.export_state()?)?;
+            match inbound {
+                Some(application) => {
+                    let sender = String::from_utf8_lossy(&application.sender_identity).to_string();
+                    match grouptext::decode(&application.plaintext).map_err(|e| e.to_string())? {
+                        GroupPayload::Text { text } => Ok(Some(Incoming::Group {
+                            group_id: group_id.to_string(),
+                            from: sender,
+                            text,
+                        })),
+                        GroupPayload::Roster { devices } => {
+                            save_roster(storage, group_id, &devices)?;
+                            Ok(None)
+                        }
+                    }
+                }
+                // Fremder Commit: angewandt, nichts anzuzeigen.
+                None => Ok(None),
+            }
+        }
+        None => {
+            // `load` hat das Mitglied konsumiert; für den Beitritt frisch
+            // aus der (unveränderten) Ablage wiederherstellen.
+            let member = load_or_new_member(storage, own_handle)?;
+            let session = GroupSession::join_group(member, blob)
+                .map_err(|e| format!("Hülle einer unbekannten Gruppe, Beitritt scheitert: {e}"))?;
+            let members: Vec<String> = session
+                .member_identities()
+                .into_iter()
+                .map(|identity| String::from_utf8_lossy(&identity).to_string())
+                .collect();
+            save_member_state(storage, &session.export_state()?)?;
+            remember_group(
+                storage,
+                GroupEntry {
+                    id: group_id.to_string(),
+                    members: members.clone(),
+                },
+            )?;
+            Ok(Some(Incoming::GroupJoined {
+                group_id: group_id.to_string(),
+                members,
+            }))
         }
     }
 }
@@ -643,6 +851,8 @@ async fn onboard(
         .await
         .map_err(|e| e.to_string())?;
     save_counter(&storage, device.next_prekey_id())?;
+    // MLS-KeyPackages fürs Eingeladen-werden in Gruppen, wie beim CLI.
+    top_up_mls_key_packages(&storage, &session.access_token, &handle).await?;
     save_profile(
         &storage,
         &Profile {
@@ -694,6 +904,14 @@ async fn login(storage: SharedStorage, password: String) -> Result<Onboarded, St
     // anderen Gerät gekoppeltes (oder entferntes) Gerät wird so beim nächsten
     // Senden neu aufgelöst.
     let _ = storage.borrow_mut().remove("sync/own_devices");
+    // Den MLS-KeyPackage-Vorrat auffüllen (das Verzeichnis konsumiert je
+    // Gruppen-Einladung eines); best effort, eine Anmeldung soll daran
+    // nicht scheitern.
+    if let Err(error) =
+        top_up_mls_key_packages(&storage, &session.access_token, &profile.handle).await
+    {
+        leptos::logging::warn!("MLS-KeyPackages nachlegen: {error}");
+    }
     let next_prekey_id = load_counter(&storage)?;
     let protocol_device_id = u8::try_from(profile.protocol_device_id)
         .map_err(|_| format!("Gerätenummer {} über 255", profile.protocol_device_id))?;
@@ -871,6 +1089,8 @@ async fn link_finish(storage: SharedStorage, password: String) -> Result<Onboard
         .await
         .map_err(|e| e.to_string())?;
     save_counter(&storage, device.next_prekey_id())?;
+    // MLS-KeyPackages fürs Eingeladen-werden in Gruppen, wie beim CLI.
+    top_up_mls_key_packages(&storage, &session.access_token, &profile.handle).await?;
 
     Ok(Onboarded {
         core: Core {
@@ -1446,6 +1666,173 @@ fn open_payload(
 /// (man schreibt sich nie selbst im normalen Fluss). Token als Signal aus
 /// demselben Grund wie bei `send_message`: zwischen fetch und ack liegt die
 /// Entschlüsselung, in der die Erneuerung rotieren kann.
+/// Legt einen kleinen Vorrat MLS-KeyPackages im Verzeichnis nach, damit
+/// dieses Konto in Gruppen eingeladen werden kann. Die Privatteile werden
+/// VOR der Veröffentlichung gesichert; sonst wäre ein Welcome auf ein
+/// KeyPackage möglich, dessen Privatteil nie gespeichert wurde.
+async fn top_up_mls_key_packages(
+    storage: &SharedStorage,
+    token: &str,
+    handle: &str,
+) -> Result<(), String> {
+    let member = load_or_new_member(storage, handle)?;
+    let mut packages = Vec::with_capacity(MLS_KEY_PACKAGE_BATCH);
+    for _ in 0..MLS_KEY_PACKAGE_BATCH {
+        packages.push(DirectoryPrekey {
+            id: new_uuid(),
+            key: BASE64.encode(member.key_package_blob()?),
+        });
+    }
+    save_member_state(storage, &member.export_state()?)?;
+    DirectoryClient::new(directory_url())
+        .publish_mls_key_packages(token, &packages)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Gründet eine MLS-Gruppe mit den genannten Handles, wie das CLI:
+/// Gruppe beim Zustelldienst anlegen (Epoche 0), je Gerät der
+/// Eingeladenen ein KeyPackage aus dem Verzeichnis (konsumiert je eins),
+/// ein Commit lädt alle ein (Epoche 1), die Welcome-Hüllen gehen an die
+/// eingeladenen Geräte und der Geräte-Roster folgt als erste
+/// Anwendungsnachricht. Liefert die Zustell-Gruppen-ID.
+async fn create_group_web(
+    storage: &SharedStorage,
+    token: &str,
+    own_handle: &str,
+    invitees: &[String],
+) -> Result<String, String> {
+    let profile = load_profile(storage).ok_or("Kein Profil in der Ablage")?;
+    let mut members = vec![own_handle.to_string()];
+    members.extend(invitees.iter().cloned());
+
+    // Zuerst die KeyPackages: scheitert ein Eingeladener, ist noch nichts
+    // angelegt worden.
+    let directory = DirectoryClient::new(directory_url());
+    let mut invite_blobs = Vec::new();
+    let mut roster = Vec::new();
+    for handle in invitees {
+        let packages = directory
+            .mls_key_packages(token, handle)
+            .await
+            .map_err(|e| e.to_string())?;
+        if packages.devices.is_empty() {
+            return Err(format!(
+                "{handle} hat kein MLS-KeyPackage veröffentlicht (dort einmal neu anmelden oder \
+                 'sm publish-keys' ausführen)."
+            ));
+        }
+        for entry in packages.devices {
+            invite_blobs.push(
+                BASE64
+                    .decode(&entry.key_package)
+                    .map_err(|e| format!("KeyPackage von {handle} unlesbar: {e}"))?,
+            );
+            roster.push(RosterDevice {
+                handle: handle.clone(),
+                device_id: entry.device_id,
+            });
+        }
+    }
+    // Der Roster führt ALLE Mitglieds-Geräte einschließlich des eigenen:
+    // Beigetretene adressieren daraus auch den Gründer.
+    roster.push(RosterDevice {
+        handle: own_handle.to_string(),
+        device_id: profile.device_id.clone(),
+    });
+
+    let delivery = DeliveryClient::new(delivery_url());
+    let group_id = new_uuid();
+    delivery
+        .create_group(token, &group_id, &members)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let member = load_or_new_member(storage, own_handle)?;
+    let mut session = GroupSession::create(member, group_id.as_bytes())?;
+    let outcome = session.add_members(&invite_blobs)?;
+    // Zustand VOR dem Verteilen sichern: bricht der Ablauf danach ab,
+    // kennt die Ablage die Gruppe trotzdem schon.
+    save_member_state(storage, &session.export_state()?)?;
+
+    let welcome_fanout: Vec<GroupOutgoing> = fanout_targets(&roster, own_handle)
+        .map(|device| {
+            Ok(GroupOutgoing {
+                id: new_uuid(),
+                device_id: device.device_id.clone(),
+                envelope: wire::seal_group(&group_id, &outcome.welcome)
+                    .map_err(|e| e.to_string())?,
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    delivery
+        .group_commit(token, &group_id, 0, &members, &welcome_fanout)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let roster_blob = session.create_message(&grouptext::encode_roster(&roster))?;
+    // Auch das Erzeugen rückt den Sende-Ratchet vor: sichern, BEVOR der
+    // Chiffretext das Gerät verlässt.
+    save_member_state(storage, &session.export_state()?)?;
+    let roster_fanout: Vec<GroupOutgoing> = fanout_targets(&roster, own_handle)
+        .map(|device| {
+            Ok(GroupOutgoing {
+                id: new_uuid(),
+                device_id: device.device_id.clone(),
+                envelope: wire::seal_group(&group_id, &roster_blob).map_err(|e| e.to_string())?,
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    delivery
+        .group_messages(token, &group_id, &roster_fanout)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    save_roster(storage, &group_id, &roster)?;
+    remember_group(
+        storage,
+        GroupEntry {
+            id: group_id.clone(),
+            members,
+        },
+    )?;
+    Ok(group_id)
+}
+
+/// Sendet einen Text in eine Gruppe: MLS verschlüsselt, der Zustand wird
+/// VOR dem Versand gesichert (sonst nutzte ein Neuladen dieselbe
+/// Ratchet-Position erneut), die Hüllen gehen an alle Roster-Geräte außer
+/// den eigenen.
+async fn send_group_message(
+    storage: &SharedStorage,
+    token: &str,
+    own_handle: &str,
+    group_id: &str,
+    text: &str,
+) -> Result<(), String> {
+    let member = load_or_new_member(storage, own_handle)?;
+    let Some(mut session) = GroupSession::load(member, group_id.as_bytes())? else {
+        return Err("Diese Gruppe ist in der lokalen Ablage unbekannt.".to_string());
+    };
+    let roster = load_roster(storage, group_id)?;
+    let blob = session.create_message(&grouptext::encode_text(text))?;
+    save_member_state(storage, &session.export_state()?)?;
+    let fanout: Vec<GroupOutgoing> = fanout_targets(&roster, own_handle)
+        .map(|device| {
+            Ok(GroupOutgoing {
+                id: new_uuid(),
+                device_id: device.device_id.clone(),
+                envelope: wire::seal_group(group_id, &blob).map_err(|e| e.to_string())?,
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    DeliveryClient::new(delivery_url())
+        .group_messages(token, group_id, &fanout)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 async fn fetch_messages(
     core: &mut Core,
     token: ReadSignal<String>,
@@ -1500,6 +1887,29 @@ async fn fetch_messages(
                     acked.push(message.id.clone());
                 }
             }
+            continue;
+        }
+        // Gruppen-Hüllen (smgrp.v1): MLS verarbeiten statt Double Ratchet.
+        if matches!(wire::classify(&message.envelope), wire::Framed::Group) {
+            let opened = match wire::open_group(&message.envelope) {
+                Ok(opened) => opened,
+                Err(error) => {
+                    leptos::logging::warn!("Gruppen-Hülle {} übersprungen: {error}", message.id);
+                    continue;
+                }
+            };
+            match handle_group_envelope(&core.storage, &core.handle, &opened.group_id, &opened.blob)
+            {
+                Ok(Some(incoming)) => received.push(incoming),
+                Ok(None) => {}
+                // Auch fehlgeschlagene Verarbeitung bestätigen (unten):
+                // ein erneuter Abruf scheiterte am selben Fehler.
+                Err(error) => leptos::logging::warn!(
+                    "Gruppen-Hülle {} nicht verarbeitbar: {error}",
+                    message.id
+                ),
+            }
+            acked.push(message.id.clone());
             continue;
         }
         let opened = match wire::open(&message.envelope) {
@@ -1919,6 +2329,12 @@ fn App() -> impl IntoView {
     // "Neuer Chat": ob das Handle-Feld offen ist und sein Inhalt.
     let (new_chat_open, set_new_chat_open) = signal(false);
     let (new_chat_input, set_new_chat_input) = signal(String::new());
+    // Mitglieder-Eingabe fürs Gründen einer Gruppe (im Neuer-Chat-Panel).
+    let (group_input, set_group_input) = signal(String::new());
+    // Anzeigenamen der Gruppen-Chats (Schlüssel `grp:<id>` -> „Gruppe: ...");
+    // aus der Ablage geladen und bei Gründung/Beitritt fortgeschrieben.
+    let (group_labels, set_group_labels) =
+        signal(std::collections::HashMap::<String, String>::new());
     // Ob die Sicherheitsnummer im Thread aufgeklappt ist.
     let (safety_open, set_safety_open) = signal(false);
     // Bleibender Verbindungszustand des Echtzeit-Kanals (Chat-Kopf).
@@ -2084,6 +2500,7 @@ fn App() -> impl IntoView {
             );
             let storage = new_core.storage.clone();
             set_me.set(new_core.handle.clone());
+            set_group_labels.set(load_group_labels(&storage, &new_core.handle));
             *core.borrow_mut() = Some(new_core);
             set_chats.set(load_summaries(&storage));
             let sealed = load_sealed_default(&storage);
@@ -2273,6 +2690,8 @@ fn App() -> impl IntoView {
             set_connected.set(false);
             set_deletion_pending.set(None);
             set_name_input.set(String::new());
+            set_group_labels.set(std::collections::HashMap::new());
+            set_group_input.set(String::new());
             let token = access_token.get_untracked();
             set_access_token.set(String::new());
             refresh_token.set_value(String::new());
@@ -2340,15 +2759,31 @@ fn App() -> impl IntoView {
                     Some(mut active) => {
                         let storage = active.storage.clone();
                         let who = active.handle.clone();
-                        let result = send_message(
-                            &mut active,
-                            access_token,
-                            &peer,
-                            &text,
-                            expires_at,
-                            sealed,
-                        )
-                        .await;
+                        // Gruppen-Chats gehen über den MLS-Pfad; Frist und
+                        // Sealed sind 1:1-Mechanik (der Gruppen-Fanout kennt
+                        // kein expires_at, und Sealed versteckt den Absender
+                        // vor dem Dienst, was MLS-Hüllen ohnehin tun).
+                        let result = if let Some(group_id) = group_id_of(&peer).map(str::to_string)
+                        {
+                            send_group_message(
+                                &storage,
+                                &access_token.get_untracked(),
+                                &who,
+                                &group_id,
+                                &text,
+                            )
+                            .await
+                        } else {
+                            send_message(
+                                &mut active,
+                                access_token,
+                                &peer,
+                                &text,
+                                expires_at,
+                                sealed,
+                            )
+                            .await
+                        };
                         *core.borrow_mut() = Some(active);
                         match result {
                             Ok(()) => {
@@ -2435,6 +2870,17 @@ fn App() -> impl IntoView {
                                         }
                                         continue;
                                     }
+                                    // Ein Gruppen-Beitritt legt den Chat an
+                                    // und merkt den Anzeigenamen; Nachrichten
+                                    // dazu folgen als eigene Posten.
+                                    if let Incoming::GroupJoined { group_id, members } = item {
+                                        let key = group_chat_key(&group_id);
+                                        summaries = Some(ensure_chat(&storage, &key));
+                                        set_group_labels.update(|labels| {
+                                            labels.insert(key, group_label(&members, &own));
+                                        });
+                                        continue;
+                                    }
                                     // Ausgehend (Self-Sync) gehört in den Chat
                                     // mit dem Empfänger und zählt nie ungelesen;
                                     // eingehend zählt ungelesen, wenn der Chat
@@ -2464,8 +2910,27 @@ fn App() -> impl IntoView {
                                             },
                                             true,
                                         ),
-                                        // History ist oben behandelt.
-                                        Incoming::SyncedHistory { .. } => unreachable!(),
+                                        // Gruppennachricht: in den Gruppen-Chat,
+                                        // der Absender kommt aus der von MLS
+                                        // geprüften Credential (kein Melden:
+                                        // Gruppen-Hüllen tragen kein Franking).
+                                        Incoming::Group {
+                                            group_id,
+                                            from,
+                                            text,
+                                        } => (
+                                            group_chat_key(&group_id),
+                                            StoredLine {
+                                                from,
+                                                text,
+                                                at: now_unix(),
+                                                report_id: None,
+                                            },
+                                            false,
+                                        ),
+                                        // History und Beitritt sind oben behandelt.
+                                        Incoming::SyncedHistory { .. }
+                                        | Incoming::GroupJoined { .. } => unreachable!(),
                                     };
                                     let for_open = open.as_deref() == Some(chat_peer.as_str());
                                     let bump = !outgoing && !for_open;
@@ -2763,6 +3228,64 @@ fn App() -> impl IntoView {
             set_new_chat_input.set(String::new());
             set_new_chat_open.set(false);
             open_chat(peer);
+        }
+    };
+
+    // Gruppe gründen (im Neuer-Chat-Panel): die Mitglieder-Handles aus dem
+    // Feld (Komma oder Leerzeichen), dann der volle Gründungs-Ablauf
+    // (create_group_web); der neue Gruppen-Chat öffnet sich direkt.
+    let on_create_group = {
+        let open_chat = open_chat.clone();
+        let current_storage = current_storage.clone();
+        move || {
+            if busy.get_untracked() {
+                return;
+            }
+            let own = me.get_untracked();
+            let mut invitees: Vec<String> = Vec::new();
+            for raw in group_input
+                .get_untracked()
+                .split([',', ' '])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if raw != own && !invitees.iter().any(|h| h == raw) {
+                    invitees.push(raw.to_string());
+                }
+            }
+            if invitees.is_empty() {
+                set_status.set("Mitglieder-Handles angeben (mit Komma getrennt).".to_string());
+                return;
+            }
+            let Some(storage) = current_storage() else {
+                set_status.set("Nicht angemeldet.".to_string());
+                return;
+            };
+            set_busy.set(true);
+            set_status.set("Gruppe wird gegründet ...".to_string());
+            let open_chat = open_chat.clone();
+            spawn_local(async move {
+                let result =
+                    create_group_web(&storage, &access_token.get_untracked(), &own, &invitees)
+                        .await;
+                match result {
+                    Ok(group_id) => {
+                        let key = group_chat_key(&group_id);
+                        let mut members = vec![own.clone()];
+                        members.extend(invitees);
+                        set_group_labels.update(|labels| {
+                            labels.insert(key.clone(), group_label(&members, &own));
+                        });
+                        set_chats.set(ensure_chat(&storage, &key));
+                        set_group_input.set(String::new());
+                        set_new_chat_open.set(false);
+                        set_status.set("Gruppe gegründet.".to_string());
+                        open_chat(key);
+                    }
+                    Err(error) => set_status.set(format!("Gruppe gründen: {error}")),
+                }
+                set_busy.set(false);
+            });
         }
     };
 
@@ -3231,6 +3754,8 @@ fn App() -> impl IntoView {
                     let open_chat_list = open_chat.clone();
                     let confirm_click = on_new_chat_confirm.clone();
                     let confirm_key = on_new_chat_confirm.clone();
+                    let group_create_click = on_create_group.clone();
+                    let group_create_key = on_create_group.clone();
                     // Frische Klone der Thread-Handler: die innere, auf `selected`
                     // reagierende Closure besitzt eigene Kopien, die äußere
                     // Closure behält ihre Originale für den nächsten Lauf.
@@ -3273,6 +3798,8 @@ fn App() -> impl IntoView {
                                         .then(|| {
                                             let confirm_click = confirm_click.clone();
                                             let confirm_key = confirm_key.clone();
+                                            let group_create_click = group_create_click.clone();
+                                            let group_create_key = group_create_key.clone();
                                             view! {
                                                 <div class="sm-sidebar-head">
                                                     <div class="sm-field">
@@ -3299,6 +3826,31 @@ fn App() -> impl IntoView {
                                                     >
                                                         "Öffnen"
                                                     </button>
+                                                    <div class="sm-field">
+                                                        <label for="sm-newgroup">"Oder Gruppe: Mitglieder (mit Komma)"</label>
+                                                        <input
+                                                            id="sm-newgroup"
+                                                            placeholder="bert, carl"
+                                                            prop:value=group_input
+                                                            on:input=move |ev| {
+                                                                set_group_input
+                                                                    .set(event_target_value(&ev))
+                                                            }
+                                                            on:keydown=move |ev: web_sys::KeyboardEvent| {
+                                                                if ev.key() == "Enter" {
+                                                                    ev.prevent_default();
+                                                                    (group_create_key)();
+                                                                }
+                                                            }
+                                                        />
+                                                    </div>
+                                                    <button
+                                                        type="button"
+                                                        class="sm-secondary"
+                                                        on:click=move |_| (group_create_click)()
+                                                    >
+                                                        "Gruppe gründen"
+                                                    </button>
                                                 </div>
                                             }
                                         })
@@ -3306,6 +3858,7 @@ fn App() -> impl IntoView {
                                 <ul class="sm-convos">
                                     {move || {
                                         let sel = selected.get();
+                                        let labels = group_labels.get();
                                         let list = chats.get();
                                         if list.is_empty() {
                                             view! {
@@ -3327,6 +3880,13 @@ fn App() -> impl IntoView {
                                                     let unread = chat.unread;
                                                     let open = open_chat_list.clone();
                                                     let click_peer = peer.clone();
+                                                    // Gruppen-Chats zeigen ihren
+                                                    // Anzeigenamen statt des
+                                                    // grp:-Schlüssels.
+                                                    let shown = labels
+                                                        .get(&peer)
+                                                        .cloned()
+                                                        .unwrap_or_else(|| peer.clone());
                                                     view! {
                                                         <li>
                                                             <button
@@ -3341,10 +3901,10 @@ fn App() -> impl IntoView {
                                                                     aria-hidden="true"
                                                                     style=avatar_style(&peer)
                                                                 >
-                                                                    {avatar_initial(&peer)}
+                                                                    {avatar_initial(&shown)}
                                                                 </span>
                                                                 <span class="sm-convo-name">
-                                                                    {peer.clone()}
+                                                                    {shown.clone()}
                                                                 </span>
                                                                 <span class="sm-convo-snippet">
                                                                     {chat.snippet.clone()}
@@ -3816,6 +4376,17 @@ fn App() -> impl IntoView {
                                                 .into_any()
                                         }
                                         Some(peer) => {
+                                            // Gruppen-Chats: Anzeigename statt
+                                            // grp:-Schlüssel; Sicherheitsnummer,
+                                            // Schlüsselprüfung und Blockieren
+                                            // sind 1:1-Mechanik (je Kontakt) und
+                                            // fehlen deshalb im Gruppen-Kopf.
+                                            let is_group = group_id_of(&peer).is_some();
+                                            let shown_name = group_labels
+                                                .get_untracked()
+                                                .get(&peer)
+                                                .cloned()
+                                                .unwrap_or_else(|| peer.clone());
                                             view! {
                                                 <div class="sm-chat-head">
                                                     <button
@@ -3831,7 +4402,7 @@ fn App() -> impl IntoView {
                                                         tabindex="-1"
                                                         node_ref=chat_name_ref
                                                     >
-                                                        {peer.clone()}
+                                                        {shown_name}
                                                     </h2>
                                                     {move || {
                                                         if connected.get() {
@@ -3852,42 +4423,49 @@ fn App() -> impl IntoView {
                                                                 .into_any()
                                                         }
                                                     }}
-                                                    <button
-                                                        type="button"
-                                                        class="sm-secondary"
-                                                        on:click=on_safety.clone()
-                                                        disabled=busy
-                                                    >
-                                                        "Sicherheitsnummer"
-                                                    </button>
-                                                    <button
-                                                        type="button"
-                                                        class="sm-secondary"
-                                                        on:click=on_key_check.clone()
-                                                        disabled=busy
-                                                    >
-                                                        "Schlüssel prüfen"
-                                                    </button>
-                                                    {move || {
-                                                        blocked
-                                                            .get()
-                                                            .map(|is_blocked| {
-                                                                view! {
-                                                                    <button
-                                                                        type="button"
-                                                                        class="sm-secondary"
-                                                                        on:click=on_block
-                                                                        disabled=busy
-                                                                    >
-                                                                        {if is_blocked {
-                                                                            "Blockierung aufheben"
-                                                                        } else {
-                                                                            "Blockieren"
-                                                                        }}
-                                                                    </button>
-                                                                }
-                                                            })
-                                                    }}
+                                                    {(!is_group)
+                                                        .then(|| {
+                                                            let on_safety = on_safety.clone();
+                                                            let on_key_check = on_key_check.clone();
+                                                            view! {
+                                                                <button
+                                                                    type="button"
+                                                                    class="sm-secondary"
+                                                                    on:click=on_safety
+                                                                    disabled=busy
+                                                                >
+                                                                    "Sicherheitsnummer"
+                                                                </button>
+                                                                <button
+                                                                    type="button"
+                                                                    class="sm-secondary"
+                                                                    on:click=on_key_check
+                                                                    disabled=busy
+                                                                >
+                                                                    "Schlüssel prüfen"
+                                                                </button>
+                                                                {move || {
+                                                                    blocked
+                                                                        .get()
+                                                                        .map(|is_blocked| {
+                                                                            view! {
+                                                                                <button
+                                                                                    type="button"
+                                                                                    class="sm-secondary"
+                                                                                    on:click=on_block
+                                                                                    disabled=busy
+                                                                                >
+                                                                                    {if is_blocked {
+                                                                                        "Blockierung aufheben"
+                                                                                    } else {
+                                                                                        "Blockieren"
+                                                                                    }}
+                                                                                </button>
+                                                                            }
+                                                                        })
+                                                                }}
+                                                            }
+                                                        })}
                                                 </div>
 
                                                 {move || {
@@ -4041,37 +4619,42 @@ fn App() -> impl IntoView {
                                                             on:keydown=on_message_key.clone()
                                                         ></textarea>
                                                     </div>
-                                                    <div class="sm-field">
-                                                        <label for="sm-ttl">"Frist"</label>
-                                                        <select
-                                                            id="sm-ttl"
-                                                            class="sm-ttl"
-                                                            prop:value=move || ttl_choice.get().to_string()
-                                                            on:change=move |ev| {
-                                                                let secs = event_target_value(&ev)
-                                                                    .parse::<u64>()
-                                                                    .unwrap_or(0);
-                                                                set_ttl_choice.set(secs);
+                                                    {(!is_group)
+                                                        .then(|| {
+                                                            view! {
+                                                                <div class="sm-field">
+                                                                    <label for="sm-ttl">"Frist"</label>
+                                                                    <select
+                                                                        id="sm-ttl"
+                                                                        class="sm-ttl"
+                                                                        prop:value=move || ttl_choice.get().to_string()
+                                                                        on:change=move |ev| {
+                                                                            let secs = event_target_value(&ev)
+                                                                                .parse::<u64>()
+                                                                                .unwrap_or(0);
+                                                                            set_ttl_choice.set(secs);
+                                                                        }
+                                                                    >
+                                                                        <option value="0">"Aus"</option>
+                                                                        <option value="300">"5 Minuten"</option>
+                                                                        <option value="3600">"1 Stunde"</option>
+                                                                        <option value="86400">"1 Tag"</option>
+                                                                        <option value="604800">"1 Woche"</option>
+                                                                    </select>
+                                                                </div>
+                                                                <label class="sm-sealed-toggle">
+                                                                    <input
+                                                                        type="checkbox"
+                                                                        prop:checked=sealed_choice
+                                                                        on:change=move |ev| {
+                                                                            set_sealed_choice
+                                                                                .set(event_target_checked(&ev));
+                                                                        }
+                                                                    />
+                                                                    "Versiegelt (Server sieht den Absender nicht)"
+                                                                </label>
                                                             }
-                                                        >
-                                                            <option value="0">"Aus"</option>
-                                                            <option value="300">"5 Minuten"</option>
-                                                            <option value="3600">"1 Stunde"</option>
-                                                            <option value="86400">"1 Tag"</option>
-                                                            <option value="604800">"1 Woche"</option>
-                                                        </select>
-                                                    </div>
-                                                    <label class="sm-sealed-toggle">
-                                                        <input
-                                                            type="checkbox"
-                                                            prop:checked=sealed_choice
-                                                            on:change=move |ev| {
-                                                                set_sealed_choice
-                                                                    .set(event_target_checked(&ev));
-                                                            }
-                                                        />
-                                                        "Versiegelt (Server sieht den Absender nicht)"
-                                                    </label>
+                                                        })}
                                                     <button
                                                         type="button"
                                                         class="sm-primary"
