@@ -13,7 +13,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::domain::{DeviceBundle, PoolCounts, Prekey, PrekeyKind};
-use crate::store::{PrekeyStore, PrekeyUpload, StoreError};
+use crate::store::{PrekeyStore, PrekeyUpload, StoreError, MAX_MLS_KEY_PACKAGES};
 
 /// Baut den Verbindungspool und fährt die eingebetteten Migrationen;
 /// schlägt eine fehl, soll der Prozess gar nicht erst Requests annehmen.
@@ -83,6 +83,28 @@ impl PrekeyStore for PgPrekeyStore {
         // Ein Stapel ist eine Transaktion: entweder kommt der ganze Upload
         // an oder nichts, halbe Pools gibt es nicht.
         let mut tx = self.pool.begin().await.map_err(backend)?;
+        // MLS-Pool deckeln: die Zeile des Geräts sperren (FOR UPDATE), die
+        // ungenutzten KeyPackages zählen und ablehnen, wenn der Upload die
+        // Obergrenze überschritte. In derselben Transaktion, also atomar
+        // gegen ein zweites gleichzeitiges Nachladen desselben Geräts.
+        let new_mls = uploads
+            .iter()
+            .filter(|u| u.kind == PrekeyKind::MlsKeyPackage)
+            .count() as i64;
+        if new_mls > 0 {
+            let existing_mls: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM prekeys \
+                 WHERE device_id = $1 AND kind = 'mls_key_package' AND used = FALSE \
+                 FOR UPDATE",
+            )
+            .bind(device_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(backend)?;
+            if existing_mls + new_mls > MAX_MLS_KEY_PACKAGES as i64 {
+                return Err(StoreError::MlsPoolFull);
+            }
+        }
         for upload in uploads {
             if !upload.kind.is_one_time() {
                 // Rotation: der bisherige signierte Prekey dieses Typs wird

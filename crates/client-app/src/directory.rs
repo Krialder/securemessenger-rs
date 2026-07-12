@@ -19,11 +19,15 @@ pub struct DirectoryClient {
 
 /// Restbestände der Einmal-Pools nach einem Upload beziehungsweise auf
 /// Abfrage; der Client füllt nach, wenn sie unter 20 fallen
-/// (datenmodell.md).
+/// (datenmodell.md). `mls_key_package` zählt die ungenutzten
+/// MLS-KeyPackages, damit der Client nur bei niedrigem Stand nachlädt und
+/// den (server-seitig gedeckelten) Pool nicht unnötig füllt.
 #[derive(Deserialize, Debug, Clone)]
 pub struct PrekeyCounts {
     pub one_time: u64,
     pub pq_one_time: u64,
+    #[serde(default)]
+    pub mls_key_package: u64,
 }
 
 /// Antwort von `GET /keys/{handle}`: Konto-Identitätsschlüssel plus ein
@@ -109,6 +113,19 @@ impl DirectoryClient {
             .await
             .map_err(transport)?;
         parse_json(response).await
+    }
+
+    /// `GET /keys/prekeys`: die Restbestände des eigenen Geräts (Einmal-,
+    /// PQ- und MLS-Pool), damit der Client nur bei niedrigem Stand nachlädt.
+    pub async fn counts(&self, access_token: &str) -> Result<PrekeyCounts, ClientError> {
+        let response = self
+            .http
+            .get(format!("{}/keys/prekeys", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(transport)?;
+        crate::http::parse_json(response).await
     }
 
     /// `POST /keys/prekeys` mit MLS-KeyPackages: füllt den KeyPackage-Pool

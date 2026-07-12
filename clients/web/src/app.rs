@@ -299,7 +299,9 @@ const INVITES_INDEX_KEY: &str = "invites/index";
 const INVITE_BUFFER_MAX: usize = 64;
 /// Wie viele MLS-KeyPackages je Anmeldung nachgelegt werden (das
 /// Verzeichnis konsumiert je Einladung eines), wie beim CLI.
-const MLS_KEY_PACKAGE_BATCH: usize = 4;
+/// Zielbestand ungenutzter MLS-KeyPackages im Verzeichnis (nur bis hierher
+/// nachlegen, damit der Pool nicht wächst), wie im CLI.
+const MLS_KEY_PACKAGE_TARGET: u64 = 8;
 
 fn invite_key(group_id: &str) -> String {
     format!("group/{group_id}/invite")
@@ -1882,25 +1884,33 @@ fn open_payload(
 /// (man schreibt sich nie selbst im normalen Fluss). Token als Signal aus
 /// demselben Grund wie bei `send_message`: zwischen fetch und ack liegt die
 /// Entschlüsselung, in der die Erneuerung rotieren kann.
-/// Legt einen kleinen Vorrat MLS-KeyPackages im Verzeichnis nach, damit
-/// dieses Konto in Gruppen eingeladen werden kann. Die Privatteile werden
-/// VOR der Veröffentlichung gesichert; sonst wäre ein Welcome auf ein
+/// Legt MLS-KeyPackages im Verzeichnis nach, damit dieses Konto in Gruppen
+/// eingeladen werden kann, aber nur bis zum Zielbestand (der Restbestand
+/// kommt aus `counts`): so wächst der Pool nicht bei jeder Anmeldung, und
+/// der server-seitige Deckel wird nie erreicht. Die Privatteile werden VOR
+/// der Veröffentlichung gesichert; sonst wäre ein Welcome auf ein
 /// KeyPackage möglich, dessen Privatteil nie gespeichert wurde.
 async fn top_up_mls_key_packages(
     storage: &SharedStorage,
     token: &str,
     handle: &str,
 ) -> Result<(), String> {
+    let directory = DirectoryClient::new(directory_url());
+    let counts = directory.counts(token).await.map_err(|e| e.to_string())?;
+    if counts.mls_key_package >= MLS_KEY_PACKAGE_TARGET {
+        return Ok(());
+    }
     let member = load_or_new_member(storage, handle)?;
-    let mut packages = Vec::with_capacity(MLS_KEY_PACKAGE_BATCH);
-    for _ in 0..MLS_KEY_PACKAGE_BATCH {
+    let needed = (MLS_KEY_PACKAGE_TARGET - counts.mls_key_package) as usize;
+    let mut packages = Vec::with_capacity(needed);
+    for _ in 0..needed {
         packages.push(DirectoryPrekey {
             id: new_uuid(),
             key: BASE64.encode(member.key_package_blob()?),
         });
     }
     save_member_state(storage, &member.export_state()?)?;
-    DirectoryClient::new(directory_url())
+    directory
         .publish_mls_key_packages(token, &packages)
         .await
         .map_err(|e| e.to_string())

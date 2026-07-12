@@ -12,11 +12,19 @@ use async_trait::async_trait;
 
 use crate::domain::{DeviceBundle, PoolCounts, Prekey, PrekeyKind};
 
+/// Obergrenze ungenutzter MLS-KeyPackages je Gerät. Ein Gerät braucht nur
+/// wenige gleichzeitig (je Gruppen-Einladung wird eines verbraucht); die
+/// Grenze deckelt den Speicher, den ein Gerät im Verzeichnis belegen kann,
+/// gegen ein Gerät, das ohne Rücksicht auf den Restbestand nachlädt.
+pub const MAX_MLS_KEY_PACKAGES: u64 = 100;
+
 /// Fehler der Ablage. Backend heißt: Infrastruktur kaputt, wird 500;
-/// PrekeyIdTaken ist ein Client-Konflikt (doppelt hochgeladene ID).
+/// PrekeyIdTaken ist ein Client-Konflikt (doppelt hochgeladene ID);
+/// MlsPoolFull heißt: das Gerät hat schon genug KeyPackages liegen.
 #[derive(Debug, PartialEq, Eq)]
 pub enum StoreError {
     PrekeyIdTaken,
+    MlsPoolFull,
     Backend(String),
 }
 
@@ -86,6 +94,22 @@ impl PrekeyStore for InMemoryPrekeyStore {
             }
         }
         let pool = pools.entry(device_id.to_string()).or_default();
+        // MLS-Pool deckeln: die ungenutzten KeyPackages dieses Geräts plus
+        // die neuen dürfen die Obergrenze nicht überschreiten (atomar unter
+        // dem Lock, kein TOCTOU).
+        let new_mls = uploads
+            .iter()
+            .filter(|u| u.kind == PrekeyKind::MlsKeyPackage)
+            .count() as u64;
+        if new_mls > 0 {
+            let existing_mls = pool
+                .iter()
+                .filter(|p| !p.used && p.kind == PrekeyKind::MlsKeyPackage)
+                .count() as u64;
+            if existing_mls + new_mls > MAX_MLS_KEY_PACKAGES {
+                return Err(StoreError::MlsPoolFull);
+            }
+        }
         for upload in uploads {
             // Rotation: der neue signierte Prekey ersetzt den alten seines
             // Typs; alte Zeilen bleiben als used markiert stehen.
@@ -244,6 +268,44 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, StoreError::PrekeyIdTaken);
+    }
+
+    #[tokio::test]
+    async fn mls_pool_is_capped_per_device() {
+        let store = InMemoryPrekeyStore::default();
+        // Bis zum Deckel füllen ist in Ordnung.
+        let full: Vec<PrekeyUpload> = (0..MAX_MLS_KEY_PACKAGES)
+            .map(|i| upload(PrekeyKind::MlsKeyPackage, &format!("kp{i}")))
+            .collect();
+        store.upload("d1", full).await.unwrap();
+        assert_eq!(
+            store.counts("d1").await.unwrap().mls_key_package,
+            MAX_MLS_KEY_PACKAGES
+        );
+
+        // Noch eines dazu wird abgelehnt (der Pool ist voll).
+        let err = store
+            .upload("d1", vec![upload(PrekeyKind::MlsKeyPackage, "kp-extra")])
+            .await
+            .unwrap_err();
+        assert_eq!(err, StoreError::MlsPoolFull);
+
+        // Nach dem Verbrauch eines KeyPackages ist wieder Platz.
+        store.take_mls_key_package("d1").await.unwrap();
+        store
+            .upload("d1", vec![upload(PrekeyKind::MlsKeyPackage, "kp-neu")])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.counts("d1").await.unwrap().mls_key_package,
+            MAX_MLS_KEY_PACKAGES
+        );
+
+        // Der Deckel gilt nur je Gerät: ein anderes Gerät kann füllen.
+        store
+            .upload("d2", vec![upload(PrekeyKind::MlsKeyPackage, "kp-d2")])
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

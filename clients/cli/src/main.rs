@@ -67,10 +67,11 @@ const INVITES_INDEX_KEY: &str = "invites/index";
 /// Höchstzahl gepufferter Hüllen je offener Einladung (gegen das Fluten
 /// der Ablage vor einer Ablehnung; der Roster kommt als erste Hülle).
 const INVITE_BUFFER_MAX: usize = 64;
-/// Wie viele MLS-KeyPackages `sm publish-keys` je Lauf nachlegt. Das
-/// Verzeichnis konsumiert je Einladung eines, ein kleiner Vorrat erlaubt
-/// mehrere Einladungen zwischen zwei Läufen.
-const MLS_KEY_PACKAGE_BATCH: usize = 4;
+/// Zielbestand ungenutzter MLS-KeyPackages im Verzeichnis. Der Client
+/// legt nur bis hierher nach (nicht bei jeder Anmeldung feste vier),
+/// damit der Pool nicht wächst und der server-seitige Deckel
+/// (`MAX_MLS_KEY_PACKAGES`) nie greift.
+const MLS_KEY_PACKAGE_TARGET: u64 = 8;
 
 /// Das lokal abgelegte Client-Profil. Der Konto-Seed ist der private
 /// Wurzelschlüssel; wer diese Datei hat, hat das Konto.
@@ -334,31 +335,36 @@ async fn publish_keys() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     save_counter(&storage, device.next_prekey_id())?;
 
-    // Dazu ein kleiner Vorrat MLS-KeyPackages, damit andere dieses Konto
-    // in Gruppen einladen können (das Verzeichnis konsumiert je Einladung
-    // eines). Die Privatteile wandern in den persistenten MLS-Zustand:
-    // erst sichern, dann veröffentlichen, sonst wäre ein Welcome auf ein
-    // KeyPackage möglich, dessen Privatteil nie gespeichert wurde.
-    let member = load_or_new_member(&storage, &profile.handle)?;
-    let mut packages = Vec::with_capacity(MLS_KEY_PACKAGE_BATCH);
-    for _ in 0..MLS_KEY_PACKAGE_BATCH {
-        let blob = member.key_package_blob()?;
-        packages.push(DirectoryPrekey {
-            id: new_uuid(),
-            key: BASE64.encode(&blob),
-        });
-    }
-    save_member_state(&storage, &member.export_state()?)?;
-    directory
-        .publish_mls_key_packages(&token, &packages)
-        .await
-        .map_err(|e| e.to_string())?;
+    // Dazu MLS-KeyPackages, damit andere dieses Konto in Gruppen einladen
+    // können (das Verzeichnis konsumiert je Einladung eines). Nur bis zum
+    // Zielbestand nachlegen (der Restbestand steht in der Upload-Antwort):
+    // so wächst der Pool nicht bei jeder Anmeldung, und der server-seitige
+    // Deckel wird nie erreicht. Die Privatteile wandern erst gesichert in
+    // den persistenten MLS-Zustand, dann wird veröffentlicht (sonst wäre
+    // ein Welcome auf ein KeyPackage möglich, dessen Privatteil fehlt).
+    let published_mls = if counts.mls_key_package < MLS_KEY_PACKAGE_TARGET {
+        let member = load_or_new_member(&storage, &profile.handle)?;
+        let needed = (MLS_KEY_PACKAGE_TARGET - counts.mls_key_package) as usize;
+        let mut packages = Vec::with_capacity(needed);
+        for _ in 0..needed {
+            packages.push(DirectoryPrekey {
+                id: new_uuid(),
+                key: BASE64.encode(member.key_package_blob()?),
+            });
+        }
+        save_member_state(&storage, &member.export_state()?)?;
+        directory
+            .publish_mls_key_packages(&token, &packages)
+            .await
+            .map_err(|e| e.to_string())?;
+        packages.len()
+    } else {
+        0
+    };
 
     println!(
-        "Prekeys veröffentlicht (Einmal-Vorrat: {} klassisch, {} PQ, {} MLS-KeyPackages)",
-        counts.one_time,
-        counts.pq_one_time,
-        packages.len()
+        "Prekeys veröffentlicht (Einmal-Vorrat: {} klassisch, {} PQ; {} MLS-KeyPackages nachgelegt)",
+        counts.one_time, counts.pq_one_time, published_mls
     );
     Ok(())
 }

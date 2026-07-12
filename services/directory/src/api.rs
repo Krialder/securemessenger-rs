@@ -266,6 +266,13 @@ async fn upload(
                 "Eine Prekey-ID ist bereits vergeben",
             )
         }
+        Err(StoreError::MlsPoolFull) => {
+            return api_error(
+                StatusCode::CONFLICT,
+                "mls_pool_full",
+                "Das Gerät hat schon genug MLS-KeyPackages; erst verbrauchen lassen",
+            )
+        }
         Err(StoreError::Backend(error)) => {
             tracing::error!(%error, "Prekey-Upload fehlgeschlagen");
             return internal();
