@@ -828,3 +828,80 @@ async fn group_invite_can_be_declined() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Multi-Device-Gruppen: ein Konto mit zwei gekoppelten Geräten ist mit
+/// BEIDEN in der Gruppe (jedes ein eigenes MLS-Leaf), und eine
+/// Gruppennachricht erreicht auch das eigene Zweitgerät des Absenders. Das
+/// ist der Kern von P4: der Fanout filtert nach Geräte-ID, nicht nach
+/// Handle, und der Gründer lädt seine eigenen anderen Geräte mit ein.
+#[tokio::test(flavor = "multi_thread")]
+async fn group_reaches_own_second_device() {
+    let urls = start_stack().await;
+    let dir = std::env::temp_dir().join(format!("sm-mdgrp-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("Testverzeichnis");
+
+    // Rosa mit zwei Geräten koppeln (wie second_device_receives_own_copy).
+    let rosa1 = CliUser::new(&dir, "rosa1", &urls);
+    rosa1.run(&["register", "rosa", "rosas-langes-passwort"]);
+    rosa1.run(&["login", "rosas-langes-passwort"]);
+    rosa1.run(&["publish-keys"]);
+    let rosa2 = CliUser::new(&dir, "rosa2", &urls);
+    let link_out = rosa2.run(&["link", "rosa", "rosas-langes-passwort"]);
+    let payload = link_out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("sm approve "))
+        .expect("Kopplungs-Antrag")
+        .to_string();
+    rosa1.run(&["approve", &payload]);
+    rosa2.run(&["link-finish", "rosa", "rosas-langes-passwort"]);
+    // Das Zweitgerät braucht eigene MLS-KeyPackages, um eingeladen zu werden.
+    rosa2.run(&["publish-keys"]);
+
+    // Timo als drittes Mitglied.
+    let timo = CliUser::new(&dir, "timo", &urls);
+    timo.run(&["register", "timo", "timos-langes-passwort"]);
+    timo.run(&["login", "timos-langes-passwort"]);
+    timo.run(&["publish-keys"]);
+
+    // Rosa (Gerät 1) gründet die Gruppe mit timo. Dabei wird auch rosas
+    // EIGENES Zweitgerät eingeladen.
+    let created = rosa1.run(&["group-create", "timo"]);
+    let group_id = created
+        .split_whitespace()
+        .nth(1)
+        .expect("Gruppen-ID")
+        .to_string();
+    assert!(created.contains("rosa, timo"), "stdout war: {created}");
+
+    // Timo nimmt an. Rosas Zweitgerät bekommt EBENFALLS eine Einladung
+    // (vom eigenen Erstgerät) und nimmt an.
+    timo.run(&["recv"]);
+    timo.run(&["group-accept", &group_id]);
+    let rosa2_recv = rosa2.run(&["recv"]);
+    assert!(
+        rosa2_recv.contains("eingeladen"),
+        "rosas Zweitgerät muss eine Einladung bekommen, stdout war: {rosa2_recv}"
+    );
+    let rosa2_accept = rosa2.run(&["group-accept", &group_id]);
+    assert!(
+        rosa2_accept.contains("beigetreten"),
+        "rosas Zweitgerät muss beitreten, stdout war: {rosa2_accept}"
+    );
+    rosa2.run(&["recv"]);
+
+    // Rosa sendet vom Erstgerät. Die Nachricht muss timo UND das eigene
+    // Zweitgerät erreichen (Fanout nach Geräte-ID).
+    rosa1.run(&["group-send", &group_id, "hallo von rosa eins"]);
+    let timo_reads = timo.run(&["recv"]);
+    assert!(
+        timo_reads.contains("rosa: hallo von rosa eins"),
+        "timo muss die Nachricht lesen, stdout war: {timo_reads}"
+    );
+    let rosa2_reads = rosa2.run(&["recv"]);
+    assert!(
+        rosa2_reads.contains("rosa: hallo von rosa eins"),
+        "das eigene Zweitgerät muss die Gruppennachricht bekommen, stdout war: {rosa2_reads}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

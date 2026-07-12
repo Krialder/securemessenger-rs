@@ -1663,10 +1663,34 @@ async fn group_create(args: &[String]) -> Result<(), String> {
         }
     }
 
+    // Auch die EIGENEN anderen Geräte einladen (Multi-Device): jedes ist
+    // ein eigenes MLS-Leaf. Das gründende Gerät selbst (own device_id)
+    // fällt heraus (es ist schon Leaf 0). Wer nur ein Gerät hat, fügt hier
+    // nichts hinzu. Die eigenen Geräte bekommen wie jedes Mitglied eine
+    // Einladung, die dort anzunehmen ist.
+    let own_packages = directory
+        .mls_key_packages(&token, &profile.handle)
+        .await
+        .map_err(|e| e.to_string())?;
+    for entry in own_packages.devices {
+        if entry.device_id == profile.device_id {
+            continue;
+        }
+        invite_blobs.push(
+            BASE64
+                .decode(&entry.key_package)
+                .map_err(|e| format!("eigenes KeyPackage unlesbar: {e}"))?,
+        );
+        roster.push(RosterDevice {
+            handle: profile.handle.clone(),
+            device_id: entry.device_id,
+        });
+    }
+
     // Der Roster führt ALLE Mitglieds-Geräte einschließlich des eigenen:
     // Beigetretene adressieren daraus auch den Gründer. Die Fanouts unten
-    // filtern die eigenen Geräte heraus (das eigene MLS-Leaf kann die
-    // eigene Nachricht nicht entschlüsseln).
+    // filtern nur das eigene Gerät heraus (sein Leaf kann die eigene
+    // Nachricht nicht entschlüsseln).
     roster.push(RosterDevice {
         handle: profile.handle.clone(),
         device_id: profile.device_id.clone(),
@@ -1684,7 +1708,7 @@ async fn group_create(args: &[String]) -> Result<(), String> {
     let mut session = GroupSession::create(member, group_id.as_bytes())?;
     let outcome = session.add_members(&invite_blobs)?;
 
-    let welcome_fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &profile.handle)
+    let welcome_fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &profile.device_id)
         .map(|device| {
             Ok(GroupOutgoing {
                 id: new_uuid(),
@@ -1714,7 +1738,7 @@ async fn group_create(args: &[String]) -> Result<(), String> {
     // BEVOR der Chiffretext das Gerät verlässt (sonst nutzte ein
     // Wiederanlauf dieselbe Ratchet-Position erneut).
     save_member_state(&storage, &session.export_state()?)?;
-    let roster_fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &profile.handle)
+    let roster_fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &profile.device_id)
         .map(|device| {
             Ok(GroupOutgoing {
                 id: new_uuid(),
@@ -1778,7 +1802,7 @@ async fn group_send(args: &[String]) -> Result<(), String> {
     // Zustand sichern, BEVOR der Chiffretext das Gerät verlässt (siehe
     // group_create: sonst Ratchet-Wiederverwendung nach einem Abbruch).
     save_member_state(&storage, &session.export_state()?)?;
-    let fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &profile.handle)
+    let fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &profile.device_id)
         .map(|device| {
             Ok(GroupOutgoing {
                 id: new_uuid(),
@@ -1833,10 +1857,8 @@ async fn group_remove(args: &[String]) -> Result<(), String> {
     // Die verbleibende Mitgliederliste (der Server ersetzt damit seine
     // Gerätemenge): die aktuellen Identitäten ohne den Entfernten. Vor
     // merge_pending trägt member_identities noch alle.
-    let members: Vec<String> = session
-        .member_identities()
+    let members: Vec<String> = unique_handles(session.member_identities())
         .into_iter()
-        .map(|identity| String::from_utf8_lossy(&identity).to_string())
         .filter(|m| m != handle)
         .collect();
     // Commit bauen (nur VORGEMERKT, nicht angewandt, nicht gesichert).
@@ -1844,7 +1866,7 @@ async fn group_remove(args: &[String]) -> Result<(), String> {
 
     // Der Commit geht an ALLE bisherigen Geräte außer den eigenen, auch
     // an die des Entfernten (Erkennen + Aufräumen).
-    let commit_fanout: Vec<GroupOutgoing> = fanout_targets(&old_roster, &profile.handle)
+    let commit_fanout: Vec<GroupOutgoing> = fanout_targets(&old_roster, &profile.device_id)
         .map(|device| {
             Ok(GroupOutgoing {
                 id: new_uuid(),
@@ -1893,7 +1915,7 @@ async fn group_remove(args: &[String]) -> Result<(), String> {
     // Frischer Roster an die Rest-Gruppe (best effort, siehe oben).
     let roster_blob = session.create_message(&grouptext::encode_roster(&new_roster))?;
     save_member_state(&storage, &session.export_state()?)?;
-    let roster_fanout: Vec<GroupOutgoing> = fanout_targets(&new_roster, &profile.handle)
+    let roster_fanout: Vec<GroupOutgoing> = fanout_targets(&new_roster, &profile.device_id)
         .map(|device| {
             Ok(GroupOutgoing {
                 id: new_uuid(),
@@ -1938,7 +1960,7 @@ async fn group_leave(args: &[String]) -> Result<(), String> {
     let roster = load_roster(&storage, group_id)?;
     let blob = session.create_message(&grouptext::encode_leave())?;
     save_member_state(&storage, &session.export_state()?)?;
-    let fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &profile.handle)
+    let fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &profile.device_id)
         .map(|device| {
             Ok(GroupOutgoing {
                 id: new_uuid(),
@@ -2045,11 +2067,7 @@ async fn group_accept(args: &[String]) -> Result<(), String> {
         save_roster(&storage, group_id, &devices)?;
     }
 
-    let members: Vec<String> = session
-        .member_identities()
-        .into_iter()
-        .map(|identity| String::from_utf8_lossy(&identity).to_string())
-        .collect();
+    let members = unique_handles(session.member_identities());
     remember_group(
         &storage,
         GroupEntry {
@@ -2092,16 +2110,31 @@ fn group_decline(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Die Zustell-Ziele aus einem Roster: alle Geräte AUSSER den eigenen
-/// (das eigene MLS-Leaf kann die eigene Nachricht nicht entschlüsseln,
-/// eine Kopie an sich selbst wäre nur eine Fehlermeldung beim Abholen).
+/// Die eindeutigen Handles aus einer Leaf-Identitätsliste
+/// (`member_identities`): ein Multi-Device-Mitglied hat mehrere Leaves mit
+/// demselben Handle, für die Mitglieder-Anzeige und den `members`-Parameter
+/// (Handles, die der Dienst zu Geräten auflöst) zählt jeder Handle einmal.
+fn unique_handles(identities: Vec<Vec<u8>>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    identities
+        .into_iter()
+        .map(|id| String::from_utf8_lossy(&id).to_string())
+        .filter(|handle| seen.insert(handle.clone()))
+        .collect()
+}
+
+/// Die Zustell-Ziele aus einem Roster: alle Geräte AUSSER dem eigenen. Es
+/// wird nach der eigenen GERÄTE-ID gefiltert, nicht nach dem Handle:
+/// eigene Zweitgeräte sind eigene MLS-Leaves und sollen die Nachricht
+/// bekommen (Multi-Device), nur das sendende Gerät selbst nicht (sein Leaf
+/// kann die eigene Nachricht nicht entschlüsseln).
 fn fanout_targets<'a>(
     roster: &'a [RosterDevice],
-    own_handle: &'a str,
+    own_device_id: &'a str,
 ) -> impl Iterator<Item = &'a RosterDevice> {
     roster
         .iter()
-        .filter(move |device| device.handle != own_handle)
+        .filter(move |device| device.device_id != own_device_id)
 }
 
 /// Verarbeitet eine eingehende Gruppen-Hülle: bekannte Gruppe -> MLS
@@ -2146,11 +2179,7 @@ fn handle_group_envelope(
                 // haben, den lokalen Eintrag nachführen.
                 GroupInbound::Updated => {
                     save_member_state(storage, &session.export_state()?)?;
-                    let members: Vec<String> = session
-                        .member_identities()
-                        .into_iter()
-                        .map(|identity| String::from_utf8_lossy(&identity).to_string())
-                        .collect();
+                    let members = unique_handles(session.member_identities());
                     // Roster selbst-heilen: Geräte ausgeschiedener Handles
                     // fallen heraus, auch wenn die neue Roster-Nachricht
                     // (die der Committer separat schickt) nie ankommt. Sonst

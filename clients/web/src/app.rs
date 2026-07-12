@@ -569,15 +569,29 @@ fn load_group_labels(
         .collect()
 }
 
-/// Die Zustell-Ziele aus einem Roster: alle Geräte AUSSER den eigenen
-/// (das eigene MLS-Leaf kann die eigene Nachricht nicht entschlüsseln).
+/// Die Zustell-Ziele aus einem Roster: alle Geräte AUSSER dem eigenen. Es
+/// wird nach der eigenen GERÄTE-ID gefiltert, nicht nach dem Handle: eigene
+/// Zweitgeräte sind eigene MLS-Leaves und sollen die Nachricht bekommen
+/// (Multi-Device), nur das sendende Gerät selbst nicht.
 fn fanout_targets<'a>(
     roster: &'a [RosterDevice],
-    own_handle: &'a str,
+    own_device_id: &'a str,
 ) -> impl Iterator<Item = &'a RosterDevice> {
     roster
         .iter()
-        .filter(move |device| device.handle != own_handle)
+        .filter(move |device| device.device_id != own_device_id)
+}
+
+/// Die eindeutigen Handles aus einer Leaf-Identitätsliste
+/// (`member_identities`): ein Multi-Device-Mitglied hat mehrere Leaves mit
+/// demselben Handle, für Anzeige und `members`-Parameter zählt jeder einmal.
+fn unique_handles(identities: Vec<Vec<u8>>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    identities
+        .into_iter()
+        .map(|id| String::from_utf8_lossy(&id).to_string())
+        .filter(|handle| seen.insert(handle.clone()))
+        .collect()
 }
 
 /// Die Initiale für den Avatar: der erste Buchstabe des Handles, groß.
@@ -765,11 +779,7 @@ fn handle_group_envelope(
                 // speist die Anzeigenamen), sonst nichts anzuzeigen.
                 GroupInbound::Updated => {
                     save_member_state(storage, &session.export_state()?)?;
-                    let members: Vec<String> = session
-                        .member_identities()
-                        .into_iter()
-                        .map(|identity| String::from_utf8_lossy(&identity).to_string())
-                        .collect();
+                    let members = unique_handles(session.member_identities());
                     // Roster selbst-heilen: Geräte ausgeschiedener Handles
                     // fallen heraus, auch wenn die neue Roster-Nachricht nie
                     // ankommt (sonst wiese der Dienst einen späteren Versand
@@ -1937,6 +1947,7 @@ async fn create_group_web(
     invitees: &[String],
 ) -> Result<String, String> {
     let profile = load_profile(storage).ok_or("Kein Profil in der Ablage")?;
+    let own_device_id = profile.device_id.clone();
     let mut members = vec![own_handle.to_string()];
     members.extend(invitees.iter().cloned());
 
@@ -1968,6 +1979,26 @@ async fn create_group_web(
             });
         }
     }
+    // Auch die EIGENEN anderen Geräte einladen (Multi-Device): jedes ist
+    // ein eigenes MLS-Leaf; das gründende Gerät selbst fällt heraus.
+    let own_packages = directory
+        .mls_key_packages(token, own_handle)
+        .await
+        .map_err(|e| e.to_string())?;
+    for entry in own_packages.devices {
+        if entry.device_id == profile.device_id {
+            continue;
+        }
+        invite_blobs.push(
+            BASE64
+                .decode(&entry.key_package)
+                .map_err(|e| format!("eigenes KeyPackage unlesbar: {e}"))?,
+        );
+        roster.push(RosterDevice {
+            handle: own_handle.to_string(),
+            device_id: entry.device_id,
+        });
+    }
     // Der Roster führt ALLE Mitglieds-Geräte einschließlich des eigenen:
     // Beigetretene adressieren daraus auch den Gründer.
     roster.push(RosterDevice {
@@ -1986,7 +2017,7 @@ async fn create_group_web(
     let mut session = GroupSession::create(member, group_id.as_bytes())?;
     let outcome = session.add_members(&invite_blobs)?;
 
-    let welcome_fanout: Vec<GroupOutgoing> = fanout_targets(&roster, own_handle)
+    let welcome_fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &own_device_id)
         .map(|device| {
             Ok(GroupOutgoing {
                 id: new_uuid(),
@@ -2011,7 +2042,7 @@ async fn create_group_web(
     // Auch das Erzeugen rückt den Sende-Ratchet vor: sichern, BEVOR der
     // Chiffretext das Gerät verlässt.
     save_member_state(storage, &session.export_state()?)?;
-    let roster_fanout: Vec<GroupOutgoing> = fanout_targets(&roster, own_handle)
+    let roster_fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &own_device_id)
         .map(|device| {
             Ok(GroupOutgoing {
                 id: new_uuid(),
@@ -2048,6 +2079,9 @@ async fn send_group_message(
     group_id: &str,
     text: &str,
 ) -> Result<(), String> {
+    let own_device_id = load_profile(storage)
+        .map(|p| p.device_id)
+        .ok_or("Kein Profil in der Ablage")?;
     let member = load_or_new_member(storage, own_handle)?;
     let Some(mut session) = GroupSession::load(member, group_id.as_bytes())? else {
         return Err("Diese Gruppe ist in der lokalen Ablage unbekannt.".to_string());
@@ -2055,7 +2089,7 @@ async fn send_group_message(
     let roster = load_roster(storage, group_id)?;
     let blob = session.create_message(&grouptext::encode_text(text))?;
     save_member_state(storage, &session.export_state()?)?;
-    let fanout: Vec<GroupOutgoing> = fanout_targets(&roster, own_handle)
+    let fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &own_device_id)
         .map(|device| {
             Ok(GroupOutgoing {
                 id: new_uuid(),
@@ -2083,6 +2117,9 @@ async fn remove_group_member(
     group_id: &str,
     handle: &str,
 ) -> Result<Vec<String>, String> {
+    let own_device_id = load_profile(storage)
+        .map(|p| p.device_id)
+        .ok_or("Kein Profil in der Ablage")?;
     let member = load_or_new_member(storage, own_handle)?;
     let Some(mut session) = GroupSession::load(member, group_id.as_bytes())? else {
         return Err("Diese Gruppe ist in der lokalen Ablage unbekannt.".to_string());
@@ -2092,16 +2129,14 @@ async fn remove_group_member(
     // Verbleibende Mitglieder (der Server ersetzt damit die Gerätemenge):
     // die aktuellen Identitäten ohne den Entfernten. Vor merge_pending
     // trägt member_identities noch alle.
-    let members: Vec<String> = session
-        .member_identities()
+    let members: Vec<String> = unique_handles(session.member_identities())
         .into_iter()
-        .map(|identity| String::from_utf8_lossy(&identity).to_string())
         .filter(|m| m != handle)
         .collect();
     let commit = session.remove_members(&[handle.as_bytes().to_vec()])?;
 
     let delivery = DeliveryClient::new(delivery_url());
-    let commit_fanout: Vec<GroupOutgoing> = fanout_targets(&old_roster, own_handle)
+    let commit_fanout: Vec<GroupOutgoing> = fanout_targets(&old_roster, &own_device_id)
         .map(|device| {
             Ok(GroupOutgoing {
                 id: new_uuid(),
@@ -2139,7 +2174,7 @@ async fn remove_group_member(
 
     let roster_blob = session.create_message(&grouptext::encode_roster(&new_roster))?;
     save_member_state(storage, &session.export_state()?)?;
-    let roster_fanout: Vec<GroupOutgoing> = fanout_targets(&new_roster, own_handle)
+    let roster_fanout: Vec<GroupOutgoing> = fanout_targets(&new_roster, &own_device_id)
         .map(|device| {
             Ok(GroupOutgoing {
                 id: new_uuid(),
@@ -2235,11 +2270,7 @@ fn accept_invite(
         );
     }
 
-    let members: Vec<String> = session
-        .member_identities()
-        .into_iter()
-        .map(|identity| String::from_utf8_lossy(&identity).to_string())
-        .collect();
+    let members = unique_handles(session.member_identities());
     remember_group(
         storage,
         GroupEntry {
@@ -2262,6 +2293,9 @@ async fn leave_group_web(
     own_handle: &str,
     group_id: &str,
 ) -> Result<(), String> {
+    let own_device_id = load_profile(storage)
+        .map(|p| p.device_id)
+        .ok_or("Kein Profil in der Ablage")?;
     let member = load_or_new_member(storage, own_handle)?;
     let Some(mut session) = GroupSession::load(member, group_id.as_bytes())? else {
         return Err("Diese Gruppe ist in der lokalen Ablage unbekannt.".to_string());
@@ -2269,7 +2303,7 @@ async fn leave_group_web(
     let roster = load_roster(storage, group_id)?;
     let blob = session.create_message(&grouptext::encode_leave())?;
     save_member_state(storage, &session.export_state()?)?;
-    let fanout: Vec<GroupOutgoing> = fanout_targets(&roster, own_handle)
+    let fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &own_device_id)
         .map(|device| {
             Ok(GroupOutgoing {
                 id: new_uuid(),
