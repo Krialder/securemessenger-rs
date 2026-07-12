@@ -26,7 +26,7 @@ Ein Teil der früher offenen Punkte ist umgesetzt und im [Live-Dokument](live-do
 
 ## Geräte und Identität
 
-- Rotation des Konto-Identitätsschlüssels. Das ist die Wurzel, also dringlich, nicht "irgendwann".
+- ~~Rotation des Konto-Identitätsschlüssels. Das ist die Wurzel, also dringlich, nicht "irgendwann".~~ GELÖST durch [ADR-0010](entscheidungen/0010-wurzelschluessel-rotation.md): kontinuitätssigniertes Ersetzen (der alte Wurzelschlüssel signiert den neuen), atomar unter Kontosperre, mit Ablauf-Erneuerung und absturzsicherem Client. Offen bleibt nur die rollierende Übergangsvariante (alt und neu eine Zeit lang gültig) als spätere Verfeinerung.
 - Cross-Signing ja oder nein, und falls ja, wie man die Matrix-Fehler vermeidet (verlorene Cross-Signing-Schlüssel, Verifikations-Loops).
 - Safety Number bei Multi-Device: pro Identität rechnen (Tendenz), aber dann muss die Geräte-Sichtbarkeit woanders hin.
 - Geräte-Credential-Format im Detail.
