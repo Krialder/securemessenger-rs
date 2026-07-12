@@ -4636,7 +4636,7 @@ fn App() -> impl IntoView {
                                             let group_create_click = group_create_click.clone();
                                             let group_create_key = group_create_key.clone();
                                             view! {
-                                                <div class="sm-sidebar-head">
+                                                <div class="sm-newchat">
                                                     <div class="sm-field">
                                                         <label for="sm-newchat">"Handle des Kontakts"</label>
                                                         <input

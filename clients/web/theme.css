@@ -584,6 +584,21 @@ button:disabled {
   margin-inline-end: auto;
 }
 
+/* Neuer-Chat-Panel: eine gestapelte Form in der schmalen Seitenleiste
+   (Kontakt-Feld plus Oeffnen, dann Gruppen-Feld plus Gruende). Bewusst NICHT
+   die horizontale sm-sidebar-head, dort quetschen sich die vier Felder in
+   eine Reihe und die Beschriftungen brechen vertikal um. */
+.sm-newchat {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-2);
+  padding: var(--sm-space-3);
+  border-block-end: 1px solid var(--sm-divider);
+}
+.sm-newchat button {
+  inline-size: 100%;
+}
+
 .sm-convos {
   list-style: none;
   margin: 0;
@@ -1002,7 +1017,14 @@ button:disabled {
   padding: var(--sm-space-4);
   display: flex;
   flex-direction: column;
+  align-items: center;
   gap: var(--sm-space-4);
+}
+/* Die Abschnitte in einer lesbaren Mittel-Spalte halten, statt auf breiten
+   Schirmen Label und Steuerung weit auseinanderzuziehen. */
+.sm-settings > * {
+  inline-size: 100%;
+  max-inline-size: 46rem;
 }
 .sm-settings-head {
   display: flex;
@@ -1064,6 +1086,12 @@ button:disabled {
 .sm-set-stack {
   flex-direction: column;
   align-items: stretch;
+}
+/* In der Stapel-Zeile (Spalten-Layout) darf das Label nicht seine
+   Zeilen-Breite (flex-basis 14rem) als HOEHE reservieren, sonst klafft eine
+   grosse Luecke zwischen Beschriftung und Formular. */
+.sm-set-stack > .sm-set-label {
+  flex: 0 0 auto;
 }
 .sm-set-form {
   display: flex;
