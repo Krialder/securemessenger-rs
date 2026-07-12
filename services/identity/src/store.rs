@@ -49,6 +49,14 @@ pub enum StoreError {
     /// erschöpft, auch durch revozierte Geräte, deren Nummern nicht
     /// wiederverwendet werden).
     TooManyDevices,
+    /// Ein paralleler Schreibzugriff hat den Konto-Wurzelschlüssel oder die
+    /// Gerätemenge unter der Prüfung verändert (ADR-0010): das Credential
+    /// wurde gegen einen inzwischen abgelösten Schlüssel geprüft, oder ein
+    /// neu hinzugekommenes Gerät wäre nach der Rotation ohne gültiges
+    /// Credential. Der Aufrufer muss mit frischem Zustand neu ansetzen. So
+    /// entsteht kein halb rotiertes Konto ("Halb rotierte Konten gibt es
+    /// nicht"), auch nicht bei überlappendem add_device und rotate.
+    ConcurrentUpdate,
     /// Ablage nicht erreichbar oder Abfrage fehlgeschlagen. Der Text ist
     /// für Logs, nie für API-Antworten.
     Backend(String),
@@ -74,6 +82,31 @@ pub trait AccountStore: Send + Sync {
     /// tauscht nur den Wert. `AccountMissing`, wenn das Konto nicht
     /// existiert (über die authentifizierte API nicht erreichbar).
     async fn set_display_name(&self, handle: &str, display_name: &str) -> Result<(), StoreError>;
+    /// Rotiert den Konto-Wurzelschlüssel (ADR-0010): setzt den neuen
+    /// `identity_key` und ersetzt Credential und Ablauf (`not_after`) der
+    /// genannten Geräte, atomar. Nur nicht-revozierte Geräte werden
+    /// angefasst.
+    ///
+    /// `expected_old_key` ist der Schlüssel, gegen den der Aufrufer die
+    /// Kontinuitätssignatur und die neuen Credentials geprüft hat; stimmt er
+    /// unter der Zeilensperre nicht mehr mit dem gespeicherten überein (eine
+    /// parallele Rotation kam zuvor), scheitert die Rotation mit
+    /// `ConcurrentUpdate` statt einen Zustand zu hinterlassen, in dem die
+    /// Credentials gegen einen anderen Schlüssel gezeichnet sind.
+    ///
+    /// Zusätzlich prüft die Ablage INNERHALB der Transaktion, dass jedes
+    /// aktuelle nicht-revozierte Gerät in `device_credentials` vorkommt;
+    /// sonst wäre ein parallel hinzugekommenes Gerät nach der Rotation ohne
+    /// gültiges Credential (`ConcurrentUpdate`). Das schließt das Fenster
+    /// zwischen der Prüfung des Aufrufers und dem Schreiben.
+    /// `AccountMissing`, wenn das Konto nicht existiert.
+    async fn rotate_identity(
+        &self,
+        handle: &str,
+        expected_old_key: &str,
+        new_identity_key: &str,
+        device_credentials: &[(String, String, u64)],
+    ) -> Result<(), StoreError>;
     /// Merkt eine Konto-Löschung vor (NF030, Widerrufsfrist): setzt den
     /// Ablauf der Frist (`deletion_at`, Unix-Sekunden). Bis dahin kann der
     /// Nutzer widerrufen; danach entfernt `purge_deleted` das Konto.
@@ -93,7 +126,20 @@ pub trait AccountStore: Send + Sync {
     /// nächste freie Protokollnummer (max der vorhandenen, auch revozierter,
     /// plus 1). Liefert die vergebene Nummer zurück, damit der Client sie
     /// als seinen ProtocolAddress-Teil übernehmen kann.
-    async fn add_device(&self, handle: &str, device: Device) -> Result<u16, StoreError>;
+    ///
+    /// `expected_identity_key` ist der Konto-Wurzelschlüssel, gegen den der
+    /// Aufrufer das Geräte-Credential geprüft hat. Unter der Zeilensperre
+    /// muss er noch mit dem gespeicherten übereinstimmen; hat eine parallele
+    /// Rotation den Schlüssel inzwischen abgelöst (ADR-0010), scheitert das
+    /// Hinzufügen mit `ConcurrentUpdate`, statt ein Gerät mit einem gegen den
+    /// alten Schlüssel gezeichneten Credential in ein rotiertes Konto zu
+    /// legen.
+    async fn add_device(
+        &self,
+        handle: &str,
+        device: Device,
+        expected_identity_key: &str,
+    ) -> Result<u16, StoreError>;
     /// Alle Geräte des Kontos, auch revozierte; das Flag steht im Gerät.
     /// Leer, wenn das Konto nicht existiert (über die API nicht erreichbar).
     async fn devices(&self, handle: &str) -> Result<Vec<Device>, StoreError>;
@@ -200,6 +246,53 @@ impl AccountStore for InMemoryStore {
         Ok(())
     }
 
+    async fn rotate_identity(
+        &self,
+        handle: &str,
+        expected_old_key: &str,
+        new_identity_key: &str,
+        device_credentials: &[(String, String, u64)],
+    ) -> Result<(), StoreError> {
+        // Der Schreib-Lock ist die Serialisierung: Prüfung und Schreiben
+        // liegen unter demselben Lock, kein add_device kann sich dazwischen
+        // schieben (anders als beim Aufrufer, der ohne Lock las).
+        let mut inner = self.inner.write().expect("Store-Lock nicht vergiftet");
+        let record = inner
+            .records
+            .get_mut(handle)
+            .ok_or(StoreError::AccountMissing)?;
+        // Hat eine parallele Rotation den Schlüssel schon abgelöst, wären die
+        // neuen Credentials gegen einen falschen Schlüssel gezeichnet.
+        if record.account.identity_key != expected_old_key {
+            return Err(StoreError::ConcurrentUpdate);
+        }
+        // Jedes aktuelle nicht-revozierte Gerät muss abgedeckt sein, sonst
+        // bliebe ein parallel hinzugekommenes Gerät ohne gültiges Credential.
+        let covered: HashSet<&str> = device_credentials
+            .iter()
+            .map(|(id, _, _)| id.as_str())
+            .collect();
+        if record
+            .devices
+            .iter()
+            .any(|d| !d.revoked && !covered.contains(d.id.as_str()))
+        {
+            return Err(StoreError::ConcurrentUpdate);
+        }
+        record.account.identity_key = new_identity_key.to_string();
+        for (device_id, credential, not_after) in device_credentials {
+            if let Some(device) = record
+                .devices
+                .iter_mut()
+                .find(|d| &d.id == device_id && !d.revoked)
+            {
+                device.credential = credential.clone();
+                device.not_after = *not_after;
+            }
+        }
+        Ok(())
+    }
+
     async fn schedule_deletion(&self, handle: &str, deletion_at: u64) -> Result<(), StoreError> {
         let mut inner = self.inner.write().expect("Store-Lock nicht vergiftet");
         let record = inner
@@ -244,7 +337,12 @@ impl AccountStore for InMemoryStore {
         Ok(due.len() as u64)
     }
 
-    async fn add_device(&self, handle: &str, device: Device) -> Result<u16, StoreError> {
+    async fn add_device(
+        &self,
+        handle: &str,
+        device: Device,
+        expected_identity_key: &str,
+    ) -> Result<u16, StoreError> {
         let mut inner = self.inner.write().expect("Store-Lock nicht vergiftet");
         if inner.device_ids.contains(&device.id) {
             return Err(StoreError::DeviceIdTaken);
@@ -253,6 +351,13 @@ impl AccountStore for InMemoryStore {
             .records
             .get_mut(handle)
             .ok_or(StoreError::AccountMissing)?;
+        // Hat eine parallele Rotation (ADR-0010) den Wurzelschlüssel unter
+        // der Credential-Prüfung des Aufrufers abgelöst, gehört dieses Gerät
+        // nicht in ein rotiertes Konto: sein Credential prüfte gegen den
+        // alten Schlüssel und würde jetzt nicht mehr verifizieren.
+        if record.account.identity_key != expected_identity_key {
+            return Err(StoreError::ConcurrentUpdate);
+        }
         // Nächste Nummer: max der vorhandenen (auch revozierter) plus 1.
         // Revozierte zählen mit, damit eine Nummer nie wiederkehrt.
         let next = record
@@ -393,14 +498,14 @@ mod tests {
             Err(StoreError::DeviceIdTaken)
         );
         assert_eq!(
-            store.add_device("alice", device("d1")).await,
+            store.add_device("alice", device("d1"), "key").await,
             Err(StoreError::DeviceIdTaken)
         );
         store.revoke_device("alice", "d1").await.unwrap();
         // Die ID bleibt gesperrt, sonst wäre das alte Credential für ein
         // neues Gerät mit derselben ID wiederverwendbar.
         assert_eq!(
-            store.add_device("alice", device("d1")).await,
+            store.add_device("alice", device("d1"), "key").await,
             Err(StoreError::DeviceIdTaken)
         );
     }
@@ -409,7 +514,7 @@ mod tests {
     async fn revoke_marks_device_and_is_not_repeatable() {
         let store = InMemoryStore::default();
         store.create(account("alice"), device("d1")).await.unwrap();
-        store.add_device("alice", device("d2")).await.unwrap();
+        store.add_device("alice", device("d2"), "key").await.unwrap();
         assert!(store.revoke_device("alice", "d2").await.is_ok());
         assert!(
             store
@@ -429,7 +534,7 @@ mod tests {
     async fn deletion_schedule_cancel_and_purge() {
         let store = InMemoryStore::default();
         store.create(account("dora"), device("d1")).await.unwrap();
-        store.add_device("dora", device("d2")).await.unwrap();
+        store.add_device("dora", device("d2"), "key").await.unwrap();
 
         // Vormerken mit einer Frist in der Zukunft: das Konto bleibt.
         store.schedule_deletion("dora", 2000).await.unwrap();
@@ -475,6 +580,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rotate_identity_replaces_key_and_credentials() {
+        let store = InMemoryStore::default();
+        store.create(account("frida"), device("d1")).await.unwrap();
+        store.add_device("frida", device("d2"), "key").await.unwrap();
+
+        store
+            .rotate_identity(
+                "frida",
+                "key",
+                "neuer-schluessel",
+                &[
+                    ("d1".to_string(), "cred-d1-neu".to_string(), 9_000),
+                    ("d2".to_string(), "cred-d2-neu".to_string(), 9_000),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get("frida").await.unwrap().unwrap().identity_key,
+            "neuer-schluessel"
+        );
+        let devices = store.devices("frida").await.unwrap();
+        let d1 = devices.iter().find(|d| d.id == "d1").unwrap();
+        assert_eq!(d1.credential, "cred-d1-neu");
+        // Der Ablauf wird mitrotiert (ADR-0010, Finding: sonst sperrt ein
+        // abgelaufenes Gerät die Rotation dauerhaft).
+        assert_eq!(d1.not_after, 9_000);
+        assert_eq!(
+            devices.iter().find(|d| d.id == "d2").unwrap().credential,
+            "cred-d2-neu"
+        );
+
+        assert_eq!(
+            store
+                .rotate_identity("gibt-es-nicht", "x", "y", &[])
+                .await,
+            Err(StoreError::AccountMissing)
+        );
+    }
+
+    /// Die Rotation ist optimistisch gegen einen abgelösten Schlüssel
+    /// gesperrt: kam eine parallele Rotation zuvor (gespeicherter Schlüssel
+    /// weicht vom erwarteten ab), scheitert sie, statt Credentials gegen
+    /// einen falschen Schlüssel zu legen.
+    #[tokio::test]
+    async fn rotate_identity_rejects_stale_old_key() {
+        let store = InMemoryStore::default();
+        store.create(account("frida"), device("d1")).await.unwrap();
+        assert_eq!(
+            store
+                .rotate_identity(
+                    "frida",
+                    "nicht-der-gespeicherte",
+                    "neu",
+                    &[("d1".to_string(), "cred".to_string(), 9_000)],
+                )
+                .await,
+            Err(StoreError::ConcurrentUpdate)
+        );
+        // Der Schlüssel blieb unverändert (kein halber Zustand).
+        assert_eq!(
+            store.get("frida").await.unwrap().unwrap().identity_key,
+            "key"
+        );
+    }
+
+    /// Deckt die Credential-Liste nicht jedes aktuelle nicht-revozierte Gerät
+    /// ab (etwa weil parallel ein Gerät hinzukam), scheitert die Rotation:
+    /// sonst bliebe dieses Gerät nach der Rotation ohne gültiges Credential.
+    #[tokio::test]
+    async fn rotate_identity_rejects_uncovered_device() {
+        let store = InMemoryStore::default();
+        store.create(account("frida"), device("d1")).await.unwrap();
+        store.add_device("frida", device("d2"), "key").await.unwrap();
+        // d2 fehlt in der Liste.
+        assert_eq!(
+            store
+                .rotate_identity(
+                    "frida",
+                    "key",
+                    "neu",
+                    &[("d1".to_string(), "cred-d1".to_string(), 9_000)],
+                )
+                .await,
+            Err(StoreError::ConcurrentUpdate)
+        );
+        assert_eq!(
+            store.get("frida").await.unwrap().unwrap().identity_key,
+            "key"
+        );
+    }
+
+    /// Revozierte Geräte müssen NICHT abgedeckt sein (sie zeigen nach der
+    /// Rotation ohnehin nicht mehr auf das Konto).
+    #[tokio::test]
+    async fn rotate_identity_ignores_revoked_devices() {
+        let store = InMemoryStore::default();
+        store.create(account("frida"), device("d1")).await.unwrap();
+        store.add_device("frida", device("d2"), "key").await.unwrap();
+        store.revoke_device("frida", "d2").await.unwrap();
+        store
+            .rotate_identity(
+                "frida",
+                "key",
+                "neu",
+                &[("d1".to_string(), "cred-d1".to_string(), 9_000)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get("frida").await.unwrap().unwrap().identity_key,
+            "neu"
+        );
+    }
+
+    /// add_device gegen einen abgelösten Schlüssel (parallele Rotation kam
+    /// zuvor) scheitert, statt ein Gerät mit altem Credential in ein
+    /// rotiertes Konto zu legen.
+    #[tokio::test]
+    async fn add_device_rejects_stale_identity_key() {
+        let store = InMemoryStore::default();
+        store.create(account("frida"), device("d1")).await.unwrap();
+        assert_eq!(
+            store
+                .add_device("frida", device("d2"), "abgeloester-schluessel")
+                .await,
+            Err(StoreError::ConcurrentUpdate)
+        );
+    }
+
+    #[tokio::test]
     async fn display_name_is_replaceable() {
         let store = InMemoryStore::default();
         store.create(account("erik"), device("d1")).await.unwrap();
@@ -500,18 +737,18 @@ mod tests {
             store.devices("alice").await.unwrap()[0].protocol_device_id,
             1
         );
-        assert_eq!(store.add_device("alice", device("d2")).await, Ok(2));
-        assert_eq!(store.add_device("alice", device("d3")).await, Ok(3));
+        assert_eq!(store.add_device("alice", device("d2"), "key").await, Ok(2));
+        assert_eq!(store.add_device("alice", device("d3"), "key").await, Ok(3));
         // Revozieren gibt die Nummer NICHT frei: das nächste Gerät ist 4.
         store.revoke_device("alice", "d3").await.unwrap();
-        assert_eq!(store.add_device("alice", device("d4")).await, Ok(4));
+        assert_eq!(store.add_device("alice", device("d4"), "key").await, Ok(4));
     }
 
     #[tokio::test]
     async fn missing_account_yields_account_missing() {
         let store = InMemoryStore::default();
         assert_eq!(
-            store.add_device("niemand", device("d1")).await,
+            store.add_device("niemand", device("d1"), "key").await,
             Err(StoreError::AccountMissing)
         );
         assert!(store.devices("niemand").await.unwrap().is_empty());

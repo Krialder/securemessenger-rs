@@ -198,6 +198,83 @@ impl AccountStore for PgAccountStore {
         Ok(())
     }
 
+    async fn rotate_identity(
+        &self,
+        handle: &str,
+        expected_old_key: &str,
+        new_identity_key: &str,
+        device_credentials: &[(String, String, u64)],
+    ) -> Result<(), StoreError> {
+        let expected_old = decode_checked(expected_old_key, "Konto-Identitätsschlüssel")?;
+        let new_key = decode_checked(new_identity_key, "Konto-Identitätsschlüssel")?;
+        // Eine Transaktion mit Zeilensperre auf dem Konto: neuer Schlüssel,
+        // neue Credentials und neue Ablaufzeiten kommen zusammen an oder gar
+        // nicht (ADR-0010, kein halb rotiertes Konto). Die Sperre (FOR
+        // UPDATE) serialisiert gegen ein paralleles add_device desselben
+        // Kontos, damit Kontinuitäts- und Vollständigkeitsprüfung unter
+        // derselben Sperre stehen wie das Schreiben.
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let row = sqlx::query("SELECT id, identity_key FROM accounts WHERE handle = $1 FOR UPDATE")
+            .bind(handle)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(backend)?;
+        let Some(row) = row else {
+            return Err(StoreError::AccountMissing);
+        };
+        let account_id: Uuid = row.get("id");
+        let stored_key: Vec<u8> = row.get("identity_key");
+        // Kam eine parallele Rotation zuvor, ist der gespeicherte Schlüssel
+        // nicht mehr der, gegen den der Aufrufer Kontinuität und Credentials
+        // geprüft hat: abbrechen, statt gegen einen falschen Schlüssel zu
+        // zeichnen.
+        if stored_key != expected_old {
+            return Err(StoreError::ConcurrentUpdate);
+        }
+        // Die aktuelle nicht-revozierte Gerätemenge INNERHALB der Transaktion
+        // lesen: jedes Gerät muss ein neues Credential mitbekommen, sonst
+        // bliebe ein parallel hinzugekommenes Gerät nach der Rotation ohne
+        // gültiges Credential.
+        let provided: std::collections::HashSet<Uuid> = device_credentials
+            .iter()
+            .map(|(id, _, _)| parse_device_id(id))
+            .collect::<Result<_, _>>()?;
+        let device_rows =
+            sqlx::query("SELECT id FROM devices WHERE account_id = $1 AND revoked_at IS NULL")
+                .bind(account_id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(backend)?;
+        for device_row in &device_rows {
+            let id: Uuid = device_row.get("id");
+            if !provided.contains(&id) {
+                return Err(StoreError::ConcurrentUpdate);
+            }
+        }
+        sqlx::query("UPDATE accounts SET identity_key = $2 WHERE id = $1")
+            .bind(account_id)
+            .bind(&new_key)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        for (device_id, credential, not_after) in device_credentials {
+            let device_id = parse_device_id(device_id)?;
+            let credential = decode_checked(credential, "Credential")?;
+            sqlx::query(
+                "UPDATE devices SET credential_blob = $3, not_after = $4 \
+                 WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL",
+            )
+            .bind(device_id)
+            .bind(account_id)
+            .bind(&credential)
+            .bind(*not_after as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        }
+        tx.commit().await.map_err(backend)
+    }
+
     async fn schedule_deletion(&self, handle: &str, deletion_at: u64) -> Result<(), StoreError> {
         // Die Frist als Unix-Sekunden in TIMESTAMPTZ setzen (to_timestamp),
         // status auf deletion_pending. Reines SQL, keine Rust-Zeitarithmetik.
@@ -262,24 +339,41 @@ impl AccountStore for PgAccountStore {
         Ok(result.rows_affected())
     }
 
-    async fn add_device(&self, handle: &str, device: Device) -> Result<u16, StoreError> {
+    async fn add_device(
+        &self,
+        handle: &str,
+        device: Device,
+        expected_identity_key: &str,
+    ) -> Result<u16, StoreError> {
         let device_key = decode_checked(&device.public_key, "Geräteschlüssel")?;
         let credential = decode_checked(&device.credential, "Credential")?;
         let device_id = parse_device_id(&device.id)?;
+        let expected_key = decode_checked(expected_identity_key, "Konto-Identitätsschlüssel")?;
         // Transaktion mit Zeilensperre auf dem Konto: die Nummernvergabe
         // (max + 1) und das Einfügen dürfen sich mit einem parallelen
         // add_device desselben Kontos nicht überschneiden, sonst bekämen
-        // zwei Geräte dieselbe Nummer.
+        // zwei Geräte dieselbe Nummer. Dieselbe Sperre serialisiert gegen
+        // eine parallele Rotation (ADR-0010).
         let mut tx = self.pool.begin().await.map_err(backend)?;
-        let account_row = sqlx::query("SELECT id FROM accounts WHERE handle = $1 FOR UPDATE")
-            .bind(handle)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(backend)?;
+        let account_row =
+            sqlx::query("SELECT id, identity_key FROM accounts WHERE handle = $1 FOR UPDATE")
+                .bind(handle)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(backend)?;
         let Some(account_row) = account_row else {
             return Err(StoreError::AccountMissing);
         };
         let account_id: Uuid = account_row.get("id");
+        // Hat eine parallele Rotation den Wurzelschlüssel unter der
+        // Credential-Prüfung des Aufrufers abgelöst, prüfte das Credential
+        // gegen den alten Schlüssel und würde im rotierten Konto nicht mehr
+        // verifizieren: abbrechen (der Client setzt mit frischem Schlüssel
+        // neu an).
+        let stored_key: Vec<u8> = account_row.get("identity_key");
+        if stored_key != expected_key {
+            return Err(StoreError::ConcurrentUpdate);
+        }
         // Max über ALLE Geräte des Kontos, auch revozierte: ihre Nummern
         // bleiben gesperrt (revozieren gibt die Nummer nicht frei).
         let next_row = sqlx::query(

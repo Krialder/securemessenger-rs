@@ -28,13 +28,13 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use client_app::account::IdentityKeypair;
+use client_app::account::{build_device_credential, build_rotation_cert, IdentityKeypair};
 use client_app::delivery::{
     parse_ws_event, ws_auth_frame, DeliveryClient, GroupOutgoing, OutgoingEnvelope, WsEvent,
 };
 use client_app::directory::DirectoryClient;
 use client_app::grouptext::{self, GroupPayload, RosterDevice};
-use client_app::identity::DeviceEnrollment;
+use client_app::identity::{DeviceEnrollment, RotateDeviceCredential};
 use client_app::kt::KtClient;
 use client_app::prekeys::{
     bundle_from_directory, device_id_from_u32, new_uuid, publication_from_bundle, DirectoryPrekey,
@@ -645,6 +645,14 @@ struct Profile {
     /// weiteren Geräte freischalten).
     #[serde(default)]
     account_seed: String,
+    /// Seed eines noch nicht bestätigten neuen Wurzelschlüssels (Base64),
+    /// während einer laufenden Rotation (ADR-0010). VOR dem Serveraufruf
+    /// abgelegt, nach dem bestätigten Erfolg nach `account_seed` befördert
+    /// und geleert. Bricht der Aufruf zwischen Server-Commit und lokalem
+    /// Ablegen ab, hält der Browser hier den neuen Schlüssel und schließt die
+    /// Rotation beim nächsten Versuch ab, statt ausgesperrt zu sein.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pending_account_seed: String,
     device_id: String,
     /// Die vom Server vergebene libsignal-Gerätenummer (ProtocolAddress-Teil).
     /// Vorgabe 1 für Altprofile aus der Ein-Gerät-Zeit.
@@ -1094,6 +1102,7 @@ async fn onboard(
         &Profile {
             handle: handle.clone(),
             account_seed: BASE64.encode(account_key.to_seed()),
+            pending_account_seed: String::new(),
             device_id,
             // Das erste Gerät ist immer Nummer 1 (der Server bestätigt es).
             protocol_device_id: 1,
@@ -1213,6 +1222,7 @@ async fn link_start(storage: SharedStorage, handle: String) -> Result<LinkStarte
         &Profile {
             handle,
             account_seed: String::new(),
+            pending_account_seed: String::new(),
             device_id: device_id.clone(),
             protocol_device_id: 0,
         },
@@ -1300,6 +1310,7 @@ async fn link_finish(storage: SharedStorage, password: String) -> Result<Onboard
         &Profile {
             handle: profile.handle.clone(),
             account_seed: String::new(),
+            pending_account_seed: String::new(),
             device_id: profile.device_id.clone(),
             protocol_device_id,
         },
@@ -2763,6 +2774,103 @@ async fn approve_device(storage: &SharedStorage, token: &str, input: &str) -> Re
     // neue Gerät synchronisiert.
     let _ = storage.borrow_mut().remove("sync/own_devices");
     Ok(outcome.protocol_device_id)
+}
+
+/// Rotiert den Konto-Wurzelschlüssel (ADR-0010, `sm rotate-key`-Gegenstück
+/// im Web). Nur auf einem Erstgerät mit Wurzel-Seed. Signiert das
+/// Rotations-Zertifikat mit dem ALTEN Schlüssel, jedes Gerät mit dem NEUEN,
+/// reicht beides ein und legt erst nach dem Erfolg den neuen Seed ab.
+/// Liefert die Zahl der neu signierten Geräte.
+/// Rotiert den Konto-Wurzelschlüssel (ADR-0010), Browser-Fassung des
+/// CLI-Ablaufs. Absturzsicher: der neue Seed wird VOR dem Serveraufruf als
+/// `pending` in IndexedDB abgelegt und erst nach dem bestätigten Erfolg nach
+/// `account_seed` befördert; eine unterbrochene Rotation wird beim nächsten
+/// Versuch abgeschlossen (siehe rotate_key in der CLI). Jedes Gerät wird mit
+/// dem neuen Schlüssel neu signiert und sein Ablauf erneuert.
+async fn rotate_key_web(storage: &SharedStorage, token: &str) -> Result<usize, String> {
+    let mut profile = load_profile(storage).ok_or("Kein Profil in der Ablage")?;
+    if profile.account_seed.is_empty() {
+        return Err(
+            "Dieses Gerät hat keinen Konto-Wurzelschlüssel; Rotieren nur auf dem Erstgerät."
+                .to_string(),
+        );
+    }
+    let old_account = IdentityKeypair::from_seed(&decode_seed_web(&profile.account_seed)?);
+
+    // Liegt ein pending seed, eine frühere Rotation abschließen statt eine
+    // neue starten. Sonst ein frisches Wurzelpaar ziehen und VOR dem
+    // Serveraufruf ablegen, damit ein Absturz danach den Schlüssel nicht
+    // verliert.
+    let resuming = !profile.pending_account_seed.is_empty();
+    let new_account = if resuming {
+        IdentityKeypair::from_seed(&decode_seed_web(&profile.pending_account_seed)?)
+    } else {
+        let account = IdentityKeypair::generate();
+        profile.pending_account_seed = BASE64.encode(account.to_seed());
+        save_profile(storage, &profile)?;
+        account
+    };
+    let new_identity_key = new_account.public_b64();
+    let rotation_signature = build_rotation_cert(&old_account, &profile.handle, &new_identity_key);
+
+    let not_after = now_unix() + CREDENTIAL_TTL_SECONDS;
+    let client = IdentityClient::new(identity_url());
+    let devices = client.devices(token).await.map_err(|e| e.to_string())?;
+    let device_creds: Vec<RotateDeviceCredential> = devices
+        .iter()
+        .map(|device| RotateDeviceCredential {
+            id: device.id.clone(),
+            credential: build_device_credential(
+                &new_account,
+                &profile.handle,
+                &device.id,
+                &device.public_key,
+                not_after,
+            ),
+            not_after,
+        })
+        .collect();
+
+    match client
+        .rotate_identity(token, &new_identity_key, &rotation_signature, &device_creds)
+        .await
+    {
+        Ok(()) => {
+            promote_pending_seed_web(storage, &mut profile, &new_account)?;
+            Ok(device_creds.len())
+        }
+        // Wiederaufnahme: der Dienst hat den pending-Schlüssel schon
+        // übernommen (die Kontinuitätssignatur des alten passt nicht mehr).
+        // Ihn lokal übernehmen und so die Rotation abschließen.
+        Err(client_app::ClientError::Api { code, .. })
+            if resuming && code == "invalid_continuity" =>
+        {
+            promote_pending_seed_web(storage, &mut profile, &new_account)?;
+            Ok(device_creds.len())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Dekodiert einen Base64-Seed (32 Byte) eines Wurzelschlüssels.
+fn decode_seed_web(seed_b64: &str) -> Result<[u8; 32], String> {
+    BASE64
+        .decode(seed_b64)
+        .map_err(|e| format!("Konto-Seed unlesbar: {e}"))?
+        .try_into()
+        .map_err(|_| "Konto-Seed hat die falsche Länge".to_string())
+}
+
+/// Befördert den bestätigten neuen Wurzelschlüssel nach `account_seed` und
+/// leert `pending_account_seed`. Erst nach dem Servererfolg aufgerufen.
+fn promote_pending_seed_web(
+    storage: &SharedStorage,
+    profile: &mut Profile,
+    new_account: &IdentityKeypair,
+) -> Result<(), String> {
+    profile.account_seed = BASE64.encode(new_account.to_seed());
+    profile.pending_account_seed = String::new();
+    save_profile(storage, profile)
 }
 
 /// Startzustand der Oberfläche, Ergebnis der Ablage-Hydration.
@@ -4278,6 +4386,33 @@ fn App() -> impl IntoView {
         });
     };
 
+    // Wurzelschlüssel rotieren (ADR-0010): nur auf einem Erstgerät mit
+    // Wurzel-Seed. Kontakte sehen danach einen Schlüsselwechsel.
+    let on_rotate_key = {
+        let current_storage = current_storage.clone();
+        move |_| {
+            if busy.get_untracked() {
+                return;
+            }
+            let Some(storage) = current_storage() else {
+                set_status.set("Nicht angemeldet.".to_string());
+                return;
+            };
+            set_busy.set(true);
+            spawn_local(async move {
+                match rotate_key_web(&storage, &access_token.get_untracked()).await {
+                    Ok(count) => set_status.set(format!(
+                        "Wurzelschlüssel rotiert ({count} Gerät(e) neu signiert). Kontakte sehen \
+                         einen Schlüsselwechsel; die Sicherheitsnummer über einen zweiten Kanal \
+                         neu abgleichen."
+                    )),
+                    Err(error) => set_status.set(format!("Rotieren: {error}")),
+                }
+                set_busy.set(false);
+            });
+        }
+    };
+
     // Geteilter Nachlade-Ablauf der Gerätemenge, von mehreren Handlern
     // genutzt (Öffnen, Freischalten, Entfernen).
     let refresh_devices = {
@@ -4733,6 +4868,7 @@ fn App() -> impl IntoView {
                                     let on_sealed_default_toggle = on_sealed_default_toggle.clone();
                                     let on_push_history = on_push_history.clone();
                                     let on_change_password = on_change_password.clone();
+                                    let on_rotate_key = on_rotate_key.clone();
                                     move || {
                                         // Diese reaktive Closure läuft mehrfach
                                         // (settings_open, selected); die
@@ -4744,6 +4880,7 @@ fn App() -> impl IntoView {
                                             let on_revoke = on_revoke.clone();
                                             let on_unblock = on_unblock.clone();
                                             let on_change_password = on_change_password.clone();
+                                            let on_rotate_key = on_rotate_key.clone();
                                             return view! {
                                                 <div class="sm-settings" aria-label="Einstellungen">
                                                     <div class="sm-settings-head">
@@ -4989,12 +5126,21 @@ fn App() -> impl IntoView {
                                                             "Schlüssel im Speicher; der Browser bleibt laut sicherheit.md "
                                                             "das schwächste Glied (kein OS-Keystore, XSS-Fläche)."
                                                         </p>
-                                                        <div class="sm-set-row sm-set-plan">
+                                                        <div class="sm-set-row sm-set-stack">
                                                             <span class="sm-set-label">
-                                                                "Rotation des Konto-Wurzelschlüssels"
-                                                                <small>"Als dringlich vermerkte offene Frage; braucht ein Protokoll-Design, keinen Schalter vorher."</small>
+                                                                "Konto-Wurzelschlüssel rotieren"
+                                                                <small>"Ersetzt den Wurzelschlüssel und signiert alle Geräte-Credentials neu; der alte Schlüssel belegt die Kontinuität (ADR-0010). Nur auf einem Erstgerät mit hinterlegtem Wurzel-Seed möglich. Kontakte sehen danach einen Schlüsselwechsel und sollten die Sicherheitsnummer neu abgleichen."</small>
                                                             </span>
-                                                            <span class="sm-set-badge">"geplant"</span>
+                                                            <div class="sm-set-form">
+                                                                <button
+                                                                    type="button"
+                                                                    class="sm-secondary"
+                                                                    on:click=on_rotate_key
+                                                                    disabled=busy
+                                                                >
+                                                                    "Wurzelschlüssel rotieren"
+                                                                </button>
+                                                            </div>
                                                         </div>
                                                     </section>
 

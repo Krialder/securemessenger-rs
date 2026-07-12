@@ -89,6 +89,38 @@ pub fn verify_device_credential(
         .map_err(|_| CredentialError::BadSignature)
 }
 
+/// Die zu signierende Rotations-Botschaft (ADR-0010). Byte-gleich zur
+/// Client-Seite (client-app::account::rotation_message).
+pub fn rotation_message(handle: &str, new_identity_key_b64: &str) -> String {
+    format!("smrot.v1\n{handle}\n{new_identity_key_b64}")
+}
+
+/// Prüft das Rotations-Zertifikat gegen den ALTEN Konto-Wurzelschlüssel
+/// (ADR-0010): nur wer den alten Schlüssel hält, kann die Kontinuität
+/// belegen. Der neue Schlüssel muss zudem ein wohlgeformter Ed25519-Punkt
+/// sein (er verifiziert danach die neuen Geräte-Credentials).
+pub fn verify_rotation_cert(
+    old_identity_key_b64: &str,
+    handle: &str,
+    new_identity_key_b64: &str,
+    signature_b64: &str,
+) -> Result<(), CredentialError> {
+    // Der neue Schlüssel muss ein gültiger Ed25519-Punkt sein, sonst könnte
+    // ein Konto in einen Zustand rotieren, in dem keine Signatur mehr prüft.
+    decode_verifying_key(new_identity_key_b64)?;
+    let old_key = decode_verifying_key(old_identity_key_b64)?;
+    let signature_bytes: [u8; 64] = BASE64
+        .decode(signature_b64)
+        .map_err(|_| CredentialError::Malformed)?
+        .try_into()
+        .map_err(|_| CredentialError::Malformed)?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    let message = rotation_message(handle, new_identity_key_b64);
+    old_key
+        .verify_strict(message.as_bytes(), &signature)
+        .map_err(|_| CredentialError::BadSignature)
+}
+
 /// Dekodiert den Base64-Ed25519-Konto-Wurzelschlüssel; nur er verifiziert
 /// serverseitig Signaturen.
 fn decode_verifying_key(key_b64: &str) -> Result<VerifyingKey, CredentialError> {

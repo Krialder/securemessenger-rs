@@ -829,6 +829,130 @@ async fn group_invite_can_be_declined() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Wurzelschlüssel-Rotation (ADR-0010) über die echten Dienste: nach der
+/// Rotation gilt der neue Schlüssel, ein danach gekoppeltes Gerät wird mit
+/// ihm signiert und vom Dienst akzeptiert (der Beweis, dass der Server den
+/// neuen Schlüssel übernommen hat und die alte Kette nicht mehr braucht).
+#[tokio::test(flavor = "multi_thread")]
+async fn root_key_rotation_takes_effect() {
+    let urls = start_stack().await;
+    let dir = std::env::temp_dir().join(format!("sm-rot-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("Testverzeichnis");
+
+    let vera1 = CliUser::new(&dir, "vera1", &urls);
+    vera1.run(&["register", "vera", "veras-langes-passwort"]);
+    vera1.run(&["login", "veras-langes-passwort"]);
+    vera1.run(&["publish-keys"]);
+
+    // Rotieren: meldet, wie viele Geräte neu signiert wurden (hier eines).
+    let rotated = vera1.run(&["rotate-key"]);
+    assert!(
+        rotated.contains("Wurzelschlüssel rotiert") && rotated.contains("1 Gerät"),
+        "die Rotation muss das eine Gerät neu signieren, stdout war: {rotated}"
+    );
+
+    // Ein Zweitgerät koppeln: das Erstgerät signiert das Credential jetzt mit
+    // dem NEUEN Wurzelschlüssel; der Dienst akzeptiert es nur, wenn er den
+    // neuen Schlüssel übernommen hat.
+    let vera2 = CliUser::new(&dir, "vera2", &urls);
+    let link_out = vera2.run(&["link", "vera", "veras-langes-passwort"]);
+    let payload = link_out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("sm approve "))
+        .expect("Kopplungs-Antrag")
+        .to_string();
+    let approved = vera1.run(&["approve", &payload]);
+    assert!(
+        approved.contains("Nummer 2"),
+        "das Freischalten mit dem neuen Schlüssel muss klappen, stdout war: {approved}"
+    );
+    vera2.run(&["link-finish", "vera", "veras-langes-passwort"]);
+    let devices = vera1.run(&["devices"]);
+    assert!(
+        devices.contains("Nummer 1") && devices.contains("Nummer 2"),
+        "beide Geräte müssen nach der Rotation in der Menge stehen, stdout war: {devices}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Wiederaufnahme einer unterbrochenen Rotation (ADR-0010, Absturzsicherheit,
+/// Finding aus der Selbstprüfung): Bricht der Client zwischen dem
+/// Server-Commit und dem lokalen Ablegen ab, hält er den neuen Schlüssel als
+/// `pending`. Der Dienst steht dann schon auf dem neuen Schlüssel; die
+/// Kontinuitätssignatur des alten passt nicht mehr (invalid_continuity). Der
+/// nächste `rotate-key` erkennt das, übernimmt den pending-Schlüssel lokal
+/// und das Konto ist NICHT ausgesperrt. Ohne diese Wiederaufnahme wäre der
+/// Wurzelschlüssel nach dem einen ungünstigen Abbruch dauerhaft verloren.
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupted_rotation_resumes_without_lockout() {
+    let urls = start_stack().await;
+    let dir = std::env::temp_dir().join(format!("sm-rotresume-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("Testverzeichnis");
+
+    let vera1 = CliUser::new(&dir, "vera1", &urls);
+    vera1.run(&["register", "vera", "veras-langes-passwort"]);
+    vera1.run(&["login", "veras-langes-passwort"]);
+    vera1.run(&["publish-keys"]);
+
+    let read_profile = || -> serde_json::Value {
+        let text = std::fs::read_to_string(&vera1.profile).expect("Profil lesbar");
+        serde_json::from_str(&text).expect("Profil ist JSON")
+    };
+
+    // Den alten Wurzel-Seed festhalten, dann real rotieren: der Dienst steht
+    // danach auf dem neuen Schlüssel.
+    let k0 = read_profile()["account_seed"].as_str().unwrap().to_string();
+    vera1.run(&["rotate-key"]);
+    let k1 = read_profile()["account_seed"].as_str().unwrap().to_string();
+    assert_ne!(k0, k1, "die Rotation muss den Wurzelschlüssel wechseln");
+
+    // Absturz nach dem Server-Commit nachstellen: der Client denkt noch, der
+    // ALTE Schlüssel sei gültig (account_seed = k0), hält aber den neuen als
+    // pending (k1). Der Dienst steht bereits auf k1.
+    let mut profile = read_profile();
+    profile["account_seed"] = serde_json::Value::String(k0.clone());
+    profile["pending_account_seed"] = serde_json::Value::String(k1.clone());
+    std::fs::write(&vera1.profile, serde_json::to_string(&profile).unwrap())
+        .expect("Profil schreibbar");
+
+    // Wiederaufnahme: erkennt am invalid_continuity, dass der Dienst den neuen
+    // Schlüssel schon hält, und übernimmt ihn lokal.
+    let resumed = vera1.run(&["rotate-key"]);
+    assert!(
+        resumed.contains("Frühere Rotation abgeschlossen"),
+        "die Wiederaufnahme muss den pending-Schlüssel übernehmen, stdout war: {resumed}"
+    );
+    let after = read_profile();
+    assert_eq!(after["account_seed"].as_str().unwrap(), k1);
+    assert!(
+        after
+            .get("pending_account_seed")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .is_empty(),
+        "der pending-Seed muss nach dem Abschluss geleert sein"
+    );
+
+    // Beweis, dass das Konto nicht ausgesperrt ist: ein Zweitgerät koppeln;
+    // das Erstgerät signiert mit dem übernommenen Schlüssel, der Dienst (auf
+    // demselben Schlüssel) akzeptiert das Credential.
+    let vera2 = CliUser::new(&dir, "vera2", &urls);
+    let link_out = vera2.run(&["link", "vera", "veras-langes-passwort"]);
+    let payload = link_out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("sm approve "))
+        .expect("Kopplungs-Antrag")
+        .to_string();
+    let approved = vera1.run(&["approve", &payload]);
+    assert!(
+        approved.contains("Nummer 2"),
+        "nach der Wiederaufnahme muss das Freischalten klappen, stdout war: {approved}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Multi-Device-Gruppen: ein Konto mit zwei gekoppelten Geräten ist mit
 /// BEIDEN in der Gruppe (jedes ein eigenes MLS-Leaf), und eine
 /// Gruppennachricht erreicht auch das eigene Zweitgerät des Absenders. Das

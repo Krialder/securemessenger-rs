@@ -294,6 +294,33 @@ impl IdentityClient {
         parse_json(response).await
     }
 
+    /// `POST /accounts/rotate-identity`: rotiert den Konto-Wurzelschlüssel
+    /// (ADR-0010). Der neue öffentliche Schlüssel, das vom ALTEN Schlüssel
+    /// signierte Rotations-Zertifikat und je aktuellem Gerät ein mit dem
+    /// NEUEN Schlüssel neu signiertes Credential. Bearer plus die
+    /// Kontinuitätssignatur als eigentliche Autorisierung.
+    pub async fn rotate_identity(
+        &self,
+        access_token: &str,
+        new_identity_key: &str,
+        rotation_signature: &str,
+        devices: &[RotateDeviceCredential],
+    ) -> Result<(), ClientError> {
+        let response = self
+            .http
+            .post(self.url("/accounts/rotate-identity"))
+            .bearer_auth(access_token)
+            .json(&RotateIdentityBody {
+                new_identity_key,
+                rotation_signature,
+                devices,
+            })
+            .send()
+            .await
+            .map_err(transport)?;
+        expect_success(response).await
+    }
+
     /// `POST /devices`: schaltet ein weiteres Gerät fürs eigene Konto frei.
     /// Der Aufrufer ist ein bereits angemeldetes Gerät (Bearer); das
     /// Credential des neuen Geräts signiert der Konto-Wurzelschlüssel
@@ -494,6 +521,26 @@ impl IdentityClient {
 #[derive(Serialize)]
 struct DeleteAccountBody<'a> {
     password: &'a str,
+}
+
+/// Ein neu signiertes Geräte-Credential für die Rotation (ADR-0010):
+/// Geräte-ID, das mit dem NEUEN Wurzelschlüssel signierte Credential und der
+/// dabei erneuerte Ablauf. `not_after` gehört mit in die Struktur, weil die
+/// Signatur genau über diesen Wert geht und der Dienst gegen ihn prüft und
+/// ihn speichert (die Rotation erneuert den Ablauf, sonst blockiert ein
+/// abgelaufenes Gerät die Rotation dauerhaft).
+#[derive(Serialize, Clone)]
+pub struct RotateDeviceCredential {
+    pub id: String,
+    pub credential: String,
+    pub not_after: u64,
+}
+
+#[derive(Serialize)]
+struct RotateIdentityBody<'a> {
+    new_identity_key: &'a str,
+    rotation_signature: &'a str,
+    devices: &'a [RotateDeviceCredential],
 }
 
 #[derive(Deserialize)]

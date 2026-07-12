@@ -90,6 +90,27 @@ pub fn build_device_credential(
     account.sign_b64(message.as_bytes())
 }
 
+/// Die zu signierende Rotations-Botschaft (ADR-0010). Muss Byte für Byte
+/// zur Server-Seite passen (services/identity/src/credential.rs
+/// `rotation_message`); Handle und Base64 tragen kein Newline, das Format
+/// bleibt eindeutig.
+pub fn rotation_message(handle: &str, new_identity_key_b64: &str) -> String {
+    format!("smrot.v1\n{handle}\n{new_identity_key_b64}")
+}
+
+/// Baut das Rotations-Zertifikat (ADR-0010): der ALTE Wurzelschlüssel
+/// signiert die Bindung des NEUEN öffentlichen Wurzelschlüssels an das
+/// Konto. Die Signatur ist der Kontinuitätsbeleg, den der Dienst gegen den
+/// gespeicherten (alten) Schlüssel prüft.
+pub fn build_rotation_cert(
+    old_account: &IdentityKeypair,
+    handle: &str,
+    new_identity_key_b64: &str,
+) -> String {
+    let message = rotation_message(handle, new_identity_key_b64);
+    old_account.sign_b64(message.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +164,33 @@ mod tests {
         let message = credential_message("alice", "dev-2", &device_pub, 2_000_000_000);
 
         assert!(verifying
+            .verify_strict(message.as_bytes(), &signature)
+            .is_err());
+    }
+
+    /// Das Rotations-Zertifikat (ADR-0010) verifiziert gegen den ALTEN
+    /// Wurzelschlüssel, so wie es der Dienst prüft.
+    #[test]
+    fn rotation_cert_verifies_against_old_key() {
+        let old = IdentityKeypair::generate();
+        let new = IdentityKeypair::generate();
+        let new_pub = new.public_b64();
+        let cert = build_rotation_cert(&old, "alice", &new_pub);
+
+        let old_pub_bytes: [u8; 32] = BASE64.decode(old.public_b64()).unwrap().try_into().unwrap();
+        let verifying = VerifyingKey::from_bytes(&old_pub_bytes).unwrap();
+        let sig_bytes: [u8; 64] = BASE64.decode(&cert).unwrap().try_into().unwrap();
+        let signature = Signature::from_bytes(&sig_bytes);
+        let message = rotation_message("alice", &new_pub);
+        assert!(verifying
+            .verify_strict(message.as_bytes(), &signature)
+            .is_ok());
+
+        // Der NEUE Schlüssel darf das Zertifikat NICHT bestätigen (nur die
+        // Kontinuität vom alten Schlüssel zählt).
+        let new_pub_bytes: [u8; 32] = BASE64.decode(&new_pub).unwrap().try_into().unwrap();
+        let new_verifying = VerifyingKey::from_bytes(&new_pub_bytes).unwrap();
+        assert!(new_verifying
             .verify_strict(message.as_bytes(), &signature)
             .is_err());
     }

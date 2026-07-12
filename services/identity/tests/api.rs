@@ -7,8 +7,12 @@ mod helpers;
 
 use axum::http::StatusCode;
 use axum::Router;
-use helpers::{key, login_body, register_body, send, signed_device};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+use ed25519_dalek::Signer;
+use helpers::{b64_public, key, login_body, register_body, send, signed_device, FAR_FUTURE};
 use identity::api::{app, AppState};
+use identity::credential::{credential_message, rotation_message};
 use serde_json::json;
 
 // Geräte-IDs sind client-erzeugte UUIDs (kanonische Form); Tests nehmen
@@ -1016,4 +1020,108 @@ async fn display_name_changes_and_shows_in_login() {
     )
     .await;
     assert_eq!(body["display_name"], "Rita B.");
+}
+
+#[tokio::test]
+async fn identity_rotation_replaces_key_and_rejects_old_signatures() {
+    let app = test_app();
+    // Das erste Gerät nutzt den Geräteschlüssel key(42) (register_body).
+    let dev_pk = b64_public(&key(42));
+    let r1 = key(13); // alter Wurzelschlüssel
+
+    let register = register_body(&r1, "rob", "robs-langes-passwort", DEV_FIRST);
+    let (status, _) = send(&app, "POST", "/accounts", Some(register), None).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, body) = send(
+        &app,
+        "POST",
+        "/sessions",
+        Some(login_body("rob", "robs-langes-passwort", DEV_FIRST)),
+        None,
+    )
+    .await;
+    let access = body["access_token"].as_str().unwrap().to_string();
+
+    // Eine falsch signierte Rotation (nicht vom alten Schlüssel) wird
+    // abgewiesen, bevor irgendetwas geändert wird.
+    let r2 = key(99);
+    let new_key = b64_public(&r2);
+    let wrong = key(200);
+    let bad_sig = BASE64.encode(
+        wrong
+            .sign(rotation_message("rob", &new_key).as_bytes())
+            .to_bytes(),
+    );
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/accounts/rotate-identity",
+        Some(json!({ "new_identity_key": new_key, "rotation_signature": bad_sig, "devices": [] })),
+        Some(&access),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Eigener Code, damit ein wiederaufnehmender Client den Kontinuitäts-
+    // fehler vom Geräte-Credential-Fehler unterscheiden kann (ADR-0010).
+    assert_eq!(body["code"], "invalid_continuity");
+
+    // Eine unvollständige Rotation (Gerät fehlt) wird abgewiesen.
+    let good_sig = BASE64.encode(
+        r1.sign(rotation_message("rob", &new_key).as_bytes())
+            .to_bytes(),
+    );
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/accounts/rotate-identity",
+        Some(json!({ "new_identity_key": new_key, "rotation_signature": good_sig, "devices": [] })),
+        Some(&access),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "incomplete_rotation");
+
+    // Korrekte Rotation: gültige Kontinuitätssignatur, jedes Gerät mit dem
+    // NEUEN Schlüssel neu signiert. Der Ablauf wird zugleich erneuert (ein
+    // frischer, vom bisherigen abweichender not_after); der Dienst zeichnet
+    // gegen genau diesen Wert und speichert ihn (ADR-0010, Finding 2).
+    let rotated_not_after = FAR_FUTURE - 1000;
+    let new_cred = BASE64.encode(
+        r2.sign(credential_message("rob", DEV_FIRST, &dev_pk, rotated_not_after).as_bytes())
+            .to_bytes(),
+    );
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/accounts/rotate-identity",
+        Some(json!({
+            "new_identity_key": new_key,
+            "rotation_signature": good_sig,
+            "devices": [{ "id": DEV_FIRST, "credential": new_cred, "not_after": rotated_not_after }],
+        })),
+        Some(&access),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Der erneuerte Ablauf ist gespeichert: die Geräteliste zeigt den neuen
+    // not_after, nicht mehr den ursprünglichen aus der Registrierung.
+    let (_, devices) = send(&app, "GET", "/devices", None, Some(&access)).await;
+    let first = devices
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == DEV_FIRST)
+        .unwrap();
+    assert_eq!(first["not_after"].as_u64().unwrap(), rotated_not_after);
+
+    // Der neue Schlüssel ist jetzt aktiv: ein mit R2 signiertes Gerät wird
+    // angenommen, ein mit dem ALTEN R1 signiertes nicht mehr.
+    let dev_new = signed_device(&r2, "rob", DEV_SECOND, 43);
+    let (status, _) = send(&app, "POST", "/devices", Some(dev_new), Some(&access)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let dev_old = signed_device(&r1, "rob", DEV_MISC, 44);
+    let (status, body) = send(&app, "POST", "/devices", Some(dev_old), Some(&access)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_credential");
 }

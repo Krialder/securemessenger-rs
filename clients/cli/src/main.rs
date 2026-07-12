@@ -22,13 +22,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use client_app::account::IdentityKeypair;
+use client_app::account::{build_device_credential, build_rotation_cert, IdentityKeypair};
 use client_app::delivery::{
     parse_ws_event, ws_auth_frame, DeliveryClient, GroupOutgoing, OutgoingEnvelope, WsEvent,
 };
 use client_app::directory::DirectoryClient;
 use client_app::grouptext::{self, GroupPayload, RosterDevice};
-use client_app::identity::DeviceEnrollment;
+use client_app::identity::{DeviceEnrollment, RotateDeviceCredential};
 use client_app::prekeys::{
     bundle_from_directory, device_id_from_u32, new_uuid, publication_from_bundle, DirectoryPrekey,
 };
@@ -92,6 +92,15 @@ struct Profile {
     /// Geräte freischalten und keine KT-Selbstprüfung fahren.
     #[serde(default)]
     account_seed: String,
+    /// Seed eines noch nicht bestätigten neuen Wurzelschlüssels (Base64),
+    /// während einer laufenden Rotation (ADR-0010). Er wird VOR dem
+    /// Serveraufruf abgelegt und nach dem bestätigten Erfolg nach
+    /// `account_seed` befördert und geleert. Bricht der Aufruf zwischen
+    /// Server-Commit und lokalem Ablegen ab, hält das Gerät hier den neuen
+    /// Schlüssel und kann die Rotation beim nächsten Lauf abschließen; ohne
+    /// diese Ablage wäre der neue Schlüssel verloren und das Konto ausgesperrt.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pending_account_seed: String,
     /// Server-seitige Geräte-ID (UUID).
     device_id: String,
     /// Die vom Server vergebene libsignal-Gerätenummer (ProtocolAddress-Teil).
@@ -153,6 +162,7 @@ async fn run() -> Result<(), String> {
         "delete-account" => delete_account(&args[1..]).await,
         "undelete" => undelete().await,
         "rename" => rename(&args[1..]).await,
+        "rotate-key" => rotate_key().await,
         "publish-keys" => publish_keys().await,
         "group-create" => group_create(&args[1..]).await,
         "groups" => groups_list(),
@@ -223,6 +233,7 @@ async fn register(args: &[String]) -> Result<(), String> {
     save_profile(&Profile {
         handle: account.handle.clone(),
         account_seed: BASE64.encode(account_key.to_seed()),
+        pending_account_seed: String::new(),
         device_id: account.device_id.clone(),
         // Das erste Gerät ist Nummer 1 (der Server bestätigt es).
         protocol_device_id: account.protocol_device_id,
@@ -1174,6 +1185,7 @@ async fn link(args: &[String]) -> Result<(), String> {
         handle: handle.clone(),
         // Kein Konto-Wurzelschlüssel auf dem Zweitgerät.
         account_seed: String::new(),
+        pending_account_seed: String::new(),
         device_id: device_id.clone(),
         // 0 = noch nicht freigeschaltet; link-finish setzt die echte Nummer.
         protocol_device_id: 0,
@@ -1409,6 +1421,117 @@ async fn rename(args: &[String]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     println!("Anzeigename geändert: {stored}");
     Ok(())
+}
+
+/// `sm rotate-key`: rotiert den Konto-Wurzelschlüssel (ADR-0010). Nur auf
+/// dem Erstgerät (das den Wurzel-Seed hält). Zieht ein neues Wurzelpaar,
+/// signiert mit dem ALTEN Schlüssel das Rotations-Zertifikat (Kontinuität),
+/// signiert jedes aktuelle Gerät mit dem NEUEN Schlüssel neu (und erneuert
+/// dabei dessen Ablauf) und reicht beides atomar ein. Der Dienst schiebt
+/// danach ein frisches KT-Commitment, in dem die Rotation sichtbar wird.
+///
+/// Absturzsicher: der neue Seed wird VOR dem Serveraufruf als `pending`
+/// abgelegt und erst nach dem bestätigten Erfolg nach `account_seed`
+/// befördert. Bricht der Lauf zwischen Server-Commit und lokalem Ablegen ab,
+/// hält das Gerät den neuen Schlüssel weiter und schließt die Rotation beim
+/// nächsten Aufruf ab, statt ausgesperrt zu sein.
+async fn rotate_key() -> Result<(), String> {
+    let mut profile = load_profile()?;
+    let token = access_token(&profile)?;
+    if profile.account_seed.is_empty() {
+        return Err(
+            "Dieses Gerät hat keinen Konto-Wurzelschlüssel (Zweitgerät). Rotieren nur auf dem \
+             Erstgerät."
+                .to_string(),
+        );
+    }
+    let old_account = IdentityKeypair::from_seed(&decode_seed(&profile.account_seed)?);
+
+    // Liegt ein pending seed, ist eine frühere Rotation unterbrochen worden:
+    // dann diese abschließen (Zielschlüssel ist der pending), keine neue
+    // starten. Sonst ein frisches Wurzelpaar ziehen und VOR dem Serveraufruf
+    // ablegen, damit ein Absturz danach den neuen Schlüssel nicht verliert.
+    let resuming = !profile.pending_account_seed.is_empty();
+    let new_account = if resuming {
+        IdentityKeypair::from_seed(&decode_seed(&profile.pending_account_seed)?)
+    } else {
+        let account = IdentityKeypair::generate();
+        profile.pending_account_seed = BASE64.encode(account.to_seed());
+        save_profile(&profile)?;
+        account
+    };
+    let new_identity_key = new_account.public_b64();
+    let rotation_signature = build_rotation_cert(&old_account, &profile.handle, &new_identity_key);
+
+    // Jedes aktuelle, nicht revozierte Gerät mit dem NEUEN Schlüssel neu
+    // signieren und dabei den Ablauf erneuern (der Dienst prüft gegen genau
+    // diese Gerätemenge und speichert den frischen not_after).
+    let not_after = now_unix() + CREDENTIAL_TTL_SECONDS;
+    let client = IdentityClient::new(identity_url());
+    let devices = client.devices(&token).await.map_err(|e| e.to_string())?;
+    let device_creds: Vec<RotateDeviceCredential> = devices
+        .iter()
+        .map(|device| RotateDeviceCredential {
+            id: device.id.clone(),
+            credential: build_device_credential(
+                &new_account,
+                &profile.handle,
+                &device.id,
+                &device.public_key,
+                not_after,
+            ),
+            not_after,
+        })
+        .collect();
+
+    match client
+        .rotate_identity(&token, &new_identity_key, &rotation_signature, &device_creds)
+        .await
+    {
+        Ok(()) => {
+            promote_pending_seed(&mut profile, &new_account)?;
+            println!(
+                "Wurzelschlüssel rotiert ({} Gerät(e) neu signiert). Kontakte sehen einen \
+                 Schlüsselwechsel; die Sicherheitsnummer über einen zweiten Kanal neu abgleichen.",
+                device_creds.len()
+            );
+            Ok(())
+        }
+        // Wiederaufnahme: der Dienst hat den pending-Schlüssel bei einem
+        // früheren, nur lokal nicht bestätigten Lauf schon übernommen. Die
+        // Kontinuitätssignatur des ALTEN Schlüssels passt deshalb nicht mehr
+        // (invalid_continuity). Da der einzige andere Schlüssel, den dieses
+        // Gerät je erzeugte, der pending ist, muss der Dienst auf ihm stehen:
+        // ihn lokal übernehmen und die Rotation so abschließen.
+        Err(client_app::ClientError::Api { code, .. })
+            if resuming && code == "invalid_continuity" =>
+        {
+            promote_pending_seed(&mut profile, &new_account)?;
+            println!(
+                "Frühere Rotation abgeschlossen: der Dienst hielt den neuen Wurzelschlüssel \
+                 bereits, das Gerät hat ihn jetzt übernommen."
+            );
+            Ok(())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Dekodiert einen Base64-Seed (32 Byte) eines Wurzelschlüssels.
+fn decode_seed(seed_b64: &str) -> Result<[u8; 32], String> {
+    BASE64
+        .decode(seed_b64)
+        .map_err(|e| format!("Konto-Seed unlesbar: {e}"))?
+        .try_into()
+        .map_err(|_| "Konto-Seed hat die falsche Länge".to_string())
+}
+
+/// Befördert den bestätigten neuen Wurzelschlüssel nach `account_seed` und
+/// leert `pending_account_seed`. Erst nach dem Servererfolg aufgerufen.
+fn promote_pending_seed(profile: &mut Profile, new_account: &IdentityKeypair) -> Result<(), String> {
+    profile.account_seed = BASE64.encode(new_account.to_seed());
+    profile.pending_account_seed = String::new();
+    save_profile(profile)
 }
 
 /// Ein Eintrag der lokalen Gruppenliste: die Zustell-ID plus die
@@ -2308,6 +2431,7 @@ fn print_usage() {
          \x20 delete-account <passwort>     Konto-Loeschung vormerken (Widerrufsfrist)\n\
          \x20 undelete                      vorgemerkte Loeschung widerrufen\n\
          \x20 rename <anzeigename>          Anzeigename aendern (Handle bleibt)\n\
+         \x20 rotate-key                    Konto-Wurzelschluessel rotieren (nur Erstgeraet)\n\
          \x20 publish-keys                   Prekey-Satz + MLS-KeyPackages veroeffentlichen\n\
          \x20 group-create <mitglied>...     MLS-Gruppe mit sich + den Handles gruenden\n\
          \x20 groups                         lokale Gruppenliste (ID + Mitglieder)\n\

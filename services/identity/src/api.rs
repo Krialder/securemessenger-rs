@@ -168,6 +168,7 @@ pub fn app(state: AppState) -> Router {
                 .patch(change_display_name),
         )
         .route("/accounts/undelete", post(undelete_account))
+        .route("/accounts/rotate-identity", post(rotate_identity))
         .route("/pow", get(pow_info))
         .route("/sessions", post(login).delete(logout))
         .route("/sessions/refresh", post(refresh))
@@ -449,6 +450,27 @@ struct DeleteAccountRequest {
 #[derive(Deserialize)]
 struct DisplayNameRequest {
     display_name: String,
+}
+
+/// Rotation des Konto-Wurzelschlüssels (ADR-0010). Der neue öffentliche
+/// Wurzelschlüssel, das vom ALTEN Schlüssel signierte Rotations-Zertifikat
+/// und je aktuellem Gerät ein mit dem NEUEN Schlüssel signiertes Credential.
+#[derive(Deserialize)]
+struct RotateIdentityRequest {
+    new_identity_key: String,
+    rotation_signature: String,
+    devices: Vec<RotateDeviceCredential>,
+}
+
+#[derive(Deserialize)]
+struct RotateDeviceCredential {
+    id: String,
+    credential: String,
+    /// Frischer Ablauf des neu signierten Credentials, Unix-Sekunden
+    /// (ADR-0010). Die Rotation ist zugleich die Erneuerung: ein sonst
+    /// abgelaufenes, aber nicht revoziertes Gerät würde die Rotation sonst
+    /// dauerhaft blockieren.
+    not_after: u64,
 }
 
 /// Antwort auf die Änderung: der gespeicherte (getrimmte) Name, damit der
@@ -1187,6 +1209,124 @@ async fn change_display_name(
     }
 }
 
+/// `POST /accounts/rotate-identity`: rotiert den Konto-Wurzelschlüssel
+/// (ADR-0010). Bearer-authentifiziert; die eigentliche Autorisierung ist
+/// die Kontinuitätssignatur des ALTEN Wurzelschlüssels über den neuen.
+/// Alle aktuellen (nicht revozierten) Geräte müssen mit einem neu
+/// signierten Credential kommen, sonst zeigte die Kette nach der Rotation
+/// nicht mehr auf sie. Nach dem atomaren Ersetzen geht ein frisches
+/// KT-Commitment (der auditierbare Vermerk der Rotation).
+async fn rotate_identity(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<RotateIdentityRequest>,
+) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return invalid_token(),
+        Err(error) => return session_failure(error),
+    };
+    let account = match st.store.get(&who.handle).await {
+        Ok(Some(account)) => account,
+        Ok(None) => {
+            tracing::error!(handle = %who.handle, "Session ohne zugehöriges Konto");
+            return internal();
+        }
+        Err(error) => return store_failure(error),
+    };
+    // Kontinuität: das Zertifikat muss der ALTE (gespeicherte) Schlüssel
+    // signiert haben, sonst ist die Rotation nicht autorisiert. Eigener
+    // Fehlercode `invalid_continuity` (getrennt vom Geräte-Credential-
+    // Fehler): ein Client, der eine unterbrochene Rotation wiederaufnimmt,
+    // liest daran ab, dass der Dienst den neuen Schlüssel bereits übernommen
+    // hat, und übernimmt ihn lokal (ADR-0010, Wiederaufnahme).
+    if credential::verify_rotation_cert(
+        &account.identity_key,
+        &who.handle,
+        &req.new_identity_key,
+        &req.rotation_signature,
+    )
+    .is_err()
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_continuity",
+            "Kontinuitätssignatur passt nicht zum aktuellen Wurzelschlüssel",
+        );
+    }
+    // Die aktuellen, gültigen Geräte samt ihrer opaken Schlüssel laden:
+    // gegen sie prüft der NEUE Schlüssel die neuen Credentials, und ihre
+    // Menge muss vollständig abgedeckt sein. Der Ablauf (`not_after`) kommt
+    // jetzt aus der Anfrage: die Rotation erneuert das Credential, statt den
+    // alten (womöglich abgelaufenen) Ablauf beizubehalten.
+    let current: Vec<Device> = match st.store.devices(&who.handle).await {
+        Ok(devices) => devices.into_iter().filter(|d| !d.revoked).collect(),
+        Err(error) => return store_failure(error),
+    };
+    let provided: std::collections::HashMap<&str, &RotateDeviceCredential> = req
+        .devices
+        .iter()
+        .map(|d| (d.id.as_str(), d))
+        .collect();
+    let now = now_unix();
+    for device in &current {
+        let Some(entry) = provided.get(device.id.as_str()) else {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "incomplete_rotation",
+                "Für jedes aktuelle Gerät muss ein neu signiertes Credential mitkommen",
+            );
+        };
+        if let Err(error) = credential::verify_device_credential(
+            &req.new_identity_key,
+            &who.handle,
+            &device.id,
+            &device.public_key,
+            entry.not_after,
+            &entry.credential,
+            now,
+        ) {
+            return credential_error_response(error);
+        }
+    }
+    let device_credentials: Vec<(String, String, u64)> = current
+        .iter()
+        .map(|d| {
+            let entry = provided[d.id.as_str()];
+            (d.id.clone(), entry.credential.clone(), entry.not_after)
+        })
+        .collect();
+    match st
+        .store
+        .rotate_identity(
+            &who.handle,
+            &account.identity_key,
+            &req.new_identity_key,
+            &device_credentials,
+        )
+        .await
+    {
+        Ok(()) => {
+            notify_kt(&st, &who.handle);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(StoreError::ConcurrentUpdate) => concurrent_update_response(),
+        Err(error) => store_failure(error),
+    }
+}
+
+/// 409 für einen parallelen Schreibkonflikt auf dem Konto (ADR-0010): eine
+/// überlappende Rotation oder Geräte-Freischaltung hat den Zustand unter der
+/// Prüfung verändert. Der Client holt frischen Zustand und setzt neu an; so
+/// entsteht kein halb rotiertes Konto.
+fn concurrent_update_response() -> Response {
+    api_error(
+        StatusCode::CONFLICT,
+        "concurrent_update",
+        "Konto wurde parallel geändert; mit frischem Zustand erneut versuchen",
+    )
+}
+
 /// `POST /accounts/undelete`: widerruft eine vorgemerkte Löschung innerhalb
 /// der Frist (Bearer, kein Passwort nötig: wer angemeldet ist, darf die
 /// eigene Löschung stoppen). Idempotent.
@@ -1323,7 +1463,7 @@ async fn add_device(
     let device_id = req.id.clone();
     match st
         .store
-        .add_device(&who.handle, device_from_request(req))
+        .add_device(&who.handle, device_from_request(req), &account.identity_key)
         .await
     {
         Ok(protocol_device_id) => {
@@ -1338,6 +1478,7 @@ async fn add_device(
             )
                 .into_response()
         }
+        Err(StoreError::ConcurrentUpdate) => concurrent_update_response(),
         Err(StoreError::DeviceIdTaken) => api_error(
             StatusCode::CONFLICT,
             "device_id_taken",

@@ -105,7 +105,7 @@ async fn deletion_schedule_cancel_and_purge() {
     let handle = unique_handle("pg-loeschen");
     let first = device(30);
     store.create(account(&handle), first.clone()).await.unwrap();
-    store.add_device(&handle, device(31)).await.unwrap();
+    store.add_device(&handle, device(31), &b64(1)).await.unwrap();
 
     // Vormerken: die Frist kommt als Unix-Sekunden zurück (TIMESTAMPTZ ->
     // Epoche), das Konto bleibt.
@@ -175,14 +175,14 @@ async fn device_lifecycle() {
 
     let second = device(21);
     // Server vergibt die Protokollnummer: erstes Gerät 1, zweites 2.
-    assert_eq!(store.add_device(&handle, second.clone()).await, Ok(2));
+    assert_eq!(store.add_device(&handle, second.clone(), &b64(1)).await, Ok(2));
     let after_add = store.devices(&handle).await.unwrap();
     assert_eq!(after_add[0].protocol_device_id, 1);
     assert_eq!(after_add[1].protocol_device_id, 2);
 
     // Unbekanntes Konto ist ein eigener Fehler, kein stiller Erfolg.
     let err = store
-        .add_device("pg-gibt-es-nicht", device(22))
+        .add_device("pg-gibt-es-nicht", device(22), &b64(1))
         .await
         .unwrap_err();
     assert_eq!(err, StoreError::AccountMissing);
@@ -206,11 +206,103 @@ async fn device_lifecycle() {
     // Replay-Schutz: die ID bleibt auch nach Revocation vergeben.
     let mut replay = device(23);
     replay.id = second.id.clone();
-    let err = store.add_device(&handle, replay).await.unwrap_err();
+    let err = store.add_device(&handle, replay, &b64(1)).await.unwrap_err();
     assert_eq!(err, StoreError::DeviceIdTaken);
 
     // Keine UUID: kann nicht existieren, aber kein Fehler.
     assert!(store.get_device(&handle, "laptop").await.unwrap().is_none());
+}
+
+/// Rotation gegen echtes PostgreSQL (ADR-0010): der PG-Pfad war ohne
+/// gesetzte TEST_DATABASE_URL nie ausgeführt, und die ursprüngliche
+/// UPDATE-Klausel verwies auf eine nicht existierende Spalte `revoked`. Der
+/// Test deckt Erfolg, Ablauf-Erneuerung und die beiden Konfliktfälle ab.
+#[tokio::test]
+async fn rotate_identity_over_postgres() {
+    let Some(pool) = pool().await else { return };
+    let store = PgAccountStore::new(pool);
+    let handle = unique_handle("pg-rotate");
+
+    let first = device(50);
+    store.create(account(&handle), first.clone()).await.unwrap();
+    let second = device(51);
+    store
+        .add_device(&handle, second.clone(), &b64(1))
+        .await
+        .unwrap();
+
+    // Falscher erwarteter Altschlüssel: als paralleler Konflikt abgelehnt,
+    // der gespeicherte Schlüssel bleibt unverändert.
+    assert_eq!(
+        store
+            .rotate_identity(
+                &handle,
+                &b64(2),
+                &b64(9),
+                &[(first.id.clone(), b64(60), 4_000_000_000)],
+            )
+            .await,
+        Err(StoreError::ConcurrentUpdate)
+    );
+    assert_eq!(store.get(&handle).await.unwrap().unwrap().identity_key, b64(1));
+
+    // Ein nicht-revoziertes Gerät fehlt in der Liste: abgelehnt, kein halb
+    // rotiertes Konto.
+    assert_eq!(
+        store
+            .rotate_identity(
+                &handle,
+                &b64(1),
+                &b64(9),
+                &[(first.id.clone(), b64(60), 4_000_000_000)],
+            )
+            .await,
+        Err(StoreError::ConcurrentUpdate)
+    );
+    assert_eq!(store.get(&handle).await.unwrap().unwrap().identity_key, b64(1));
+
+    // Vollständig und mit korrektem Altschlüssel: Schlüssel, Credentials und
+    // Ablauf werden gesetzt.
+    store
+        .rotate_identity(
+            &handle,
+            &b64(1),
+            &b64(9),
+            &[
+                (first.id.clone(), b64(60), 4_000_000_000),
+                (second.id.clone(), b64(61), 4_000_000_000),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.get(&handle).await.unwrap().unwrap().identity_key, b64(9));
+    let devices = store.devices(&handle).await.unwrap();
+    let d1 = devices.iter().find(|d| d.id == first.id).unwrap();
+    assert_eq!(d1.credential, b64(60));
+    assert_eq!(d1.not_after, 4_000_000_000);
+    let d2 = devices.iter().find(|d| d.id == second.id).unwrap();
+    assert_eq!(d2.credential, b64(61));
+
+    // Revozierte Geräte müssen NICHT abgedeckt sein.
+    store.revoke_device(&handle, &second.id).await.unwrap();
+    store
+        .rotate_identity(
+            &handle,
+            &b64(9),
+            &b64(12),
+            &[(first.id.clone(), b64(70), 4_000_000_001)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.get(&handle).await.unwrap().unwrap().identity_key, b64(12));
+
+    // Unbekanntes Konto bleibt ein eigener Fehler.
+    assert_eq!(
+        store
+            .rotate_identity("pg-gibt-es-nicht", &b64(1), &b64(9), &[])
+            .await,
+        Err(StoreError::AccountMissing)
+    );
 }
 
 #[tokio::test]
