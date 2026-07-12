@@ -1,0 +1,248 @@
+openapi: 3.0.3
+info:
+  title: SecureMessenger Integrations-API
+  version: "1.0"
+  description: >
+    Oeffentliche Schnittstelle fuer Fremdprojekte (Mandanten), die den
+    SecureMessenger einbinden: Maschinen-Benachrichtigungen (notify) und
+    Praesenz-Abruf (presence). Der menschliche Leitfaden mit Schritt-fuer-
+    Schritt und curl-Beispielen steht in integration-leitfaden.md.
+
+
+    Quelle der Wahrheit sind die Handler in services/integrations/src/api.rs;
+    diese Datei spiegelt sie und muss bei Aenderungen mitgezogen werden.
+
+
+    NICHT enthalten, weil betriebsintern: die Route POST /internal/tenants
+    (nur im Cluster-Netz erreichbar, per Shared Secret, nicht im Ingress).
+    Ebenfalls nicht enthalten: der OIDC-/SSO-Nutzer-Login. Keycloak liegt
+    bisher nur als Deployment-Skelett vor; POST /integrations/token unten ist
+    ein Maschine-zu-Maschine-Fluss (Client Credentials), kein Nutzer-Login.
+servers:
+  - url: https://api.messenger.intern
+    description: >
+      Platzhalter. Die echte Basis-URL setzt der Betreiber am Ingress
+      (deploy/k8s/ingress.yaml).
+paths:
+  /integrations/token:
+    post:
+      summary: Client-Credentials gegen ein kurzlebiges Bearer-Token tauschen
+      operationId: token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenRequest'
+      responses:
+        '200':
+          description: Token ausgestellt (Laufzeit 1 Stunde).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '401':
+          description: >
+            Client-ID oder Secret falsch, oder Mandant gesperrt. Unbekannte
+            und falsche Zugangsdaten antworten identisch (code invalid_client),
+            damit die Antwort die Existenz eines Mandanten nicht verraet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /integrations/{tenant}/notify:
+    post:
+      summary: Markierte Maschinen-Benachrichtigung an alle Geraete eines Nutzers
+      description: >
+        Braucht den Scope 'notify'. Der Hinweis traegt nur Mandant und Titel,
+        keinen weiteren Inhalt (kein Ende-zu-Ende-Chat, der Absender ist ein
+        Server). Nicht verbundene Geraete verpassen den Hinweis.
+      operationId: notify
+      security:
+        - tenantToken: []
+      parameters:
+        - name: tenant
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Muss zum Mandanten des Tokens passen, sonst 403 tenant_mismatch.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotifyRequest'
+      responses:
+        '200':
+          description: Angenommen (auch wenn das Konto gerade kein verbundenes Geraet hat).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotifyResponse'
+        '400':
+          description: Titel leer oder ueber 200 Zeichen (code invalid_title).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '401':
+          description: Token fehlt, ungueltig oder abgelaufen (code invalid_token).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: >
+            Token gehoert zu einem anderen Mandanten (code tenant_mismatch)
+            oder der Mandant hat den Scope 'notify' nicht (code missing_scope).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '404':
+          description: Nutzer-Handle unbekannt (code unknown_user).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '429':
+          description: Rate-Limit des Mandanten erreicht. Der Header Retry-After nennt die Wartezeit in Sekunden.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+              description: Sekunden bis zum naechsten erlaubten Versuch.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /integrations/{tenant}/presence/{handle}:
+    get:
+      summary: Online-Status eines Nutzers abfragen
+      description: >
+        Braucht den Scope 'presence'. online ist true, sobald IRGENDEIN Geraet
+        des Kontos verbunden ist; mehr Aufloesung (welches Geraet, seit wann)
+        gibt die API bewusst nicht her.
+      operationId: presence
+      security:
+        - tenantToken: []
+      parameters:
+        - name: tenant
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Muss zum Mandanten des Tokens passen, sonst 403 tenant_mismatch.
+        - name: handle
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Status ermittelt.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PresenceResponse'
+        '401':
+          description: Token fehlt, ungueltig oder abgelaufen (code invalid_token).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: >
+            Token gehoert zu einem anderen Mandanten (code tenant_mismatch)
+            oder der Mandant hat den Scope 'presence' nicht (code missing_scope).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '404':
+          description: Nutzer-Handle unbekannt (code unknown_user).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '429':
+          description: Rate-Limit des Mandanten erreicht. Der Header Retry-After nennt die Wartezeit in Sekunden.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+components:
+  securitySchemes:
+    tenantToken:
+      type: http
+      scheme: bearer
+      description: Das Bearer-Token aus POST /integrations/token (Laufzeit 1 Stunde).
+  schemas:
+    TokenRequest:
+      type: object
+      required: [client_id, client_secret]
+      properties:
+        client_id:
+          type: string
+          description: Vom Betreiber vergeben (gleich dem Mandanten-Namen).
+        client_secret:
+          type: string
+          description: Vom Betreiber genau einmal bei der Anlage ausgegeben.
+    TokenResponse:
+      type: object
+      required: [access_token, token_type, expires_in]
+      properties:
+        access_token:
+          type: string
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_in:
+          type: integer
+          description: Restlaufzeit in Sekunden (3600).
+    NotifyRequest:
+      type: object
+      required: [handle, title]
+      properties:
+        handle:
+          type: string
+          description: Handle des Zielnutzers im SecureMessenger.
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Kurzer Titel; bewusst minimal, kein Platz fuer ganze Berichte.
+    NotifyResponse:
+      type: object
+      required: [devices, connected]
+      properties:
+        devices:
+          type: integer
+          description: Zielgeraete des Kontos (gueltige Geraetemenge).
+        connected:
+          type: integer
+          description: Davon gerade verbunden (nur informativ).
+    PresenceResponse:
+      type: object
+      required: [handle, online]
+      properties:
+        handle:
+          type: string
+        online:
+          type: boolean
+    ApiError:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Maschinenlesbarer Fehlercode (z. B. invalid_token, missing_scope).
+        message:
+          type: string
+          description: Menschenlesbare Erklaerung (nicht fuer die Fallunterscheidung).

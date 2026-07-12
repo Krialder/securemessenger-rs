@@ -2,7 +2,7 @@
 
 Zwei Wege zwischen Client und Kern. REST über HTTPS für alles, was du auslöst, WebSocket für alles, was der Server von sich aus meldet. Bodies sind JSON, Binärdaten gehen Base64-kodiert über die Leitung. Authentifiziert wird per `Authorization: Bearer <token>`, Access-Token kurzlebig, Refresh-Token rotiert.
 
-Die Übersicht zeigt die grobe Form. Jedes Feld steht verbindlich in der OpenAPI-Spec, die mit dem Backend ausgeliefert wird.
+Die Übersicht zeigt die grobe Form. Für die oeffentliche Integrations-API (token, notify, presence) liegt der maschinenlesbare Feldvertrag als OpenAPI-Datei im Repo ([openapi-integrations.yaml](openapi-integrations.yaml)), ergänzt um den [Integrations-Leitfaden](integration-leitfaden.md). Für die übrigen Dienste ist die jeweilige Handler-Quelle der verbindliche Vertrag; eine gemeinsam ausgelieferte, aus dem Code erzeugte OpenAPI-Spec über alle Routen (etwa per utoipa) bleibt eine offene Aufgabe.
 
 ## Konto und Geräte
 
@@ -49,12 +49,12 @@ Die Übersicht zeigt die grobe Form. Jedes Feld steht verbindlich in der OpenAPI
 
 ## Integration für andere Projekte
 
-Andere Ausbildungsprojekte binden den Kern über Standard-Protokolle ein, ohne ihren Stack zu ändern. Jedes Projekt ist ein eigener Mandant mit eigenem Token und eigenem Rate-Limit.
+Andere Ausbildungsprojekte binden den Kern über Standard-Protokolle ein, ohne ihren Stack zu ändern. Jedes Projekt ist ein eigener Mandant mit eigenem Token und eigenem Rate-Limit. Der konsumentenseitige Schritt-für-Schritt-Weg samt curl-Beispielen steht im [Integrations-Leitfaden](integration-leitfaden.md), die öffentlichen Endpunkte maschinenlesbar in [openapi-integrations.yaml](openapi-integrations.yaml).
 
-- OpenID Connect (Discovery plus Authorization-Code-Flow) delegiert die Anmeldung. SSO gibt dem Projekt die Anmelde-Identität, nie private Schlüssel oder Lesezugriff auf Inhalte.
+- OpenID Connect (Discovery plus Authorization-Code-Flow) soll die Anmeldung delegieren: SSO gäbe dem Projekt die Anmelde-Identität, nie private Schlüssel oder Lesezugriff auf Inhalte. Stand: Keycloak liegt bisher nur als Deployment-Skelett vor, ein nutzbarer OIDC-Fluss (Realm, registrierter Client, redirect_uri, Discovery-URL) fehlt noch. Der Mandanten-Token unten ist ein Maschine-zu-Maschine-Fluss (Client Credentials), NICHT der Nutzer-Login.
 - `POST /integrations/{tenant}/notify` löst eine Benachrichtigung an einen Nutzer aus. Sie ist eine markierte Maschinen-Benachrichtigung mit minimalem Inhalt, kein Ende-zu-Ende-Chat, weil der Absender ein Server ist.
-- `GET /integrations/{tenant}/presence/{handle}` fragt den Online-Status ab, soweit der Nutzer es erlaubt.
-- Webhook-Callbacks melden dem Projekt Status zurück, etwa die Zustellung.
+- `GET /integrations/{tenant}/presence/{handle}` fragt den Online-Status ab. Die Freigabe je Nutzer ("soweit der Nutzer es erlaubt") braucht Nutzer-Einstellungen, die noch fehlen; bis dahin ist die Präsenz für Mandanten pauschal sichtbar.
+- Webhook-Callbacks sollen dem Projekt Status zurückmelden (etwa die Zustellung); sie sind noch nicht gebaut.
 
 [ANNAHME: Mandanten authentifizieren sich über `POST /integrations/token` (client_id plus client_secret gegen ein kurzlebiges Bearer-Token, Client-Credentials-Zuschnitt). Der notify-Body ist minimal ({handle, title}, Titel max. 200 Zeichen); das Event beim Nutzer trägt nur Mandant und Titel. Die Präsenz-Freigabe je Nutzer braucht Nutzer-Einstellungen, die noch fehlen; bis dahin ist sie pauschal an. Webhook-Callbacks folgen mit einer späteren Etappe.]
 

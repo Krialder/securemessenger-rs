@@ -37,6 +37,7 @@ Diese Doku ist eine Übersicht plus die Specs, an denen so ein System steht oder
 | [identitaet-und-geraete.md](identitaet-und-geraete.md) | Konten, Handles, Multi-Device, Verifikation |
 | [datenmodell.md](datenmodell.md) | Was der Server speichert, mit Indizes und Partitionierung |
 | [schnittstellen.md](schnittstellen.md) | APIs und Echtzeit-Events |
+| [integration-leitfaden.md](integration-leitfaden.md) | Konsumentenseitiger Leitfaden für Fremdprojekte (Mandant, Token, notify, presence), mit curl-Beispielen; maschinenlesbar in [openapi-integrations.yaml](openapi-integrations.yaml) |
 | [betrieb.md](betrieb.md) | Deployment, Skalierung, die teuren Pfade |
 | [roadmap.md](roadmap.md) | Reihenfolge, mit einer Spec-Phase vor dem Code |
 | [offene-fragen.md](offene-fragen.md) | Was noch nicht entschieden ist |
