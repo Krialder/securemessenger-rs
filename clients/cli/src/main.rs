@@ -22,13 +22,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use client_app::account::{build_device_credential, build_rotation_cert, IdentityKeypair};
+use client_app::account::{build_device_credential, build_rotation_cert, decode_seed, IdentityKeypair};
 use client_app::delivery::{
     parse_ws_event, ws_auth_frame, DeliveryClient, GroupOutgoing, OutgoingEnvelope, WsEvent,
 };
 use client_app::directory::DirectoryClient;
 use client_app::grouptext::{self, GroupPayload, RosterDevice};
 use client_app::identity::{DeviceEnrollment, RotateDeviceCredential};
+use client_app::policy::{
+    CREDENTIAL_TTL_SECONDS, INVITE_BUFFER_MAX, MAX_PENDING_INVITES, MLS_KEY_PACKAGE_TARGET,
+};
+use client_app::store_keys::{
+    invite_buffer_key, invite_key, roster_key, COUNTER_KEY, GROUPS_INDEX_KEY, INVITES_INDEX_KEY,
+    MLS_STATE_KEY, OWN_DEVICES_KEY,
+};
 use client_app::prekeys::{
     bundle_from_directory, device_id_from_u32, new_uuid, publication_from_bundle, DirectoryPrekey,
 };
@@ -49,36 +56,11 @@ const DEFAULT_IDENTITY_URL: &str = "http://127.0.0.1:8080";
 const DEFAULT_DIRECTORY_URL: &str = "http://127.0.0.1:8081";
 const DEFAULT_DELIVERY_URL: &str = "http://127.0.0.1:8082";
 const DEFAULT_KT_URL: &str = "http://127.0.0.1:8083";
-/// Gültigkeit des Geräte-Credentials: ein Jahr. Der Client wählt die Dauer
-/// (specs/geraete-identitaet.md), der Server lehnt nur Abgelaufenes ab.
-const CREDENTIAL_TTL_SECONDS: u64 = 60 * 60 * 24 * 365;
-/// Storage-Schlüssel des Prekey-ID-Zählers (client-core `next_prekey_id`).
-const COUNTER_KEY: &str = "counter/next_prekey_id";
-/// Storage-Schlüssel des persistenten MLS-Zustands (smmls.v1-Blob mit
-/// Signierschlüssel, KeyPackage-Privatteilen und allen Gruppenzuständen;
-/// EIN Mitglied je Gerät für alle Gruppen). Liegt wie alles andere hinter
-/// dem keystore, wenn SM_PASSPHRASE gesetzt ist.
-const MLS_STATE_KEY: &str = "mls/state";
-/// Storage-Schlüssel der lokalen Gruppenliste (`sm groups`).
-const GROUPS_INDEX_KEY: &str = "groups/index";
-/// Storage-Schlüssel der Liste offener Einladungen (Gruppen-IDs, deren
-/// Welcome vorgemerkt, aber noch nicht angenommen ist).
-const INVITES_INDEX_KEY: &str = "invites/index";
-/// Höchstzahl gleichzeitig offener Einladungen. Weil `is_welcome` nur das
-/// Wire-Format prüft (nicht, dass der Welcome wirklich an uns adressiert
-/// ist) und keinen KeyPackage-Verbrauch auslöst, könnte sonst jeder
-/// Authentifizierte die Ablage mit beliebig vielen Welcome-Blobs fluten.
-/// Ist der Deckel erreicht, werden neue Einladungen verworfen, bis der
-/// Nutzer bestehende annimmt oder ablehnt.
-const MAX_PENDING_INVITES: usize = 16;
-/// Höchstzahl gepufferter Hüllen je offener Einladung (gegen das Fluten
-/// der Ablage vor einer Ablehnung; der Roster kommt als erste Hülle).
-const INVITE_BUFFER_MAX: usize = 32;
-/// Zielbestand ungenutzter MLS-KeyPackages im Verzeichnis. Der Client
-/// legt nur bis hierher nach (nicht bei jeder Anmeldung feste vier),
-/// damit der Pool nicht wächst und der server-seitige Deckel
-/// (`MAX_MLS_KEY_PACKAGES`) nie greift.
-const MLS_KEY_PACKAGE_TARGET: u64 = 8;
+// Geteilte Ablage-Schlüssel (MLS_STATE_KEY, GROUPS_INDEX_KEY,
+// INVITES_INDEX_KEY, COUNTER_KEY, roster_key/invite_key/invite_buffer_key)
+// und Betriebskonstanten (CREDENTIAL_TTL_SECONDS, MLS_KEY_PACKAGE_TARGET,
+// MAX_PENDING_INVITES, INVITE_BUFFER_MAX) liegen jetzt in client-app
+// (store_keys, policy), damit CLI und Web nicht auseinanderdriften.
 
 /// Das lokal abgelegte Client-Profil. Der Konto-Seed ist der private
 /// Wurzelschlüssel; wer diese Datei hat, hat das Konto.
@@ -270,7 +252,7 @@ async fn login(args: &[String]) -> Result<(), String> {
     // Anmeldung neu gekoppeltes Gerät wird so beim nächsten Senden
     // aufgelöst (sonst bekäme es keine Kopien). Best effort.
     if let Ok(storage) = open_storage() {
-        let _ = storage.borrow_mut().remove("sync/own_devices");
+        let _ = storage.borrow_mut().remove(OWN_DEVICES_KEY);
     }
 
     println!(
@@ -584,8 +566,7 @@ async fn build_sync_envelopes(
     text: &str,
     expires_at: Option<u64>,
 ) -> Result<Vec<OutgoingEnvelope>, String> {
-    const OWN_KEY: &str = "sync/own_devices";
-    let cached = storage.borrow().get(OWN_KEY).map_err(|e| e.to_string())?;
+    let cached = storage.borrow().get(OWN_DEVICES_KEY).map_err(|e| e.to_string())?;
     let siblings: Vec<ContactDevice> = match cached {
         Some(bytes) => {
             serde_json::from_slice(&bytes).map_err(|e| format!("Eigene Geräte unlesbar: {e}"))?
@@ -618,7 +599,7 @@ async fn build_sync_envelopes(
             let json = serde_json::to_vec(&siblings).map_err(|e| e.to_string())?;
             storage
                 .borrow_mut()
-                .put(OWN_KEY, &json)
+                .put(OWN_DEVICES_KEY, &json)
                 .map_err(|e| e.to_string())?;
             siblings
         }
@@ -1254,7 +1235,7 @@ async fn approve(args: &[String]) -> Result<(), String> {
     // kam dazu); leeren, damit die nächste gesendete Nachricht auch an das
     // neue Gerät synchronisiert. Best effort.
     if let Ok(storage) = open_storage() {
-        let _ = storage.borrow_mut().remove("sync/own_devices");
+        let _ = storage.borrow_mut().remove(OWN_DEVICES_KEY);
     }
 
     println!(
@@ -1517,15 +1498,6 @@ async fn rotate_key() -> Result<(), String> {
     }
 }
 
-/// Dekodiert einen Base64-Seed (32 Byte) eines Wurzelschlüssels.
-fn decode_seed(seed_b64: &str) -> Result<[u8; 32], String> {
-    BASE64
-        .decode(seed_b64)
-        .map_err(|e| format!("Konto-Seed unlesbar: {e}"))?
-        .try_into()
-        .map_err(|_| "Konto-Seed hat die falsche Länge".to_string())
-}
-
 /// Befördert den bestätigten neuen Wurzelschlüssel nach `account_seed` und
 /// leert `pending_account_seed`. Erst nach dem Servererfolg aufgerufen.
 fn promote_pending_seed(profile: &mut Profile, new_account: &IdentityKeypair) -> Result<(), String> {
@@ -1540,10 +1512,6 @@ fn promote_pending_seed(profile: &mut Profile, new_account: &IdentityKeypair) ->
 struct GroupEntry {
     id: String,
     members: Vec<String>,
-}
-
-fn roster_key(group_id: &str) -> String {
-    format!("group/{group_id}/roster")
 }
 
 /// Lädt das MLS-Mitglied aus der Ablage oder legt ein frisches an und
@@ -1597,10 +1565,6 @@ fn remember_group(storage: &SharedStorage, entry: GroupEntry) -> Result<(), Stri
     index.retain(|g| g.id != entry.id);
     index.push(entry);
     save_group_index(storage, &index)
-}
-
-fn invite_key(group_id: &str) -> String {
-    format!("group/{group_id}/invite")
 }
 
 fn load_invites(storage: &SharedStorage) -> Result<Vec<String>, String> {
@@ -1658,10 +1622,6 @@ fn forget_invite(storage: &SharedStorage, group_id: &str) -> Result<(), String> 
     let _ = storage.borrow_mut().remove(&invite_key(group_id));
     let _ = storage.borrow_mut().remove(&invite_buffer_key(group_id));
     Ok(())
-}
-
-fn invite_buffer_key(group_id: &str) -> String {
-    format!("group/{group_id}/buffer")
 }
 
 /// Puffert eine Gruppen-Hülle, die vor der Annahme einer Einladung

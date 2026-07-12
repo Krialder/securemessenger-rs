@@ -90,6 +90,17 @@ pub fn build_device_credential(
     account.sign_b64(message.as_bytes())
 }
 
+/// Dekodiert einen Base64-Seed (32 Byte) eines Wurzelschlüssels aus der
+/// Ablage. Gemeinsam von CLI und Web genutzt, damit die Fehlermeldungen und
+/// die Längenprüfung an einer Stelle liegen.
+pub fn decode_seed(seed_b64: &str) -> Result<[u8; 32], String> {
+    BASE64
+        .decode(seed_b64)
+        .map_err(|e| format!("Konto-Seed unlesbar: {e}"))?
+        .try_into()
+        .map_err(|_| "Konto-Seed hat die falsche Länge".to_string())
+}
+
 /// Die zu signierende Rotations-Botschaft (ADR-0010). Muss Byte für Byte
 /// zur Server-Seite passen (services/identity/src/credential.rs
 /// `rotation_message`); Handle und Base64 tragen kein Newline, das Format

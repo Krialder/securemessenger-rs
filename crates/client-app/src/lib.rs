@@ -31,9 +31,11 @@ pub mod grouptext;
 mod http;
 pub mod identity;
 pub mod kt;
+pub mod policy;
 pub mod prekeys;
 pub mod protocol_store;
 pub mod storage;
+pub mod store_keys;
 pub mod sync;
 pub mod wire;
 

@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use client_app::account::{build_device_credential, build_rotation_cert, IdentityKeypair};
+use client_app::account::{build_device_credential, build_rotation_cert, decode_seed, IdentityKeypair};
 use client_app::delivery::{
     parse_ws_event, ws_auth_frame, DeliveryClient, GroupOutgoing, OutgoingEnvelope, WsEvent,
 };
@@ -36,6 +36,13 @@ use client_app::directory::DirectoryClient;
 use client_app::grouptext::{self, GroupPayload, RosterDevice};
 use client_app::identity::{DeviceEnrollment, RotateDeviceCredential};
 use client_app::kt::KtClient;
+use client_app::policy::{
+    CREDENTIAL_TTL_SECONDS, INVITE_BUFFER_MAX, MAX_PENDING_INVITES, MLS_KEY_PACKAGE_TARGET,
+};
+use client_app::store_keys::{
+    invite_buffer_key, invite_key, roster_key, COUNTER_KEY, GROUPS_INDEX_KEY, INVITES_INDEX_KEY,
+    MLS_STATE_KEY, OWN_DEVICES_KEY,
+};
 use client_app::prekeys::{
     bundle_from_directory, device_id_from_u32, new_uuid, publication_from_bundle, DirectoryPrekey,
     PROTOCOL_DEVICE_ID,
@@ -57,10 +64,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::storage::BrowserStorage;
 
-/// Gültigkeit des Geräte-Credentials: ein Jahr, wie beim CLI.
-const CREDENTIAL_TTL_SECONDS: u64 = 60 * 60 * 24 * 365;
-/// Ablage-Schlüssel, identisch zum CLI (Zähler) bzw. web-eigen (Profil).
-const COUNTER_KEY: &str = "counter/next_prekey_id";
+/// Web-eigener Ablage-Schlüssel des Profils (die geteilten Schlüssel und
+/// Betriebskonstanten kommen aus client-app::store_keys/policy).
 const PROFILE_KEY: &str = "profile/v1";
 /// Index aller Unterhaltungen (jüngste zuerst) samt Auszug und
 /// Ungelesen-Zahl. Ein eigener Schlüssel, weil der Storage-Trait bewusst
@@ -286,34 +291,11 @@ fn mark_read(storage: &SharedStorage, peer: &str) -> Vec<ChatSummary> {
 /// Handles kennen keinen Doppelpunkt (Handle-Regel des identity-Dienstes),
 /// der Präfix kollidiert also nie mit einem Kontakt-Chat.
 const GROUP_CHAT_PREFIX: &str = "grp:";
-/// Ablage-Schlüssel des persistenten MLS-Zustands (smmls.v1-Blob; EIN
-/// Mitglied je Gerät für alle Gruppen), Konvention identisch zum CLI.
-const MLS_STATE_KEY: &str = "mls/state";
-/// Ablage-Schlüssel der lokalen Gruppenliste (ID plus Mitglieder).
-const GROUPS_INDEX_KEY: &str = "groups/index";
-/// Ablage-Schlüssel der offenen Einladungen (Gruppen-IDs, deren Welcome
-/// vorgemerkt, aber noch nicht angenommen ist), Konvention wie im CLI.
-const INVITES_INDEX_KEY: &str = "invites/index";
-/// Höchstzahl gleichzeitig offener Einladungen (gegen das Fluten der
-/// Ablage und der Banner-Liste), wie im CLI. Neue Einladungen darüber
-/// werden verworfen, bis bestehende angenommen oder abgelehnt sind.
-const MAX_PENDING_INVITES: usize = 16;
-/// Höchstzahl gepufferter Hüllen je offener Einladung (gegen das Fluten
-/// der Ablage vor einer Ablehnung), wie im CLI.
-const INVITE_BUFFER_MAX: usize = 32;
-/// Wie viele MLS-KeyPackages je Anmeldung nachgelegt werden (das
-/// Verzeichnis konsumiert je Einladung eines), wie beim CLI.
-/// Zielbestand ungenutzter MLS-KeyPackages im Verzeichnis (nur bis hierher
-/// nachlegen, damit der Pool nicht wächst), wie im CLI.
-const MLS_KEY_PACKAGE_TARGET: u64 = 8;
-
-fn invite_key(group_id: &str) -> String {
-    format!("group/{group_id}/invite")
-}
-
-fn invite_buffer_key(group_id: &str) -> String {
-    format!("group/{group_id}/buffer")
-}
+// Die geteilten Ablage-Schlüssel (MLS_STATE_KEY, GROUPS_INDEX_KEY,
+// INVITES_INDEX_KEY, COUNTER_KEY, roster_key/invite_key/invite_buffer_key)
+// und Betriebskonstanten (CREDENTIAL_TTL_SECONDS, MLS_KEY_PACKAGE_TARGET,
+// MAX_PENDING_INVITES, INVITE_BUFFER_MAX) kommen jetzt aus client-app
+// (store_keys, policy), damit CLI und Web nicht auseinanderdriften.
 
 fn load_invites(storage: &SharedStorage) -> Vec<String> {
     storage
@@ -430,10 +412,6 @@ struct GroupEntry {
     status: GroupStatus,
 }
 
-fn roster_storage_key(group_id: &str) -> String {
-    format!("group/{group_id}/roster")
-}
-
 /// Lädt das MLS-Mitglied aus der Ablage oder legt ein frisches an und
 /// persistiert es sofort (die KeyPackage-Privatteile müssen jedes
 /// Neuladen überleben, sonst wäre ein späterer Welcome wertlos).
@@ -489,7 +467,7 @@ fn tombstone_group(
     }
     let bytes = serde_json::to_vec(&index).map_err(|e| e.to_string())?;
     storage.borrow_mut().put(GROUPS_INDEX_KEY, &bytes)?;
-    let _ = storage.borrow_mut().remove(&roster_storage_key(group_id));
+    let _ = storage.borrow_mut().remove(&roster_key(group_id));
     Ok(())
 }
 
@@ -501,11 +479,11 @@ fn save_roster(
     let bytes = serde_json::to_vec(devices).map_err(|e| e.to_string())?;
     storage
         .borrow_mut()
-        .put(&roster_storage_key(group_id), &bytes)
+        .put(&roster_key(group_id), &bytes)
 }
 
 fn load_roster(storage: &SharedStorage, group_id: &str) -> Result<Vec<RosterDevice>, String> {
-    match storage.borrow().get(&roster_storage_key(group_id))? {
+    match storage.borrow().get(&roster_key(group_id))? {
         Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
         None => Err(
             "Geräte-Roster dieser Gruppe fehlt noch (der Gründer schickt ihn als erste \
@@ -1148,7 +1126,7 @@ async fn login(storage: SharedStorage, password: String) -> Result<Onboarded, St
     // Den Self-Sync-Cache leeren: ein seit der letzten Anmeldung von einem
     // anderen Gerät gekoppeltes (oder entferntes) Gerät wird so beim nächsten
     // Senden neu aufgelöst.
-    let _ = storage.borrow_mut().remove("sync/own_devices");
+    let _ = storage.borrow_mut().remove(OWN_DEVICES_KEY);
     // Den MLS-KeyPackage-Vorrat auffüllen (das Verzeichnis konsumiert je
     // Gruppen-Einladung eines); best effort, eine Anmeldung soll daran
     // nicht scheitern.
@@ -1595,11 +1573,10 @@ async fn own_siblings(
     core: &mut Core,
     token: ReadSignal<String>,
 ) -> Result<Vec<ContactDevice>, String> {
-    const OWN_KEY: &str = "sync/own_devices";
     let cached = core
         .storage
         .borrow()
-        .get(OWN_KEY)
+        .get(OWN_DEVICES_KEY)
         .map_err(|e| e.to_string())?;
     if let Some(bytes) = cached {
         return serde_json::from_slice(&bytes).map_err(|e| format!("Eigene Geräte unlesbar: {e}"));
@@ -1631,7 +1608,7 @@ async fn own_siblings(
     let json = serde_json::to_vec(&siblings).map_err(|e| e.to_string())?;
     core.storage
         .borrow_mut()
-        .put(OWN_KEY, &json)
+        .put(OWN_DEVICES_KEY, &json)
         .map_err(|e| e.to_string())?;
     Ok(siblings)
 }
@@ -2772,7 +2749,7 @@ async fn approve_device(storage: &SharedStorage, token: &str, input: &str) -> Re
     // Der Self-Sync-Cache dieses Geräts ist jetzt veraltet (ein Geschwister
     // kam dazu); leeren, damit die nächste gesendete Nachricht auch an das
     // neue Gerät synchronisiert.
-    let _ = storage.borrow_mut().remove("sync/own_devices");
+    let _ = storage.borrow_mut().remove(OWN_DEVICES_KEY);
     Ok(outcome.protocol_device_id)
 }
 
@@ -2795,7 +2772,7 @@ async fn rotate_key_web(storage: &SharedStorage, token: &str) -> Result<usize, S
                 .to_string(),
         );
     }
-    let old_account = IdentityKeypair::from_seed(&decode_seed_web(&profile.account_seed)?);
+    let old_account = IdentityKeypair::from_seed(&decode_seed(&profile.account_seed)?);
 
     // Liegt ein pending seed, eine frühere Rotation abschließen statt eine
     // neue starten. Sonst ein frisches Wurzelpaar ziehen und VOR dem
@@ -2803,7 +2780,7 @@ async fn rotate_key_web(storage: &SharedStorage, token: &str) -> Result<usize, S
     // verliert.
     let resuming = !profile.pending_account_seed.is_empty();
     let new_account = if resuming {
-        IdentityKeypair::from_seed(&decode_seed_web(&profile.pending_account_seed)?)
+        IdentityKeypair::from_seed(&decode_seed(&profile.pending_account_seed)?)
     } else {
         let account = IdentityKeypair::generate();
         profile.pending_account_seed = BASE64.encode(account.to_seed());
@@ -2850,15 +2827,6 @@ async fn rotate_key_web(storage: &SharedStorage, token: &str) -> Result<usize, S
         }
         Err(error) => Err(error.to_string()),
     }
-}
-
-/// Dekodiert einen Base64-Seed (32 Byte) eines Wurzelschlüssels.
-fn decode_seed_web(seed_b64: &str) -> Result<[u8; 32], String> {
-    BASE64
-        .decode(seed_b64)
-        .map_err(|e| format!("Konto-Seed unlesbar: {e}"))?
-        .try_into()
-        .map_err(|_| "Konto-Seed hat die falsche Länge".to_string())
 }
 
 /// Befördert den bestätigten neuen Wurzelschlüssel nach `account_seed` und
