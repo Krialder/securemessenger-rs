@@ -100,7 +100,7 @@ services/
 deploy/
   docker/             generisches Multi-Stage-Dockerfile
   k8s/                Kubernetes-Manifeste
-scripts/              Setup der Entwicklungsumgebung (start.cmd im Root)
+scripts/              Einrichten und Starten (sm.ps1; GUI: SecureMessenger.cmd im Root)
 ```
 
 Jeder Backend-Dienst ist ein eigenes Binary unter `services/` mit einem Bibliotheksteil für Tests und teilt sich die Querschnitts-Bausteine aus `crates/common`. Weitere Dienste kommen phasenweise dazu, jeder nach demselben Muster wie `identity`.

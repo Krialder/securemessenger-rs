@@ -3,7 +3,7 @@
 Skripte, um die Entwicklungsumgebung einzurichten und die Dienste plus Web-Client zu starten. Es gibt genau zwei Einstiege, beide bauen auf derselben geteilten Prüf- und Reparatur-Logik auf (`lib-checks.ps1`):
 
 - **Grafisch (Doppelklick):** `SecureMessenger.cmd` im Projekt-Root öffnet das eine App-Fenster `scripts/sm-gui.ps1`.
-- **Konsole (Entwickler):** `start.cmd` im Projekt-Root ruft `scripts/sm.ps1` auf.
+- **Konsole (Entwickler):** `scripts/sm.ps1` aus einem PowerShell-Terminal.
 
 ## SecureMessenger.cmd (grafisch, ein Fenster für alles)
 
@@ -11,20 +11,20 @@ Skripte, um die Entwicklungsumgebung einzurichten und die Dienste plus Web-Clien
 
 Die langen Schritte (winget, cargo build) laufen in einem Hintergrund-Runspace und melden über eine synchronisierte Warteschlange an einen DispatcherTimer, damit die Oberfläche nie einfriert. Der eigentliche Start läuft über `sm.ps1` (dieselbe eine Startlogik wie die Konsole).
 
-## start.cmd und sm.ps1 (Konsole)
+## sm.ps1 (Konsole)
 
-`start.cmd` reicht seine Argumente an `scripts/sm.ps1` durch:
+Aus einem PowerShell-Terminal im Projekt-Root (auf einem frischen Rechner mit noch strenger ExecutionPolicy vorweg `powershell -ExecutionPolicy Bypass -File scripts\sm.ps1 ...`):
 
+```powershell
+scripts\sm.ps1            # startet die Umgebung (Dienste 8080-8083 plus Web-Clients)
+scripts\sm.ps1 -Setup     # richtet nur ein und aktualisiert, ohne zu starten
+scripts\sm.ps1 -Stop      # beendet eine laufende Umgebung
+scripts\sm.ps1 -Reset     # frische demo_*-Datenbanken vor dem Start
+scripts\sm.ps1 -Solo      # nur ein Web-Client (Alice, 3000) statt Alice und Bob
+scripts\sm.ps1 -NoWeb     # nur die Dienste, keine Web-Clients
 ```
-start.cmd            # startet die Umgebung (Dienste 8080-8083 plus Web-Clients)
-start.cmd -Setup     # richtet nur ein und aktualisiert, ohne zu starten
-start.cmd -Stop      # beendet eine laufende Umgebung
-start.cmd -Reset     # frische demo_*-Datenbanken vor dem Start
-start.cmd -Solo      # nur ein Web-Client (Alice, 3000) statt Alice und Bob
-start.cmd -NoWeb     # nur die Dienste, keine Web-Clients
-```
 
-Erststart auf einem frischen Rechner: einmal `start.cmd -Setup` (oder gleich die GUI), dann `start.cmd`.
+Erststart auf einem frischen Rechner: einmal `scripts\sm.ps1 -Setup` (oder gleich die GUI `SecureMessenger.cmd`, die das ohne ExecutionPolicy-Vorspann erledigt), dann `scripts\sm.ps1`.
 
 `sm.ps1 -Setup` richtet die Umgebung idempotent ein und delegiert dafür an die geteilte Bibliothek `lib-checks.ps1` (dieselbe, die auch die GUI nutzt, damit die Logik nicht doppelt gepflegt wird):
 
@@ -44,7 +44,7 @@ Beide werden per Dot-Sourcing eingebunden, nicht direkt aufgerufen.
 
 ## Vorführung mit zwei Personen
 
-`start.cmd` (ohne `-Solo`) startet Alice (3000) und Bob (3001) mit eigenen `demo_*`-Datenbanken und deterministischen Demo-Schlüsseln. Das Drehbuch der Vorführung steht in [DEMO.md](../DEMO.md).
+`scripts\sm.ps1` (ohne `-Solo`) startet Alice (3000) und Bob (3001) mit eigenen `demo_*`-Datenbanken und deterministischen Demo-Schlüsseln. Das Drehbuch der Vorführung steht in [DEMO.md](../DEMO.md).
 
 ## Danach bauen (manuell)
 
