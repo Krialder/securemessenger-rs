@@ -653,9 +653,13 @@ async fn group_chat_over_separate_cli_processes() {
         "stdout war: {created}"
     );
 
+    // Anna schreibt VOR der Annahme in die Gruppe: der Text darf nicht
+    // verloren gehen, er wird bei Berts Annahme nachgespielt.
+    anna.run(&["group-send", &group_id, "vor der annahme gesendet"]);
+
     // Bert und Carl holen ab: kein automatischer Beitritt mehr, sondern
     // eine EINLADUNG, die vorgemerkt wird (Schutz vor aufgezwungenen
-    // Gruppen).
+    // Gruppen). Roster und der Vor-Annahme-Text werden dabei gepuffert.
     let bert_recv = bert.run(&["recv"]);
     assert!(
         bert_recv.contains("eingeladen") && !bert_recv.contains("beigetreten"),
@@ -667,8 +671,9 @@ async fn group_chat_over_separate_cli_processes() {
         bert_invites.contains(&group_id),
         "die Einladung muss in 'invites' stehen, stdout war: {bert_invites}"
     );
-    // Annehmen: jetzt erst der Beitritt (Mitglieder aus dem Ratchet-Tree),
-    // und der vor der Annahme gepufferte Geräte-Roster wird nachgespielt.
+    // Annehmen: jetzt erst der Beitritt (Mitglieder aus dem Ratchet-Tree);
+    // der gepufferte Roster wird nachgespielt und der Vor-Annahme-Text
+    // gezeigt (statt still verworfen).
     let bert_accept = bert.run(&["group-accept", &group_id]);
     assert!(
         bert_accept.contains("beigetreten") && bert_accept.contains("anna"),
@@ -677,6 +682,10 @@ async fn group_chat_over_separate_cli_processes() {
     assert!(
         bert_accept.contains("Roster ist da"),
         "der gepufferte Roster muss beim Beitritt nachgespielt werden, stdout war: {bert_accept}"
+    );
+    assert!(
+        bert_accept.contains("anna: vor der annahme gesendet"),
+        "der Vor-Annahme-Text darf nicht verloren gehen, stdout war: {bert_accept}"
     );
     // Carl nimmt ebenfalls an (die Ablehnung prüft ein eigener Test).
     carl.run(&["recv"]);

@@ -64,9 +64,16 @@ const GROUPS_INDEX_KEY: &str = "groups/index";
 /// Storage-Schlüssel der Liste offener Einladungen (Gruppen-IDs, deren
 /// Welcome vorgemerkt, aber noch nicht angenommen ist).
 const INVITES_INDEX_KEY: &str = "invites/index";
+/// Höchstzahl gleichzeitig offener Einladungen. Weil `is_welcome` nur das
+/// Wire-Format prüft (nicht, dass der Welcome wirklich an uns adressiert
+/// ist) und keinen KeyPackage-Verbrauch auslöst, könnte sonst jeder
+/// Authentifizierte die Ablage mit beliebig vielen Welcome-Blobs fluten.
+/// Ist der Deckel erreicht, werden neue Einladungen verworfen, bis der
+/// Nutzer bestehende annimmt oder ablehnt.
+const MAX_PENDING_INVITES: usize = 16;
 /// Höchstzahl gepufferter Hüllen je offener Einladung (gegen das Fluten
 /// der Ablage vor einer Ablehnung; der Roster kommt als erste Hülle).
-const INVITE_BUFFER_MAX: usize = 64;
+const INVITE_BUFFER_MAX: usize = 32;
 /// Zielbestand ungenutzter MLS-KeyPackages im Verzeichnis. Der Client
 /// legt nur bis hierher nach (nicht bei jeder Anmeldung feste vier),
 /// damit der Pool nicht wächst und der server-seitige Deckel
@@ -1506,6 +1513,10 @@ fn remember_invite(
     if invites.iter().any(|id| id == group_id) {
         return Ok(false);
     }
+    // Deckel gegen das Fluten der Einladungsliste (siehe MAX_PENDING_INVITES).
+    if invites.len() >= MAX_PENDING_INVITES {
+        return Ok(false);
+    }
     storage
         .borrow_mut()
         .put(&invite_key(group_id), welcome_blob)
@@ -1991,23 +2002,44 @@ async fn group_accept(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("Beitritt scheitert: {e}"))?;
     save_member_state(&storage, &session.export_state()?)?;
 
-    // Vor der Annahme eingetroffenen Verkehr nachspielen (vor allem den
-    // Geräte-Roster). Der Reihe nach, wie er ankam; Fehler übersprungen
-    // (eine einzelne unlesbare Hülle darf den Beitritt nicht scheitern).
+    // Vor der Annahme eingetroffenen Verkehr nachspielen: der Geräte-Roster
+    // (zum Senden nötig), Gesprächs-Texte (sonst verloren, der Server hat
+    // seine Kopie beim Puffern schon verworfen) und fremde Commits. Der
+    // Reihe nach; eine einzelne unlesbare Hülle darf den Beitritt nicht
+    // scheitern lassen. Ein Commit, der uns schon wieder ENTFERNT, macht
+    // die Einladung wertlos: dann aufräumen statt eine tote Gruppe anlegen.
     let mut roster_devices = None;
+    let mut pending_texts: Vec<(String, String)> = Vec::new();
+    let mut removed_before_join = false;
     for buffered in load_invite_buffer(&storage, group_id)? {
         match session.process(&buffered) {
             Ok(GroupInbound::Application(application)) => {
-                if let Ok(GroupPayload::Roster { devices }) =
-                    grouptext::decode(&application.plaintext)
-                {
-                    roster_devices = Some(devices);
+                let sender = String::from_utf8_lossy(&application.sender_identity).to_string();
+                match grouptext::decode(&application.plaintext) {
+                    Ok(GroupPayload::Roster { devices }) => roster_devices = Some(devices),
+                    Ok(GroupPayload::Text { text }) => pending_texts.push((sender, text)),
+                    Ok(GroupPayload::Leave) | Err(_) => {}
                 }
             }
-            Ok(_) => {}
+            Ok(GroupInbound::RemovedSelf) => {
+                removed_before_join = true;
+                break;
+            }
+            Ok(GroupInbound::Updated) => {}
             Err(error) => eprintln!("[gruppe {group_id}] gepufferte Hülle übersprungen: {error}"),
         }
     }
+
+    if removed_before_join {
+        let member = session.forget()?;
+        save_member_state(&storage, &member.export_state()?)?;
+        forget_invite(&storage, group_id)?;
+        return Err(format!(
+            "Die Einladung zu Gruppe {group_id} ist nicht mehr gültig (du wurdest inzwischen \
+             wieder entfernt). Sie wurde verworfen."
+        ));
+    }
+
     save_member_state(&storage, &session.export_state()?)?;
     if let Some(devices) = roster_devices {
         save_roster(&storage, group_id, &devices)?;
@@ -2036,6 +2068,10 @@ async fn group_accept(args: &[String]) -> Result<(), String> {
         members.len(),
         members.join(", ")
     );
+    // Vor der Annahme gesendete Gesprächs-Texte zeigen (der Reihe nach).
+    for (sender, text) in pending_texts {
+        println!("[gruppe {group_id}] {sender}: {text}");
+    }
     Ok(())
 }
 

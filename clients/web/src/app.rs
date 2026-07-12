@@ -294,9 +294,13 @@ const GROUPS_INDEX_KEY: &str = "groups/index";
 /// Ablage-Schlüssel der offenen Einladungen (Gruppen-IDs, deren Welcome
 /// vorgemerkt, aber noch nicht angenommen ist), Konvention wie im CLI.
 const INVITES_INDEX_KEY: &str = "invites/index";
+/// Höchstzahl gleichzeitig offener Einladungen (gegen das Fluten der
+/// Ablage und der Banner-Liste), wie im CLI. Neue Einladungen darüber
+/// werden verworfen, bis bestehende angenommen oder abgelehnt sind.
+const MAX_PENDING_INVITES: usize = 16;
 /// Höchstzahl gepufferter Hüllen je offener Einladung (gegen das Fluten
 /// der Ablage vor einer Ablehnung), wie im CLI.
-const INVITE_BUFFER_MAX: usize = 64;
+const INVITE_BUFFER_MAX: usize = 32;
 /// Wie viele MLS-KeyPackages je Anmeldung nachgelegt werden (das
 /// Verzeichnis konsumiert je Einladung eines), wie beim CLI.
 /// Zielbestand ungenutzter MLS-KeyPackages im Verzeichnis (nur bis hierher
@@ -335,6 +339,10 @@ fn remember_invite(
 ) -> Result<bool, String> {
     let mut invites = load_invites(storage);
     if invites.iter().any(|id| id == group_id) {
+        return Ok(false);
+    }
+    // Deckel gegen das Fluten (siehe MAX_PENDING_INVITES).
+    if invites.len() >= MAX_PENDING_INVITES {
         return Ok(false);
     }
     storage
@@ -2171,23 +2179,60 @@ fn accept_invite(
         .map_err(|e| format!("Beitritt scheitert: {e}"))?;
     save_member_state(storage, &session.export_state()?)?;
 
+    // Gepufferten Verkehr nachspielen: Roster (zum Senden nötig),
+    // Gesprächs-Texte (sonst verloren) und fremde Commits. Ein Commit, der
+    // uns schon wieder entfernt, macht die Einladung wertlos.
     let mut roster_devices = None;
+    let mut pending_texts: Vec<(String, String)> = Vec::new();
+    let mut removed_before_join = false;
     for buffered in load_invite_buffer(storage, group_id)? {
         match session.process(&buffered) {
             Ok(GroupInbound::Application(application)) => {
-                if let Ok(GroupPayload::Roster { devices }) =
-                    grouptext::decode(&application.plaintext)
-                {
-                    roster_devices = Some(devices);
+                let sender = String::from_utf8_lossy(&application.sender_identity).to_string();
+                match grouptext::decode(&application.plaintext) {
+                    Ok(GroupPayload::Roster { devices }) => roster_devices = Some(devices),
+                    Ok(GroupPayload::Text { text }) => pending_texts.push((sender, text)),
+                    Ok(GroupPayload::Leave) | Err(_) => {}
                 }
             }
-            Ok(_) => {}
+            Ok(GroupInbound::RemovedSelf) => {
+                removed_before_join = true;
+                break;
+            }
+            Ok(GroupInbound::Updated) => {}
             Err(error) => leptos::logging::warn!("gepufferte Hülle übersprungen: {error}"),
         }
     }
+
+    if removed_before_join {
+        let member = session.forget()?;
+        save_member_state(storage, &member.export_state()?)?;
+        forget_invite(storage, group_id)?;
+        return Err(
+            "Die Einladung ist nicht mehr gültig (du wurdest inzwischen wieder entfernt)."
+                .to_string(),
+        );
+    }
+
     save_member_state(storage, &session.export_state()?)?;
     if let Some(devices) = roster_devices {
         save_roster(storage, group_id, &devices)?;
+    }
+    // Vor der Annahme gesendete Texte in den Verlauf legen (der Reihe nach),
+    // damit sie im Chat erscheinen statt verloren zu gehen.
+    let chat_key = group_chat_key(group_id);
+    for (sender, text) in pending_texts {
+        record_message(
+            storage,
+            &chat_key,
+            StoredLine {
+                from: sender,
+                text,
+                at: now_unix(),
+                report_id: None,
+            },
+            false,
+        );
     }
 
     let members: Vec<String> = session
@@ -3908,7 +3953,13 @@ fn App() -> impl IntoView {
                         set_status.set("Einladung angenommen.".to_string());
                         open_chat(key);
                     }
-                    Err(error) => set_status.set(format!("Annehmen: {error}")),
+                    Err(error) => {
+                        // Auch die „schon wieder entfernt"-Ablehnung hat die
+                        // Einladung in der Ablage verworfen: die Banner-Liste
+                        // aus der Ablage nachziehen.
+                        set_invites.set(load_invites(&storage));
+                        set_status.set(format!("Annehmen: {error}"));
+                    }
                 }
                 set_busy.set(false);
             });
