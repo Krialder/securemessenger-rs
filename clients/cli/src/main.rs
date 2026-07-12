@@ -35,7 +35,7 @@ use client_app::prekeys::{
 use client_app::protocol_store::{has_own_identity, store_own_identity, PersistentProtocolStore};
 use client_app::storage::{FileStorage, KeyValueStorage as _};
 use client_app::{wire, IdentityClient, NewAccount};
-use client_core::group::{GroupMember, GroupSession};
+use client_core::group::{GroupInbound, GroupMember, GroupSession};
 use client_core::libsignal_protocol::ProtocolAddress;
 use client_core::onetoone::Device;
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -143,6 +143,8 @@ async fn run() -> Result<(), String> {
         "group-create" => group_create(&args[1..]).await,
         "groups" => groups_list(),
         "group-send" => group_send(&args[1..]).await,
+        "group-remove" => group_remove(&args[1..]).await,
+        "group-leave" => group_leave(&args[1..]).await,
         "send" => send(&args[1..]).await,
         "recv" => recv().await,
         "listen" => listen(&args[1..]).await,
@@ -1553,9 +1555,6 @@ async fn group_create(args: &[String]) -> Result<(), String> {
     let member = load_or_new_member(&storage, &profile.handle)?;
     let mut session = GroupSession::create(member, group_id.as_bytes())?;
     let outcome = session.add_members(&invite_blobs)?;
-    // Zustand VOR dem Verteilen sichern: bricht der Prozess nach dem
-    // Commit ab, kennt die Ablage die Gruppe trotzdem schon.
-    save_member_state(&storage, &session.export_state()?)?;
 
     let welcome_fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &profile.handle)
         .map(|device| {
@@ -1567,10 +1566,17 @@ async fn group_create(args: &[String]) -> Result<(), String> {
             })
         })
         .collect::<Result<_, String>>()?;
+    // Erst senden, dann anwenden: nimmt der Dienst den Commit nicht an,
+    // wird der vorgemerkte Zustand gar nicht erst abgelegt (die Gruppe
+    // ist beim Dienst dann angelegt, aber ohne Mitglieder-Commit, und ein
+    // neuer Versuch kann sie überschreiben). Der Handshake ist signierter
+    // Klartext, ein verworfener Commit hinterlässt kein Schlüsselmaterial.
     delivery
         .group_commit(&token, &group_id, 0, &members, &welcome_fanout)
         .await
         .map_err(|e| e.to_string())?;
+    session.merge_pending()?;
+    save_member_state(&storage, &session.export_state()?)?;
 
     // Der Geräte-Roster als erste Anwendungsnachricht: Beigetretene
     // erfahren daraus, an welche Geräte sie ihre Hüllen adressieren
@@ -1665,6 +1671,174 @@ fn delivery_client() -> DeliveryClient {
     DeliveryClient::new(delivery_url())
 }
 
+/// `sm group-remove <gruppen-id> <handle>`: entfernt ein Mitglied mit
+/// MLS-Neuschlüsseln. Der Remove-Commit schaltet die Gruppe in eine neue
+/// Epoche, die dem Entfernten verschlossen bleibt; das ist die Antwort
+/// auf ein kompromittiertes oder revoziertes Gerät eines Mitglieds. Der
+/// Commit geht auch an die Geräte des Entfernten, damit sein Client die
+/// Entfernung erkennt und lokal aufräumt; danach bekommt die Rest-Gruppe
+/// einen frischen Roster.
+async fn group_remove(args: &[String]) -> Result<(), String> {
+    let [group_id, handle] = args else {
+        return Err("Aufruf: sm group-remove <gruppen-id> <handle>".to_string());
+    };
+    let profile = load_profile()?;
+    if handle == &profile.handle {
+        return Err(
+            "Sich selbst entfernen geht nicht (RFC 9420 verbietet den Commit der eigenen \
+             Entfernung); zum Austreten 'sm group-leave' nutzen."
+                .to_string(),
+        );
+    }
+    let token = access_token(&profile)?;
+    let storage = open_storage()?;
+    let member = load_or_new_member(&storage, &profile.handle)?;
+    let Some(mut session) = GroupSession::load(member, group_id.as_bytes())? else {
+        return Err(format!(
+            "Gruppe {group_id} ist in der lokalen Ablage unbekannt."
+        ));
+    };
+    let old_roster = load_roster(&storage, group_id)?;
+    // Die Server-Epoche läuft mit der MLS-Epoche im Gleichschritt (jeder
+    // Commit geht über den Dienst); der CAS-Vertrag verlangt die aktuelle.
+    let from_epoch = session.epoch();
+    // Die verbleibende Mitgliederliste (der Server ersetzt damit seine
+    // Gerätemenge): die aktuellen Identitäten ohne den Entfernten. Vor
+    // merge_pending trägt member_identities noch alle.
+    let members: Vec<String> = session
+        .member_identities()
+        .into_iter()
+        .map(|identity| String::from_utf8_lossy(&identity).to_string())
+        .filter(|m| m != handle)
+        .collect();
+    // Commit bauen (nur VORGEMERKT, nicht angewandt, nicht gesichert).
+    let commit = session.remove_members(&[handle.as_bytes().to_vec()])?;
+
+    // Der Commit geht an ALLE bisherigen Geräte außer den eigenen, auch
+    // an die des Entfernten (Erkennen + Aufräumen).
+    let commit_fanout: Vec<GroupOutgoing> = fanout_targets(&old_roster, &profile.handle)
+        .map(|device| {
+            Ok(GroupOutgoing {
+                id: new_uuid(),
+                device_id: device.device_id.clone(),
+                envelope: wire::seal_group(group_id, &commit).map_err(|e| e.to_string())?,
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    // Senden, dann anwenden. Lehnt der Dienst ab (409, ein anderes
+    // Mitglied war schneller) oder scheitert der Versand, wird NICHTS
+    // gesichert: der lokale Zustand bleibt bei Epoche N (kein Fork), und
+    // ein 'sm recv' wendet den Gewinner-Commit an. Würde man vorher
+    // anwenden und ablegen, läge die eigene Epoche für immer neben der
+    // Dienst-Wahrheit.
+    delivery_client()
+        .group_commit(&token, group_id, from_epoch, &members, &commit_fanout)
+        .await
+        .map_err(|e| {
+            format!("{e} (bei stale_epoch: 'sm recv' holt den Stand nach, dann erneut entfernen)")
+        })?;
+    session.merge_pending()?;
+    save_member_state(&storage, &session.export_state()?)?;
+
+    // Den frischen Roster (ohne den Entfernten) SOFORT lokal ablegen:
+    // scheitert die Roster-Nachricht unten, sind die Empfänger trotzdem
+    // selbst-heilend (sie filtern beim Verarbeiten des Commits die Geräte
+    // ausgeschiedener Handles heraus), und der eigene Roster stimmt schon.
+    let new_roster: Vec<RosterDevice> = old_roster
+        .into_iter()
+        .filter(|device| &device.handle != handle)
+        .collect();
+    save_roster(&storage, group_id, &new_roster)?;
+    remember_group(
+        &storage,
+        GroupEntry {
+            id: group_id.clone(),
+            members: members.clone(),
+        },
+    )?;
+    println!(
+        "{handle} entfernt; die Gruppe ist neu geschlüsselt ({} Mitglieder: {})",
+        members.len(),
+        members.join(", ")
+    );
+
+    // Frischer Roster an die Rest-Gruppe (best effort, siehe oben).
+    let roster_blob = session.create_message(&grouptext::encode_roster(&new_roster))?;
+    save_member_state(&storage, &session.export_state()?)?;
+    let roster_fanout: Vec<GroupOutgoing> = fanout_targets(&new_roster, &profile.handle)
+        .map(|device| {
+            Ok(GroupOutgoing {
+                id: new_uuid(),
+                device_id: device.device_id.clone(),
+                envelope: wire::seal_group(group_id, &roster_blob).map_err(|e| e.to_string())?,
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    if !roster_fanout.is_empty() {
+        if let Err(error) = delivery_client()
+            .group_messages(&token, group_id, &roster_fanout)
+            .await
+        {
+            eprintln!(
+                "  (Roster-Nachricht nicht zugestellt: {error}; die Empfänger heilen den \
+                 Roster beim Verarbeiten des Entfernungs-Commits selbst.)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `sm group-leave <gruppen-id>`: verlässt die Gruppe lokal. Schickt den
+/// Verbliebenen eine Ansage und löscht dann den eigenen Gruppenzustand
+/// samt lokaler Einträge. Kryptografisch entfernt bleibt man erst, wenn
+/// ein verbleibendes Mitglied den Remove-Commit setzt (`group-remove`),
+/// denn RFC 9420 verbietet den Commit der eigenen Entfernung; die Ansage
+/// fordert genau dazu auf.
+async fn group_leave(args: &[String]) -> Result<(), String> {
+    let [group_id] = args else {
+        return Err("Aufruf: sm group-leave <gruppen-id>".to_string());
+    };
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    let storage = open_storage()?;
+    let member = load_or_new_member(&storage, &profile.handle)?;
+    let Some(mut session) = GroupSession::load(member, group_id.as_bytes())? else {
+        return Err(format!(
+            "Gruppe {group_id} ist in der lokalen Ablage unbekannt."
+        ));
+    };
+    let roster = load_roster(&storage, group_id)?;
+    let blob = session.create_message(&grouptext::encode_leave())?;
+    save_member_state(&storage, &session.export_state()?)?;
+    let fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &profile.handle)
+        .map(|device| {
+            Ok(GroupOutgoing {
+                id: new_uuid(),
+                device_id: device.device_id.clone(),
+                envelope: wire::seal_group(group_id, &blob).map_err(|e| e.to_string())?,
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    if !fanout.is_empty() {
+        delivery_client()
+            .group_messages(&token, group_id, &fanout)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let member = session.forget()?;
+    save_member_state(&storage, &member.export_state()?)?;
+    let mut index = load_group_index(&storage)?;
+    index.retain(|g| &g.id != group_id);
+    save_group_index(&storage, &index)?;
+    let _ = storage.borrow_mut().remove(&roster_key(group_id));
+    println!(
+        "Gruppe verlassen und lokal vergessen. Kryptografisch entfernt dich erst der \
+         Remove-Commit eines verbleibenden Mitglieds ('sm group-remove {group_id} {}').",
+        profile.handle
+    );
+    Ok(())
+}
+
 /// Die Zustell-Ziele aus einem Roster: alle Geräte AUSSER den eigenen
 /// (das eigene MLS-Leaf kann die eigene Nachricht nicht entschlüsseln,
 /// eine Kopie an sich selbst wäre nur eine Fehlermeldung beim Abholen).
@@ -1692,9 +1866,9 @@ fn handle_group_envelope(
     match GroupSession::load(member, group_id.as_bytes())? {
         Some(mut session) => {
             let inbound = session.process(blob)?;
-            save_member_state(storage, &session.export_state()?)?;
             match inbound {
-                Some(application) => {
+                GroupInbound::Application(application) => {
+                    save_member_state(storage, &session.export_state()?)?;
                     let sender = String::from_utf8_lossy(&application.sender_identity).to_string();
                     match grouptext::decode(&application.plaintext).map_err(|e| e.to_string())? {
                         GroupPayload::Text { text } => {
@@ -1707,9 +1881,64 @@ fn handle_group_envelope(
                                 devices.len()
                             );
                         }
+                        GroupPayload::Leave => {
+                            println!(
+                                "[gruppe {group_id}] {sender} verlässt die Gruppe. Kryptografisch \
+                                 entfernt erst 'sm group-remove {group_id} {sender}'."
+                            );
+                        }
                     }
                 }
-                None => println!("[gruppe {group_id}] Gruppen-Update angewandt"),
+                // Fremder Commit: die Mitgliederliste kann sich geändert
+                // haben, den lokalen Eintrag nachführen.
+                GroupInbound::Updated => {
+                    save_member_state(storage, &session.export_state()?)?;
+                    let members: Vec<String> = session
+                        .member_identities()
+                        .into_iter()
+                        .map(|identity| String::from_utf8_lossy(&identity).to_string())
+                        .collect();
+                    // Roster selbst-heilen: Geräte ausgeschiedener Handles
+                    // fallen heraus, auch wenn die neue Roster-Nachricht
+                    // (die der Committer separat schickt) nie ankommt. Sonst
+                    // adressierte ein späterer Versand ein Gerät außerhalb
+                    // der Gruppen-Gerätemenge, und der Dienst wiese den
+                    // ganzen Stapel ab (404 unknown_device).
+                    if let Ok(roster) = load_roster(storage, group_id) {
+                        let pruned: Vec<RosterDevice> = roster
+                            .into_iter()
+                            .filter(|device| members.iter().any(|m| m == &device.handle))
+                            .collect();
+                        save_roster(storage, group_id, &pruned)?;
+                    }
+                    remember_group(
+                        storage,
+                        GroupEntry {
+                            id: group_id.to_string(),
+                            members: members.clone(),
+                        },
+                    )?;
+                    println!(
+                        "[gruppe {group_id}] Gruppen-Update angewandt ({} Mitglieder: {})",
+                        members.len(),
+                        members.join(", ")
+                    );
+                }
+                // Der Commit hat DIESES Mitglied entfernt: Zustand und
+                // lokale Einträge aufräumen; die neue Epoche ist ohnehin
+                // unlesbar (MLS-Neuschlüsseln), und genau das ist der Zweck.
+                GroupInbound::RemovedSelf => {
+                    let member = session.forget()?;
+                    save_member_state(storage, &member.export_state()?)?;
+                    let mut index = load_group_index(storage)?;
+                    index.retain(|g| g.id != group_id);
+                    save_group_index(storage, &index)?;
+                    let _ = storage.borrow_mut().remove(&roster_key(group_id));
+                    println!(
+                        "[gruppe {group_id}] Du wurdest aus der Gruppe entfernt; der lokale \
+                         Zustand ist gelöscht."
+                    );
+                }
             }
             Ok(())
         }
@@ -1800,6 +2029,8 @@ fn print_usage() {
          \x20 group-create <mitglied>...     MLS-Gruppe mit sich + den Handles gruenden\n\
          \x20 groups                         lokale Gruppenliste (ID + Mitglieder)\n\
          \x20 group-send <id> <text>         E2EE-Gruppennachricht senden\n\
+         \x20 group-remove <id> <handle>     Mitglied entfernen (MLS-Neuschluesseln)\n\
+         \x20 group-leave <id>               Gruppe verlassen (lokal + Ansage)\n\
          \x20 send <handle> <text> [--ttl s] [--sealed]  E2EE senden (--ttl: verschwindet; --sealed: ohne Absender-Klartext)\n\
          \x20 recv                           wartende Nachrichten abholen und entschlüsseln\n\
          \x20 listen [--once]                Hinweiskanal halten und bei Hinweisen abholen\n\

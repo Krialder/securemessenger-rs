@@ -694,5 +694,57 @@ async fn group_chat_over_separate_cli_processes() {
         "stdout war: {bert_reads}"
     );
 
+    // Entfernen mit MLS-Neuschlüsseln: anna wirft carl hinaus. carl
+    // erkennt die Entfernung am Commit und räumt lokal auf; bert führt
+    // nur seine Mitgliederliste nach.
+    let removed = anna.run(&["group-remove", &group_id, "carl"]);
+    assert!(
+        removed.contains("neu geschlüsselt") && removed.contains("anna, bert"),
+        "stdout war: {removed}"
+    );
+    let carl_out = carl.run(&["recv"]);
+    assert!(
+        carl_out.contains("Du wurdest aus der Gruppe entfernt"),
+        "stdout war: {carl_out}"
+    );
+    let carl_groups = carl.run(&["groups"]);
+    assert!(
+        !carl_groups.contains(&group_id),
+        "carls Gruppenliste muss leer sein, stdout war: {carl_groups}"
+    );
+    let bert_update = bert.run(&["recv"]);
+    assert!(
+        bert_update.contains("Gruppen-Update angewandt") && bert_update.contains("anna, bert"),
+        "stdout war: {bert_update}"
+    );
+
+    // Die neue Epoche bleibt carl verschlossen: die nächste Nachricht
+    // erreicht nur noch bert (carls Gerät ist aus der Gruppen-Gerätemenge,
+    // sein lokaler Zustand ist weg).
+    anna.run(&["group-send", &group_id, "ohne carl"]);
+    let bert_secret = bert.run(&["recv"]);
+    assert!(
+        bert_secret.contains("anna: ohne carl"),
+        "stdout war: {bert_secret}"
+    );
+    let carl_after = carl.run(&["recv"]);
+    assert!(
+        !carl_after.contains("ohne carl"),
+        "carl darf die Nachricht der neuen Epoche nicht sehen, stdout war: {carl_after}"
+    );
+
+    // Verlassen: bert sagt es an und vergisst lokal; anna sieht die
+    // Ansage samt Hinweis auf den Remove-Commit.
+    let left = bert.run(&["group-leave", &group_id]);
+    assert!(
+        left.contains("verlassen und lokal vergessen"),
+        "stdout war: {left}"
+    );
+    let anna_notice = anna.run(&["recv"]);
+    assert!(
+        anna_notice.contains("bert verlässt die Gruppe"),
+        "stdout war: {anna_notice}"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -4,7 +4,7 @@
 //! dass Sitzungsaufbau, Nachrichtenumlauf, Out-of-Order und Gruppen
 //! über unsere Wrapper funktionieren.
 
-use client_core::group::{GroupMember, GroupSession, CIPHERSUITE};
+use client_core::group::{GroupApplication, GroupInbound, GroupMember, GroupSession, CIPHERSUITE};
 use client_core::libsignal_protocol::{CiphertextMessage, SignalProtocolError};
 use client_core::onetoone::Device;
 use client_core::openmls::prelude::tls_codec::*;
@@ -277,6 +277,16 @@ fn mls_group_roundtrip_with_pinned_ciphersuite() {
     }
 }
 
+/// Entpackt eine Anwendungsnachricht aus dem `process`-Ergebnis; alles
+/// andere ist im jeweiligen Test ein Fehler.
+fn expect_application(inbound: GroupInbound) -> GroupApplication {
+    match inbound {
+        GroupInbound::Application(application) => application,
+        GroupInbound::Updated => panic!("Anwendungsnachricht erwartet, kam Updated"),
+        GroupInbound::RemovedSelf => panic!("Anwendungsnachricht erwartet, kam RemovedSelf"),
+    }
+}
+
 /// Die Byte-Ein-Byte-Aus-Schnittstelle `GroupSession`, wie sie der Client
 /// über den Zustelldienst nutzt: alle Blobs sind opak, nichts an der
 /// Schnittstelle setzt libsignal/OpenMLS-Typen voraus. Beweist einen
@@ -293,6 +303,10 @@ fn group_session_byte_interface_roundtrip() {
     let mut alice = GroupSession::create(alice_member, b"gruppe-bytes").unwrap();
     assert_eq!(alice.member_count(), 1);
     let outcome = alice.add_members(&[bob_key_package]).unwrap();
+    // Der Commit ist erst vorgemerkt (Epoche unverändert), bis der
+    // Zustelldienst ihn annimmt; hier: sofort anwenden.
+    assert_eq!(alice.member_count(), 1);
+    alice.merge_pending().unwrap();
     assert_eq!(alice.member_count(), 2);
 
     // Bob tritt über den Welcome-Blob mit derselben Ablage bei; die
@@ -305,11 +319,11 @@ fn group_session_byte_interface_roundtrip() {
     // Anwendungsnachricht hin und zurück, nur über Blobs; der Absender
     // kommt aus der von MLS geprüften Credential, nicht aus der Hülle.
     let ciphertext = alice.create_message(b"hallo gruppe").unwrap();
-    let inbound = bob.process(&ciphertext).unwrap().expect("Anwendung");
+    let inbound = expect_application(bob.process(&ciphertext).unwrap());
     assert_eq!(inbound.plaintext, b"hallo gruppe");
     assert_eq!(inbound.sender_identity, b"alice");
     let reply = bob.create_message(b"hallo zurueck").unwrap();
-    let inbound = alice.process(&reply).unwrap().expect("Anwendung");
+    let inbound = expect_application(alice.process(&reply).unwrap());
     assert_eq!(inbound.plaintext, b"hallo zurueck");
     assert_eq!(inbound.sender_identity, b"bob");
 
@@ -336,6 +350,8 @@ fn group_session_survives_restart_via_exported_state() {
     let alice_member = GroupMember::new(b"alice").unwrap();
     let mut alice = GroupSession::create(alice_member, b"gruppe-neustart").unwrap();
     let outcome = alice.add_members(&[bob_key_package]).unwrap();
+    // Vorgemerkten Commit anwenden (der Dienst hätte ihn angenommen).
+    alice.merge_pending().unwrap();
 
     // "Neustart" auf Bobs Seite: Mitglied aus dem Blob, Beitritt klappt,
     // weil die KeyPackage-Privatteile im wiederhergestellten Zustand liegen.
@@ -343,7 +359,7 @@ fn group_session_survives_restart_via_exported_state() {
     let mut bob = GroupSession::join_group(bob_restored, &outcome.welcome).unwrap();
     let first = alice.create_message(b"vor dem neustart").unwrap();
     assert_eq!(
-        bob.process(&first).unwrap().expect("Anwendung").plaintext,
+        expect_application(bob.process(&first).unwrap()).plaintext,
         b"vor dem neustart"
     );
     // Export NACH der letzten Operation beider Seiten: auch das Erzeugen
@@ -371,12 +387,12 @@ fn group_session_survives_restart_via_exported_state() {
 
     let second = alice.create_message(b"nach dem neustart").unwrap();
     assert_eq!(
-        bob.process(&second).unwrap().expect("Anwendung").plaintext,
+        expect_application(bob.process(&second).unwrap()).plaintext,
         b"nach dem neustart"
     );
     let reply = bob.create_message(b"zurueck nach neustart").unwrap();
     assert_eq!(
-        alice.process(&reply).unwrap().expect("Anwendung").plaintext,
+        expect_application(alice.process(&reply).unwrap()).plaintext,
         b"zurueck nach neustart"
     );
 
@@ -385,6 +401,113 @@ fn group_session_survives_restart_via_exported_state() {
     assert!(GroupSession::load(stranger, b"gibt-es-nicht")
         .unwrap()
         .is_none());
+}
+
+/// Mitglied entfernen mit MLS-Neuschlüsseln: der Entfernte erkennt seine
+/// Entfernung am Commit (`RemovedSelf`), kann NICHTS mehr aus der neuen
+/// Epoche lesen, und seine Alt-Epochen-Nachrichten weisen die
+/// Verbliebenen ab. Genau die Eigenschaft, um die es beim Entfernen geht
+/// (etwa nach der Revocation eines Geräts).
+#[test]
+fn removed_member_is_rekeyed_out() {
+    // Dreiergruppe: alice gründet, bob und carol treten bei.
+    let bob_member = GroupMember::new(b"bob").unwrap();
+    let bob_kp = bob_member.key_package_blob().unwrap();
+    let carol_member = GroupMember::new(b"carol").unwrap();
+    let carol_kp = carol_member.key_package_blob().unwrap();
+    let alice_member = GroupMember::new(b"alice").unwrap();
+    let mut alice = GroupSession::create(alice_member, b"gruppe-remove").unwrap();
+    let outcome = alice.add_members(&[bob_kp, carol_kp]).unwrap();
+    alice.merge_pending().unwrap();
+    let mut bob = GroupSession::join_group(bob_member, &outcome.welcome).unwrap();
+    let mut carol = GroupSession::join_group(carol_member, &outcome.welcome).unwrap();
+    assert_eq!(alice.member_count(), 3);
+
+    // alice entfernt carol; der Commit ist vorgemerkt (Epoche noch
+    // unverändert), bis der Dienst ihn annimmt. Erst dann anwenden.
+    let commit = alice.remove_members(&[b"carol".to_vec()]).unwrap();
+    assert_eq!(alice.member_count(), 3, "vor merge_pending unverändert");
+    alice.merge_pending().unwrap();
+    assert_eq!(alice.member_count(), 2);
+    assert!(matches!(
+        bob.process(&commit).unwrap(),
+        GroupInbound::Updated
+    ));
+    assert_eq!(bob.member_count(), 2);
+    assert!(matches!(
+        carol.process(&commit).unwrap(),
+        GroupInbound::RemovedSelf
+    ));
+
+    // Die neue Epoche bleibt carol verschlossen: bob liest, carol nicht
+    // (ihre Gruppe ist beendet, die Verarbeitung scheitert).
+    let secret = alice.create_message(b"ohne carol").unwrap();
+    assert_eq!(
+        expect_application(bob.process(&secret).unwrap()).plaintext,
+        b"ohne carol"
+    );
+    assert!(carol.process(&secret).is_err());
+
+    // carols Aufräumen: forget löscht den Gruppenzustand aus der Ablage,
+    // ein Laden über die ID findet nichts mehr.
+    let carol_member = carol.forget().unwrap();
+    let carol_state = carol_member.export_state().unwrap();
+    let carol_restored = GroupMember::restore(b"carol", &carol_state).unwrap();
+    assert!(GroupSession::load(carol_restored, b"gruppe-remove")
+        .unwrap()
+        .is_none());
+
+    // Ein Unbeteiligter kann niemanden entfernen: die Identität fehlt.
+    assert!(alice.remove_members(&[b"gibt-es-nicht".to_vec()]).is_err());
+}
+
+/// Der Kern der Commit-Sicherheit: ein Commit wird erst NACH der Annahme
+/// durch den Zustelldienst angewandt. Verliert man das Wettrennen (409,
+/// ein anderes Mitglied war schneller), bleibt die eigene Epoche
+/// unverändert (kein Fork), und der Gewinner-Commit lässt sich anwenden.
+/// Ohne diese Trennung läge die eigene Epoche für immer neben der
+/// Dienst-Wahrheit, und keine Entfernung ginge mehr durch (auch keine
+/// sicherheitskritische nach einer Geräte-Kompromittierung).
+#[test]
+fn losing_a_commit_race_recovers_without_forking() {
+    let bob_member = GroupMember::new(b"bob").unwrap();
+    let bob_kp = bob_member.key_package_blob().unwrap();
+    let carol_member = GroupMember::new(b"carol").unwrap();
+    let carol_kp = carol_member.key_package_blob().unwrap();
+    let alice_member = GroupMember::new(b"alice").unwrap();
+    let mut alice = GroupSession::create(alice_member, b"gruppe-race").unwrap();
+    let outcome = alice.add_members(&[bob_kp, carol_kp]).unwrap();
+    alice.merge_pending().unwrap();
+    let mut bob = GroupSession::join_group(bob_member, &outcome.welcome).unwrap();
+    let start_epoch = alice.epoch();
+
+    // Beide bauen gleichzeitig einen Remove-Commit für carol. bob gewinnt
+    // beim Dienst und wendet an; alice bekommt ein 409 und wendet NICHT an
+    // (sie ruft merge_pending nie auf, ihr Commit bleibt vorgemerkt).
+    let _alices_commit = alice.remove_members(&[b"carol".to_vec()]).unwrap();
+    let bobs_commit = bob.remove_members(&[b"carol".to_vec()]).unwrap();
+    bob.merge_pending().unwrap();
+
+    // Kein Fork: alices Epoche ist unverändert. Sie verarbeitet bobs
+    // Gewinner-Commit; ihr vorgemerkter eigener wird dabei verworfen.
+    assert_eq!(alice.epoch(), start_epoch, "kein Fork vor der Annahme");
+    assert!(matches!(
+        alice.process(&bobs_commit).unwrap(),
+        GroupInbound::Updated
+    ));
+    assert_eq!(
+        alice.epoch(),
+        bob.epoch(),
+        "beide auf derselben neuen Epoche"
+    );
+    assert_eq!(alice.member_count(), 2);
+
+    // Der Ratchet läuft weiter: bob sendet in der neuen Epoche, alice liest.
+    let msg = bob.create_message(b"nach dem rennen").unwrap();
+    assert_eq!(
+        expect_application(alice.process(&msg).unwrap()).plaintext,
+        b"nach dem rennen"
+    );
 }
 
 /// Manipulierte oder abgeschnittene Zustands-Blobs werden abgewiesen,

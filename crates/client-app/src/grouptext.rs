@@ -44,6 +44,11 @@ pub enum GroupPayload {
     Text { text: String },
     /// Der Geräte-Roster der Gruppe (vom Gründer bzw. letzten Committer).
     Roster { devices: Vec<RosterDevice> },
+    /// Die Ansage des Absenders, dass er die Gruppe verlässt. Nur eine
+    /// Information: kryptografisch entfernt ihn erst der Remove-Commit
+    /// eines verbleibenden Mitglieds (RFC 9420 verbietet den Commit der
+    /// eigenen Entfernung).
+    Leave,
 }
 
 /// Baut den Klartext-Payload eines Gesprächstexts (wird anschließend von
@@ -69,6 +74,17 @@ pub fn encode_roster(devices: &[RosterDevice]) -> Vec<u8> {
     serde_json::to_vec(&blob).expect("PayloadBlob ist immer serialisierbar")
 }
 
+/// Baut den Klartext-Payload der Verlassen-Ansage.
+pub fn encode_leave() -> Vec<u8> {
+    let blob = PayloadBlob {
+        v: GROUP_PAYLOAD_VERSION.to_string(),
+        kind: "leave".to_string(),
+        text: String::new(),
+        devices: Vec::new(),
+    };
+    serde_json::to_vec(&blob).expect("PayloadBlob ist immer serialisierbar")
+}
+
 /// Liest den Inhalt eines entschlüsselten Gruppen-Payloads.
 pub fn decode(payload: &[u8]) -> Result<GroupPayload, ClientError> {
     let blob: PayloadBlob = serde_json::from_slice(payload)
@@ -84,6 +100,7 @@ pub fn decode(payload: &[u8]) -> Result<GroupPayload, ClientError> {
         "roster" => Ok(GroupPayload::Roster {
             devices: blob.devices,
         }),
+        "leave" => Ok(GroupPayload::Leave),
         other => Err(ClientError::Protocol(format!(
             "unbekannter Gruppen-Payload-Typ {other}"
         ))),
@@ -98,7 +115,7 @@ mod tests {
     fn text_roundtrip() {
         match decode(&encode_text("hallo gruppe ä")).unwrap() {
             GroupPayload::Text { text } => assert_eq!(text, "hallo gruppe ä"),
-            GroupPayload::Roster { .. } => panic!("text erwartet"),
+            _ => panic!("text erwartet"),
         }
     }
 
@@ -116,8 +133,16 @@ mod tests {
         ];
         match decode(&encode_roster(&devices)).unwrap() {
             GroupPayload::Roster { devices: got } => assert_eq!(got, devices),
-            GroupPayload::Text { .. } => panic!("roster erwartet"),
+            _ => panic!("roster erwartet"),
         }
+    }
+
+    #[test]
+    fn leave_roundtrip() {
+        assert!(matches!(
+            decode(&encode_leave()).unwrap(),
+            GroupPayload::Leave
+        ));
     }
 
     #[test]

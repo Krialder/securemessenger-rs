@@ -20,7 +20,15 @@ use client_app::delivery::{DeliveryClient, GroupOutgoing};
 use client_app::directory::DirectoryClient;
 use client_app::prekeys::{new_uuid, DirectoryPrekey};
 use client_app::{wire, IdentityClient, NewAccount};
-use client_core::group::{GroupMember, GroupSession};
+use client_core::group::{GroupApplication, GroupInbound, GroupMember, GroupSession};
+
+/// Entpackt eine Anwendungsnachricht aus dem `process`-Ergebnis.
+fn expect_application(inbound: GroupInbound) -> GroupApplication {
+    match inbound {
+        GroupInbound::Application(application) => application,
+        _ => panic!("Anwendungsnachricht erwartet"),
+    }
+}
 use client_core::onetoone::Device;
 
 const INTERNAL_SECRET: &str = "test-internes-secret";
@@ -192,11 +200,11 @@ async fn three_users_exchange_a_group_message_over_real_services() {
     }
 
     // Ein Commit lädt beide neuen Mitglieder ein; der Welcome geht an ihre
-    // Geräte, der Commit-Epochenwechsel serialisiert über den Dienst.
+    // Geräte, der Commit-Epochenwechsel serialisiert über den Dienst. Der
+    // Commit ist erst vorgemerkt; angewandt wird er NACH der Annahme.
     let outcome = alice_group
         .add_members(&invite_blobs)
         .expect("Mitglieder einladen");
-    assert_eq!(alice_group.member_count(), 3);
     let welcome_fanout: Vec<GroupOutgoing> = invited_devices
         .iter()
         .map(|device_id| GroupOutgoing {
@@ -210,6 +218,9 @@ async fn three_users_exchange_a_group_message_over_real_services() {
         .await
         .expect("Commit");
     assert_eq!(commit.epoch, 1, "Epoche steigt mit dem Commit");
+    // Erst nach der Annahme durch den Dienst anwenden.
+    alice_group.merge_pending().expect("Commit anwenden");
+    assert_eq!(alice_group.member_count(), 3);
     assert_eq!(commit.accepted, 2);
 
     // Bob und Carol holen ihren Welcome ab und treten bei.
@@ -249,10 +260,7 @@ async fn three_users_exchange_a_group_message_over_real_services() {
     for (group, party) in [(&mut bob_group, &bob), (&mut carol_group, &carol)] {
         let blobs = drain_group_blobs(&delivery, &party.access_token).await;
         assert_eq!(blobs.len(), 1, "{} bekommt die Nachricht", party.handle);
-        let inbound = group
-            .process(&blobs[0])
-            .expect("verarbeiten")
-            .expect("Anwendungsnachricht");
+        let inbound = expect_application(group.process(&blobs[0]).expect("verarbeiten"));
         assert_eq!(
             inbound.plaintext, b"hallo gruppe, ende-zu-ende",
             "{} entschlüsselt die Gruppennachricht",
@@ -289,11 +297,7 @@ async fn three_users_exchange_a_group_message_over_real_services() {
     let blobs = drain_group_blobs(&delivery, &bob.access_token).await;
     assert_eq!(blobs.len(), 1, "Bob bekommt die zweite Nachricht");
     assert_eq!(
-        bob_group
-            .process(&blobs[0])
-            .expect("verarbeiten")
-            .expect("Anwendungsnachricht")
-            .plaintext,
+        expect_application(bob_group.process(&blobs[0]).expect("verarbeiten")).plaintext,
         b"nach bobs neustart",
         "der wiederhergestellte Bob liest mit fortgesetztem Ratchet"
     );

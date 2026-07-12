@@ -43,7 +43,7 @@ use client_app::prekeys::{
 use client_app::protocol_store::{store_own_identity, PersistentProtocolStore};
 use client_app::storage::KeyValueStorage as _;
 use client_app::{wire, ClientError, IdentityClient, NewAccount};
-use client_core::group::{GroupMember, GroupSession};
+use client_core::group::{GroupInbound, GroupMember, GroupSession};
 use client_core::libsignal_protocol::{IdentityKeyPair, ProtocolAddress};
 use client_core::onetoone::Device;
 use futures_util::future::{select, Either};
@@ -303,11 +303,31 @@ fn group_id_of(chat_key: &str) -> Option<&str> {
     chat_key.strip_prefix(GROUP_CHAT_PREFIX)
 }
 
-/// Ein Eintrag der lokalen Gruppenliste, Format identisch zum CLI.
+/// Zustand einer Gruppe in der lokalen Liste. `Active` ist der Normalfall
+/// (der Client trägt lebenden MLS-Zustand); `Removed`/`Left` sind
+/// Grabsteine: der MLS-Zustand ist gelöscht, der Chat-Verlauf bleibt
+/// lesbar, aber Senden und Mitglieder-Aktionen sind aus. Als Grabstein
+/// bleibt der Eintrag in der Liste, damit der Anzeigename samt Zusatz
+/// „(entfernt)"/„(verlassen)" auch nach einem Neuladen erhalten ist
+/// (sonst zeigte die Liste den nackten `grp:<uuid>`-Schlüssel).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+enum GroupStatus {
+    #[default]
+    Active,
+    Removed,
+    Left,
+}
+
+/// Ein Eintrag der lokalen Gruppenliste. Das `members`/`id`-Format ist
+/// identisch zum CLI; `status` ergänzt der Web-Client (serde-Default
+/// `active`, damit CLI-geschriebene Einträge ohne Feld lesbar bleiben).
 #[derive(Serialize, Deserialize, Clone)]
 struct GroupEntry {
     id: String,
     members: Vec<String>,
+    #[serde(default)]
+    status: GroupStatus,
 }
 
 fn roster_storage_key(group_id: &str) -> String {
@@ -353,6 +373,26 @@ fn remember_group(storage: &SharedStorage, entry: GroupEntry) -> Result<(), Stri
     storage.borrow_mut().put(GROUPS_INDEX_KEY, &bytes)
 }
 
+/// Setzt eine Gruppe auf einen Grabstein-Zustand (entfernt/verlassen): der
+/// Eintrag bleibt in der Liste (der Anzeigename samt Zusatz überlebt so das
+/// Neuladen), die Mitglieder bleiben fürs Label erhalten, der Status
+/// schaltet die Aktionen ab. Der MLS-Zustand und der Roster sind zu diesem
+/// Zeitpunkt schon gelöscht (`forget`).
+fn tombstone_group(
+    storage: &SharedStorage,
+    group_id: &str,
+    status: GroupStatus,
+) -> Result<(), String> {
+    let mut index = load_group_index(storage);
+    if let Some(entry) = index.iter_mut().find(|g| g.id == group_id) {
+        entry.status = status;
+    }
+    let bytes = serde_json::to_vec(&index).map_err(|e| e.to_string())?;
+    storage.borrow_mut().put(GROUPS_INDEX_KEY, &bytes)?;
+    let _ = storage.borrow_mut().remove(&roster_storage_key(group_id));
+    Ok(())
+}
+
 fn save_roster(
     storage: &SharedStorage,
     group_id: &str,
@@ -390,15 +430,42 @@ fn group_label(members: &[String], own: &str) -> String {
     }
 }
 
-/// Alle Gruppen-Anzeigenamen aus der Ablage, für die Chatliste (Schlüssel
-/// ist der `grp:`-Chat-Schlüssel).
+/// Anzeige-Zustand eines Gruppen-Chats: der Listen-Name, die Mitglieder
+/// (für die Mitgliederliste im Chat-Kopf) und ob die Gruppe vergessen ist
+/// (Grabstein: kein MLS-Zustand mehr, Senden und Mitglieder-Aktionen aus).
+#[derive(Clone)]
+struct GroupUi {
+    label: String,
+    members: Vec<String>,
+    forgotten: bool,
+}
+
+/// Baut den Anzeige-Zustand aus einem Gruppen-Eintrag: bei einem
+/// Grabstein trägt das Label den Zusatz, und `forgotten` schaltet die
+/// Aktionen ab.
+fn group_ui(entry: &GroupEntry, own: &str) -> GroupUi {
+    let base = group_label(&entry.members, own);
+    let (label, forgotten) = match entry.status {
+        GroupStatus::Active => (base, false),
+        GroupStatus::Removed => (format!("{base} (entfernt)"), true),
+        GroupStatus::Left => (format!("{base} (verlassen)"), true),
+    };
+    GroupUi {
+        label,
+        members: entry.members.clone(),
+        forgotten,
+    }
+}
+
+/// Alle Gruppen-Anzeigezustände aus der Ablage, für Chatliste und
+/// Chat-Kopf (Schlüssel ist der `grp:`-Chat-Schlüssel).
 fn load_group_labels(
     storage: &SharedStorage,
     own: &str,
-) -> std::collections::HashMap<String, String> {
+) -> std::collections::HashMap<String, GroupUi> {
     load_group_index(storage)
         .iter()
-        .map(|entry| (group_chat_key(&entry.id), group_label(&entry.members, own)))
+        .map(|entry| (group_chat_key(&entry.id), group_ui(entry, own)))
         .collect()
 }
 
@@ -533,6 +600,17 @@ enum Incoming {
         group_id: String,
         members: Vec<String>,
     },
+    /// Ein fremder Commit hat die Mitgliederliste geändert (Entfernung
+    /// durch ein anderes Mitglied); Label nachführen.
+    GroupUpdated {
+        group_id: String,
+        members: Vec<String>,
+    },
+    /// Ein fremder Commit hat DIESES Mitglied entfernt; der lokale
+    /// Zustand ist schon aufgeräumt, die UI sagt es an.
+    GroupRemovedSelf {
+        group_id: String,
+    },
 }
 
 /// Übersetzt ein entschlüsseltes Self-Sync-Ergebnis in einen `Incoming`.
@@ -560,9 +638,9 @@ fn handle_group_envelope(
     match GroupSession::load(member, group_id.as_bytes())? {
         Some(mut session) => {
             let inbound = session.process(blob)?;
-            save_member_state(storage, &session.export_state()?)?;
             match inbound {
-                Some(application) => {
+                GroupInbound::Application(application) => {
+                    save_member_state(storage, &session.export_state()?)?;
                     let sender = String::from_utf8_lossy(&application.sender_identity).to_string();
                     match grouptext::decode(&application.plaintext).map_err(|e| e.to_string())? {
                         GroupPayload::Text { text } => Ok(Some(Incoming::Group {
@@ -574,10 +652,60 @@ fn handle_group_envelope(
                             save_roster(storage, group_id, &devices)?;
                             Ok(None)
                         }
+                        // Die Ansage erscheint als Zeile im Gruppen-Chat;
+                        // das kryptografische Entfernen bleibt Sache eines
+                        // verbleibenden Mitglieds.
+                        GroupPayload::Leave => Ok(Some(Incoming::Group {
+                            group_id: group_id.to_string(),
+                            from: sender,
+                            text: "(verlässt die Gruppe)".to_string(),
+                        })),
                     }
                 }
-                // Fremder Commit: angewandt, nichts anzuzeigen.
-                None => Ok(None),
+                // Fremder Commit: Mitgliederliste nachführen (der Eintrag
+                // speist die Anzeigenamen), sonst nichts anzuzeigen.
+                GroupInbound::Updated => {
+                    save_member_state(storage, &session.export_state()?)?;
+                    let members: Vec<String> = session
+                        .member_identities()
+                        .into_iter()
+                        .map(|identity| String::from_utf8_lossy(&identity).to_string())
+                        .collect();
+                    // Roster selbst-heilen: Geräte ausgeschiedener Handles
+                    // fallen heraus, auch wenn die neue Roster-Nachricht nie
+                    // ankommt (sonst wiese der Dienst einen späteren Versand
+                    // wegen unknown_device wholesale ab).
+                    if let Ok(roster) = load_roster(storage, group_id) {
+                        let pruned: Vec<RosterDevice> = roster
+                            .into_iter()
+                            .filter(|device| members.iter().any(|m| m == &device.handle))
+                            .collect();
+                        save_roster(storage, group_id, &pruned)?;
+                    }
+                    remember_group(
+                        storage,
+                        GroupEntry {
+                            id: group_id.to_string(),
+                            members: members.clone(),
+                            status: GroupStatus::Active,
+                        },
+                    )?;
+                    Ok(Some(Incoming::GroupUpdated {
+                        group_id: group_id.to_string(),
+                        members,
+                    }))
+                }
+                // Der Commit hat DIESES Mitglied entfernt: Zustand löschen,
+                // die Gruppe als Grabstein markieren (der Verlauf und der
+                // Anzeigename samt „(entfernt)" überleben ein Neuladen).
+                GroupInbound::RemovedSelf => {
+                    let member = session.forget()?;
+                    save_member_state(storage, &member.export_state()?)?;
+                    tombstone_group(storage, group_id, GroupStatus::Removed)?;
+                    Ok(Some(Incoming::GroupRemovedSelf {
+                        group_id: group_id.to_string(),
+                    }))
+                }
             }
         }
         None => {
@@ -597,6 +725,7 @@ fn handle_group_envelope(
                 GroupEntry {
                     id: group_id.to_string(),
                     members: members.clone(),
+                    status: GroupStatus::Active,
                 },
             )?;
             Ok(Some(Incoming::GroupJoined {
@@ -1751,9 +1880,6 @@ async fn create_group_web(
     let member = load_or_new_member(storage, own_handle)?;
     let mut session = GroupSession::create(member, group_id.as_bytes())?;
     let outcome = session.add_members(&invite_blobs)?;
-    // Zustand VOR dem Verteilen sichern: bricht der Ablauf danach ab,
-    // kennt die Ablage die Gruppe trotzdem schon.
-    save_member_state(storage, &session.export_state()?)?;
 
     let welcome_fanout: Vec<GroupOutgoing> = fanout_targets(&roster, own_handle)
         .map(|device| {
@@ -1765,10 +1891,16 @@ async fn create_group_web(
             })
         })
         .collect::<Result<_, String>>()?;
+    // Erst senden, dann anwenden: nimmt der Dienst den Commit nicht an,
+    // wird der vorgemerkte Zustand nicht abgelegt (siehe die Begründung
+    // in client-core::group::add_members). Der Handshake ist signierter
+    // Klartext, ein verworfener Commit hinterlässt kein Schlüsselmaterial.
     delivery
         .group_commit(token, &group_id, 0, &members, &welcome_fanout)
         .await
         .map_err(|e| e.to_string())?;
+    session.merge_pending()?;
+    save_member_state(storage, &session.export_state()?)?;
 
     let roster_blob = session.create_message(&grouptext::encode_roster(&roster))?;
     // Auch das Erzeugen rückt den Sende-Ratchet vor: sichern, BEVOR der
@@ -1794,6 +1926,7 @@ async fn create_group_web(
         GroupEntry {
             id: group_id.clone(),
             members,
+            status: GroupStatus::Active,
         },
     )?;
     Ok(group_id)
@@ -1830,6 +1963,135 @@ async fn send_group_message(
         .group_messages(token, group_id, &fanout)
         .await
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Entfernt ein Mitglied mit MLS-Neuschlüsseln (wie `sm group-remove`):
+/// der Remove-Commit schaltet die Gruppe in eine neue Epoche, die dem
+/// Entfernten verschlossen bleibt; er geht auch an dessen Geräte, damit
+/// der Client dort aufräumt. Danach bekommt die Rest-Gruppe einen
+/// frischen Roster. Liefert die neue Mitgliederliste.
+async fn remove_group_member(
+    storage: &SharedStorage,
+    token: &str,
+    own_handle: &str,
+    group_id: &str,
+    handle: &str,
+) -> Result<Vec<String>, String> {
+    let member = load_or_new_member(storage, own_handle)?;
+    let Some(mut session) = GroupSession::load(member, group_id.as_bytes())? else {
+        return Err("Diese Gruppe ist in der lokalen Ablage unbekannt.".to_string());
+    };
+    let old_roster = load_roster(storage, group_id)?;
+    let from_epoch = session.epoch();
+    // Verbleibende Mitglieder (der Server ersetzt damit die Gerätemenge):
+    // die aktuellen Identitäten ohne den Entfernten. Vor merge_pending
+    // trägt member_identities noch alle.
+    let members: Vec<String> = session
+        .member_identities()
+        .into_iter()
+        .map(|identity| String::from_utf8_lossy(&identity).to_string())
+        .filter(|m| m != handle)
+        .collect();
+    let commit = session.remove_members(&[handle.as_bytes().to_vec()])?;
+
+    let delivery = DeliveryClient::new(delivery_url());
+    let commit_fanout: Vec<GroupOutgoing> = fanout_targets(&old_roster, own_handle)
+        .map(|device| {
+            Ok(GroupOutgoing {
+                id: new_uuid(),
+                device_id: device.device_id.clone(),
+                envelope: wire::seal_group(group_id, &commit).map_err(|e| e.to_string())?,
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    // Senden, dann anwenden. Bei 409 oder Versandfehler wird nichts
+    // gesichert: der lokale Zustand bleibt bei Epoche N (kein Fork), ein
+    // Abruf wendet den Gewinner-Commit an.
+    delivery
+        .group_commit(token, group_id, from_epoch, &members, &commit_fanout)
+        .await
+        .map_err(|e| format!("{e} (bei stale_epoch: erst abrufen, dann erneut entfernen)"))?;
+    session.merge_pending()?;
+    save_member_state(storage, &session.export_state()?)?;
+
+    // Den frischen Roster SOFORT lokal ablegen: scheitert die
+    // Roster-Nachricht unten, heilen die Empfänger den Roster beim
+    // Verarbeiten des Commits selbst, und der eigene stimmt schon.
+    let new_roster: Vec<RosterDevice> = old_roster
+        .into_iter()
+        .filter(|device| device.handle != handle)
+        .collect();
+    save_roster(storage, group_id, &new_roster)?;
+    remember_group(
+        storage,
+        GroupEntry {
+            id: group_id.to_string(),
+            members: members.clone(),
+            status: GroupStatus::Active,
+        },
+    )?;
+
+    let roster_blob = session.create_message(&grouptext::encode_roster(&new_roster))?;
+    save_member_state(storage, &session.export_state()?)?;
+    let roster_fanout: Vec<GroupOutgoing> = fanout_targets(&new_roster, own_handle)
+        .map(|device| {
+            Ok(GroupOutgoing {
+                id: new_uuid(),
+                device_id: device.device_id.clone(),
+                envelope: wire::seal_group(group_id, &roster_blob).map_err(|e| e.to_string())?,
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    if !roster_fanout.is_empty() {
+        // Best effort: die Empfänger heilen den Roster ohnehin selbst.
+        if let Err(error) = delivery
+            .group_messages(token, group_id, &roster_fanout)
+            .await
+        {
+            leptos::logging::warn!("Roster-Nachricht nach Entfernung nicht zugestellt: {error}");
+        }
+    }
+    Ok(members)
+}
+
+/// Verlässt die Gruppe lokal (wie `sm group-leave`): Ansage an die
+/// Verbliebenen, dann eigenen Zustand samt Einträgen löschen. Der Verlauf
+/// des Chats bleibt in der Ablage; kryptografisch entfernt einen erst der
+/// Remove-Commit eines verbleibenden Mitglieds.
+async fn leave_group_web(
+    storage: &SharedStorage,
+    token: &str,
+    own_handle: &str,
+    group_id: &str,
+) -> Result<(), String> {
+    let member = load_or_new_member(storage, own_handle)?;
+    let Some(mut session) = GroupSession::load(member, group_id.as_bytes())? else {
+        return Err("Diese Gruppe ist in der lokalen Ablage unbekannt.".to_string());
+    };
+    let roster = load_roster(storage, group_id)?;
+    let blob = session.create_message(&grouptext::encode_leave())?;
+    save_member_state(storage, &session.export_state()?)?;
+    let fanout: Vec<GroupOutgoing> = fanout_targets(&roster, own_handle)
+        .map(|device| {
+            Ok(GroupOutgoing {
+                id: new_uuid(),
+                device_id: device.device_id.clone(),
+                envelope: wire::seal_group(group_id, &blob).map_err(|e| e.to_string())?,
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    if !fanout.is_empty() {
+        DeliveryClient::new(delivery_url())
+            .group_messages(token, group_id, &fanout)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let member = session.forget()?;
+    save_member_state(storage, &member.export_state()?)?;
+    // Grabstein statt Löschen: der Chat-Verlauf und der Anzeigename samt
+    // „(verlassen)" bleiben nach einem Neuladen erhalten.
+    tombstone_group(storage, group_id, GroupStatus::Left)?;
     Ok(())
 }
 
@@ -2334,7 +2596,7 @@ fn App() -> impl IntoView {
     // Anzeigenamen der Gruppen-Chats (Schlüssel `grp:<id>` -> „Gruppe: ...");
     // aus der Ablage geladen und bei Gründung/Beitritt fortgeschrieben.
     let (group_labels, set_group_labels) =
-        signal(std::collections::HashMap::<String, String>::new());
+        signal(std::collections::HashMap::<String, GroupUi>::new());
     // Ob die Sicherheitsnummer im Thread aufgeklappt ist.
     let (safety_open, set_safety_open) = signal(false);
     // Bleibender Verbindungszustand des Echtzeit-Kanals (Chat-Kopf).
@@ -2765,14 +3027,27 @@ fn App() -> impl IntoView {
                         // vor dem Dienst, was MLS-Hüllen ohnehin tun).
                         let result = if let Some(group_id) = group_id_of(&peer).map(str::to_string)
                         {
-                            send_group_message(
-                                &storage,
-                                &access_token.get_untracked(),
-                                &who,
-                                &group_id,
-                                &text,
-                            )
-                            .await
+                            // In eine vergessene Gruppe (entfernt/verlassen)
+                            // führt kein Senden mehr: klar sagen statt den
+                            // generischen "unbekannt"-Fehler.
+                            if group_labels
+                                .get_untracked()
+                                .get(&peer)
+                                .is_some_and(|ui| ui.forgotten)
+                            {
+                                Err("Du bist nicht mehr in dieser Gruppe (entfernt oder \
+                                     verlassen); der Verlauf bleibt lesbar."
+                                    .to_string())
+                            } else {
+                                send_group_message(
+                                    &storage,
+                                    &access_token.get_untracked(),
+                                    &who,
+                                    &group_id,
+                                    &text,
+                                )
+                                .await
+                            }
                         } else {
                             send_message(
                                 &mut active,
@@ -2877,8 +3152,51 @@ fn App() -> impl IntoView {
                                         let key = group_chat_key(&group_id);
                                         summaries = Some(ensure_chat(&storage, &key));
                                         set_group_labels.update(|labels| {
-                                            labels.insert(key, group_label(&members, &own));
+                                            labels.insert(
+                                                key,
+                                                GroupUi {
+                                                    label: group_label(&members, &own),
+                                                    members,
+                                                    forgotten: false,
+                                                },
+                                            );
                                         });
+                                        continue;
+                                    }
+                                    // Eine geänderte Mitgliederliste führt nur
+                                    // den Anzeigenamen nach.
+                                    if let Incoming::GroupUpdated { group_id, members } = item {
+                                        let key = group_chat_key(&group_id);
+                                        set_group_labels.update(|labels| {
+                                            labels.insert(
+                                                key,
+                                                GroupUi {
+                                                    label: group_label(&members, &own),
+                                                    members,
+                                                    forgotten: false,
+                                                },
+                                            );
+                                        });
+                                        continue;
+                                    }
+                                    // Selbst entfernt: der Verlauf bleibt
+                                    // stehen, der Name sagt den Zustand an,
+                                    // die Aktionen sind aus (forgotten).
+                                    if let Incoming::GroupRemovedSelf { group_id } = item {
+                                        let key = group_chat_key(&group_id);
+                                        set_group_labels.update(|labels| {
+                                            if let Some(ui) = labels.get_mut(&key) {
+                                                if !ui.forgotten {
+                                                    ui.label = format!("{} (entfernt)", ui.label);
+                                                }
+                                                ui.forgotten = true;
+                                            }
+                                        });
+                                        set_status.set(
+                                            "Du wurdest aus einer Gruppe entfernt; der Verlauf \
+                                             bleibt lesbar, senden geht nicht mehr."
+                                                .to_string(),
+                                        );
                                         continue;
                                     }
                                     // Ausgehend (Self-Sync) gehört in den Chat
@@ -2928,9 +3246,12 @@ fn App() -> impl IntoView {
                                             },
                                             false,
                                         ),
-                                        // History und Beitritt sind oben behandelt.
+                                        // History und Gruppen-Ereignisse sind
+                                        // oben behandelt.
                                         Incoming::SyncedHistory { .. }
-                                        | Incoming::GroupJoined { .. } => unreachable!(),
+                                        | Incoming::GroupJoined { .. }
+                                        | Incoming::GroupUpdated { .. }
+                                        | Incoming::GroupRemovedSelf { .. } => unreachable!(),
                                     };
                                     let for_open = open.as_deref() == Some(chat_peer.as_str());
                                     let bump = !outgoing && !for_open;
@@ -3274,7 +3595,14 @@ fn App() -> impl IntoView {
                         let mut members = vec![own.clone()];
                         members.extend(invitees);
                         set_group_labels.update(|labels| {
-                            labels.insert(key.clone(), group_label(&members, &own));
+                            labels.insert(
+                                key.clone(),
+                                GroupUi {
+                                    label: group_label(&members, &own),
+                                    members: members.clone(),
+                                    forgotten: false,
+                                },
+                            );
                         });
                         set_chats.set(ensure_chat(&storage, &key));
                         set_group_input.set(String::new());
@@ -3283,6 +3611,105 @@ fn App() -> impl IntoView {
                         open_chat(key);
                     }
                     Err(error) => set_status.set(format!("Gruppe gründen: {error}")),
+                }
+                set_busy.set(false);
+            });
+        }
+    };
+
+    // Mitglied aus der OFFENEN Gruppe entfernen (MLS-Neuschlüsseln): die
+    // neue Epoche bleibt dem Entfernten verschlossen; danach frischer
+    // Roster an die Rest-Gruppe.
+    let on_group_remove = {
+        let current_storage = current_storage.clone();
+        SendWrapper::new(Rc::new(move |handle: String| {
+            if busy.get_untracked() {
+                return;
+            }
+            let Some(peer) = selected.get_untracked() else {
+                return;
+            };
+            let Some(group_id) = group_id_of(&peer).map(str::to_string) else {
+                return;
+            };
+            let Some(storage) = current_storage() else {
+                return;
+            };
+            let own = me.get_untracked();
+            set_busy.set(true);
+            spawn_local(async move {
+                let result = remove_group_member(
+                    &storage,
+                    &access_token.get_untracked(),
+                    &own,
+                    &group_id,
+                    &handle,
+                )
+                .await;
+                match result {
+                    Ok(members) => {
+                        set_group_labels.update(|labels| {
+                            labels.insert(
+                                group_chat_key(&group_id),
+                                GroupUi {
+                                    label: group_label(&members, &own),
+                                    members,
+                                    forgotten: false,
+                                },
+                            );
+                        });
+                        set_status.set(format!(
+                            "{handle} entfernt; die Gruppe ist neu geschlüsselt."
+                        ));
+                    }
+                    Err(error) => set_status.set(format!("Entfernen: {error}")),
+                }
+                set_busy.set(false);
+            });
+        }))
+    };
+
+    // Die offene Gruppe verlassen: Ansage an die anderen, dann lokal
+    // vergessen (der Verlauf bleibt); kryptografisch entfernt einen erst
+    // der Remove-Commit eines verbleibenden Mitglieds.
+    let on_group_leave = {
+        let current_storage = current_storage.clone();
+        move |_| {
+            if busy.get_untracked() {
+                return;
+            }
+            let Some(peer) = selected.get_untracked() else {
+                return;
+            };
+            let Some(group_id) = group_id_of(&peer).map(str::to_string) else {
+                return;
+            };
+            let Some(storage) = current_storage() else {
+                return;
+            };
+            let own = me.get_untracked();
+            set_busy.set(true);
+            spawn_local(async move {
+                let result =
+                    leave_group_web(&storage, &access_token.get_untracked(), &own, &group_id).await;
+                match result {
+                    Ok(()) => {
+                        let key = group_chat_key(&group_id);
+                        set_group_labels.update(|labels| {
+                            if let Some(ui) = labels.get_mut(&key) {
+                                if !ui.forgotten {
+                                    ui.label = format!("{} (verlassen)", ui.label);
+                                }
+                                ui.forgotten = true;
+                            }
+                        });
+                        set_status.set(
+                            "Gruppe verlassen. Kryptografisch entfernt dich erst ein \
+                             verbleibendes Mitglied über dessen Mitgliederliste."
+                                .to_string(),
+                        );
+                    }
+                    Err(error) => set_status.set(format!("Verlassen: {error}")),
                 }
                 set_busy.set(false);
             });
@@ -3763,6 +4190,8 @@ fn App() -> impl IntoView {
                     // braucht also keinen Klon.
                     let on_safety = on_safety.clone();
                     let on_key_check = on_key_check.clone();
+                    let on_group_remove = on_group_remove.clone();
+                    let on_group_leave = on_group_leave.clone();
                     let run_report = run_report.clone();
                     let on_send = on_send.clone();
                     let on_fetch = on_fetch.clone();
@@ -3885,7 +4314,7 @@ fn App() -> impl IntoView {
                                                     // grp:-Schlüssels.
                                                     let shown = labels
                                                         .get(&peer)
-                                                        .cloned()
+                                                        .map(|ui| ui.label.clone())
                                                         .unwrap_or_else(|| peer.clone());
                                                     view! {
                                                         <li>
@@ -3955,6 +4384,12 @@ fn App() -> impl IntoView {
                                     let on_push_history = on_push_history.clone();
                                     let on_change_password = on_change_password.clone();
                                     move || {
+                                        // Diese reaktive Closure läuft mehrfach
+                                        // (settings_open, selected); die
+                                        // Gruppen-Handler wandern in verschachtelte
+                                        // Views, deshalb je Lauf frisch klonen.
+                                        let on_group_remove = on_group_remove.clone();
+                                        let on_group_leave = on_group_leave.clone();
                                         if settings_open.get() {
                                             let on_revoke = on_revoke.clone();
                                             let on_unblock = on_unblock.clone();
@@ -4382,11 +4817,12 @@ fn App() -> impl IntoView {
                                             // sind 1:1-Mechanik (je Kontakt) und
                                             // fehlen deshalb im Gruppen-Kopf.
                                             let is_group = group_id_of(&peer).is_some();
-                                            let shown_name = group_labels
-                                                .get_untracked()
-                                                .get(&peer)
-                                                .cloned()
-                                                .unwrap_or_else(|| peer.clone());
+                                            // Name und Mitgliederliste hängen
+                                            // reaktiv am Label-Signal, damit ein
+                                            // Entfernen sofort sichtbar wird und
+                                            // nicht erst beim Chat-Wechsel.
+                                            let name_peer = peer.clone();
+                                            let members_peer = peer.clone();
                                             view! {
                                                 <div class="sm-chat-head">
                                                     <button
@@ -4402,7 +4838,13 @@ fn App() -> impl IntoView {
                                                         tabindex="-1"
                                                         node_ref=chat_name_ref
                                                     >
-                                                        {shown_name}
+                                                        {move || {
+                                                            group_labels
+                                                                .get()
+                                                                .get(&name_peer)
+                                                                .map(|ui| ui.label.clone())
+                                                                .unwrap_or_else(|| name_peer.clone())
+                                                        }}
                                                     </h2>
                                                     {move || {
                                                         if connected.get() {
@@ -4466,6 +4908,74 @@ fn App() -> impl IntoView {
                                                                 }}
                                                             }
                                                         })}
+                                                    {move || {
+                                                        // Mitglieder-Liste und Verlassen
+                                                        // nur bei einer AKTIVEN Gruppe; ist
+                                                        // sie vergessen (entfernt/verlassen),
+                                                        // bleibt nur der lesbare Verlauf.
+                                                        let forgotten = group_labels
+                                                            .get()
+                                                            .get(&members_peer)
+                                                            .is_some_and(|ui| ui.forgotten);
+                                                        let show = is_group && !forgotten;
+                                                        let remove = on_group_remove.clone();
+                                                        let leave = on_group_leave.clone();
+                                                        let members_peer = members_peer.clone();
+                                                        show.then(move || {
+                                                            view! {
+                                                                <details class="sm-group-members">
+                                                                    <summary>"Mitglieder"</summary>
+                                                                    <ul>
+                                                                        {move || {
+                                                                            let own_now = me.get_untracked();
+                                                                            let members = group_labels
+                                                                                .get()
+                                                                                .get(&members_peer)
+                                                                                .map(|ui| ui.members.clone())
+                                                                                .unwrap_or_default();
+                                                                            let remove = remove.clone();
+                                                                            members
+                                                                                .into_iter()
+                                                                                .map(|member| {
+                                                                                    let is_self = member == own_now;
+                                                                                    let remove = remove.clone();
+                                                                                    let target = member.clone();
+                                                                                    view! {
+                                                                                        <li>
+                                                                                            <span>{member.clone()}</span>
+                                                                                            {(!is_self)
+                                                                                                .then(|| {
+                                                                                                    view! {
+                                                                                                        <button
+                                                                                                            type="button"
+                                                                                                            class="sm-secondary"
+                                                                                                            disabled=busy
+                                                                                                            on:click=move |_| (remove)(
+                                                                                                                target.clone(),
+                                                                                                            )
+                                                                                                        >
+                                                                                                            "Entfernen"
+                                                                                                        </button>
+                                                                                                    }
+                                                                                                })}
+                                                                                        </li>
+                                                                                    }
+                                                                                })
+                                                                                .collect_view()
+                                                                        }}
+                                                                    </ul>
+                                                                </details>
+                                                                <button
+                                                                    type="button"
+                                                                    class="sm-secondary"
+                                                                    on:click=leave
+                                                                    disabled=busy
+                                                                >
+                                                                    "Verlassen"
+                                                                </button>
+                                                            }
+                                                        })
+                                                    }}
                                                 </div>
 
                                                 {move || {

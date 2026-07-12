@@ -286,7 +286,19 @@ impl GroupSession {
     /// Lädt Mitglieder über ihre KeyPackage-Blobs ein. Liefert den
     /// Commit-Blob (für die schon vorhandenen Mitglieder) und den
     /// Welcome-Blob (für die neuen); der Aufrufer verteilt beide über den
-    /// Zustelldienst. Der Commit ist danach lokal angewandt.
+    /// Zustelldienst.
+    ///
+    /// Der Commit ist danach NUR VORGEMERKT, nicht angewandt: das Anwenden
+    /// (`merge_pending`) folgt erst, wenn der Zustelldienst den Commit
+    /// angenommen hat (die Epoche serialisiert dort über ein CAS, erster
+    /// gewinnt). Würde man sofort anwenden und der Dienst lehnt ab (409,
+    /// ein anderes Mitglied war schneller) oder der Versand scheitert, läge
+    /// die eigene Epoche für immer neben der Dienst-Wahrheit, und kein
+    /// späterer Commit ließe sich mehr einigen. Der Handshake geht als
+    /// signierter Klartext (AlwaysPlaintext-Policy), ein verworfener,
+    /// ungesendeter Commit hinterlässt also kein wiederverwendetes
+    /// Schlüsselmaterial; deshalb wird der vorgemerkte Zustand bewusst NICHT
+    /// zwischengespeichert (der Aufrufer legt erst nach `merge_pending` ab).
     pub fn add_members(
         &mut self,
         key_package_blobs: &[Vec<u8>],
@@ -304,9 +316,6 @@ impl GroupSession {
             .group
             .add_members(&self.member.provider, &self.member.signer, &key_packages)
             .map_err(|err| format!("Mitglieder hinzufügen: {err}"))?;
-        self.group
-            .merge_pending_commit(&self.member.provider)
-            .map_err(|err| format!("Commit anwenden: {err}"))?;
         Ok(AddMembersOutcome {
             commit: commit
                 .to_bytes()
@@ -315,6 +324,16 @@ impl GroupSession {
                 .to_bytes()
                 .map_err(|err| format!("Welcome serialisieren: {err}"))?,
         })
+    }
+
+    /// Wendet den vorgemerkten Commit an (`add_members`/`remove_members`):
+    /// erst NACH der Annahme durch den Zustelldienst aufrufen, dann den
+    /// Zustand exportieren und ablegen. Ohne einen vorgemerkten Commit ein
+    /// No-op.
+    pub fn merge_pending(&mut self) -> Result<(), String> {
+        self.group
+            .merge_pending_commit(&self.member.provider)
+            .map_err(|err| format!("Commit anwenden: {err}"))
     }
 
     /// Verschlüsselt eine Anwendungsnachricht zu einem Wire-Blob.
@@ -331,12 +350,23 @@ impl GroupSession {
     /// Credential (die Transport-Hülle trägt bewusst keinen Absender;
     /// nur die kryptografisch verifizierte Identität zählt); ein Handshake
     /// (Commit anderer Mitglieder) wird angewandt und ergibt `None`.
-    pub fn process(&mut self, wire: &[u8]) -> Result<Option<GroupApplication>, String> {
+    pub fn process(&mut self, wire: &[u8]) -> Result<GroupInbound, String> {
         let message = MlsMessageIn::tls_deserialize_exact(wire)
             .map_err(|err| format!("Gruppen-Blob unlesbar: {err}"))?;
         let protocol = message
             .try_into_protocol_message()
             .map_err(|err| format!("keine Protokollnachricht: {err}"))?;
+        // Ein noch vorgemerkter eigener Commit heißt: ein anderes Mitglied
+        // war beim Zustelldienst schneller (der Commit, den wir hier
+        // empfangen, hat das CAS gewonnen). Unseren verworfenen Commit
+        // wegräumen, sonst ließe sich der fremde nicht anwenden. Das ist
+        // der Wiederanlauf-Pfad nach einem 409, den ein Prozessabbruch
+        // zwischen Versand und Aufräumen offen ließ.
+        if self.group.pending_commit().is_some() {
+            self.group
+                .clear_pending_commit(self.member.provider.storage())
+                .map_err(|err| format!("vorgemerkten Commit verwerfen: {err}"))?;
+        }
         let processed = self
             .group
             .process_message(&self.member.provider, protocol)
@@ -346,7 +376,7 @@ impl GroupSession {
             .unwrap_or_default();
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(application) => {
-                Ok(Some(GroupApplication {
+                Ok(GroupInbound::Application(GroupApplication {
                     sender_identity,
                     plaintext: application.into_bytes(),
                 }))
@@ -355,12 +385,73 @@ impl GroupSession {
                 self.group
                     .merge_staged_commit(&self.member.provider, *staged)
                     .map_err(|err| format!("fremden Commit anwenden: {err}"))?;
-                Ok(None)
+                // Bleibt die Gruppe aktiv, war es ein gewöhnlicher
+                // Epochenwechsel; sonst hat der Commit DIESES Mitglied
+                // entfernt, und der Aufrufer räumt mit `forget` auf.
+                if self.group.is_active() {
+                    Ok(GroupInbound::Updated)
+                } else {
+                    Ok(GroupInbound::RemovedSelf)
+                }
             }
             // Proposals ohne Commit halten wir nicht vor: unsere Commits
-            // tragen ihre Proposals selbst (add_members).
-            _ => Ok(None),
+            // tragen ihre Proposals selbst (add_members/remove_members).
+            _ => Ok(GroupInbound::Updated),
         }
+    }
+
+    /// Entfernt Mitglieder anhand ihrer Identitäten (Handle-Bytes) und
+    /// schaltet die Gruppe in eine neue Epoche (MLS-Neuschlüsseln): die
+    /// Entfernten lesen ab diesem Commit nichts Neues mehr. Liefert den
+    /// Commit-Blob für die Verteilung an alle bisherigen Geräte, auch an
+    /// die entfernten, damit deren Client die Entfernung erkennt
+    /// (`RemovedSelf`) und lokal aufräumt.
+    ///
+    /// Wie `add_members` ist der Commit danach nur VORGEMERKT: erst nach
+    /// der Annahme durch den Zustelldienst `merge_pending` aufrufen und
+    /// den Zustand ablegen (siehe die Begründung dort). Bis dahin bleibt
+    /// die Epoche unverändert, ein 409 oder Versandfehler kostet dann
+    /// nichts als den verworfenen Commit.
+    pub fn remove_members(&mut self, identities: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+        let targets: Vec<LeafNodeIndex> = self
+            .group
+            .members()
+            .filter(|member| {
+                BasicCredential::try_from(member.credential.clone())
+                    .ok()
+                    .is_some_and(|basic| {
+                        identities
+                            .iter()
+                            .any(|id| id.as_slice() == basic.identity())
+                    })
+            })
+            .map(|member| member.index)
+            .collect();
+        if targets.is_empty() {
+            return Err("Kein Mitglied mit dieser Identität in der Gruppe".to_string());
+        }
+        let (commit, _welcome, _group_info) = self
+            .group
+            .remove_members(&self.member.provider, &self.member.signer, &targets)
+            .map_err(|err| format!("Mitglieder entfernen: {err}"))?;
+        commit
+            .to_bytes()
+            .map_err(|err| format!("Commit serialisieren: {err}"))
+    }
+
+    /// Vergisst die Gruppe: löscht ihren kompletten Zustand aus der
+    /// Ablage des Mitglieds (nach `RemovedSelf` oder beim Verlassen) und
+    /// gibt das Mitglied zurück, damit der Aufrufer den bereinigten
+    /// Zustand exportiert. Das MLS-eigene Selbst-Entfernen (ein
+    /// Leave-Proposal, das ein ANDERES Mitglied committet) ist bewusst
+    /// nicht gebaut: RFC 9420 verbietet den Commit der eigenen
+    /// Entfernung, das Verlassen bleibt deshalb lokal plus einer Ansage
+    /// an die anderen.
+    pub fn forget(mut self) -> Result<GroupMember, String> {
+        self.group
+            .delete(self.member.provider.storage())
+            .map_err(|err| format!("Gruppenzustand löschen: {err}"))?;
+        Ok(self.member)
     }
 
     /// Die Identitäten aller Mitglieder der aktuellen Epoche (bei
@@ -414,6 +505,18 @@ pub struct AddMembersOutcome {
     pub commit: Vec<u8>,
     /// Welcome für die neu eingeladenen Mitglieder.
     pub welcome: Vec<u8>,
+}
+
+/// Ergebnis der Verarbeitung eines eingehenden Gruppen-Blobs.
+pub enum GroupInbound {
+    /// Eine Anwendungsnachricht mit geprüftem Absender.
+    Application(GroupApplication),
+    /// Ein fremder Commit ist angewandt, die Gruppe lebt weiter; die
+    /// Mitgliederliste kann sich geändert haben (`member_identities`).
+    Updated,
+    /// Ein fremder Commit hat DIESES Mitglied entfernt: die Gruppe ist
+    /// für dieses Mitglied beendet, `forget` räumt die Ablage auf.
+    RemovedSelf,
 }
 
 /// Eine entschlüsselte Gruppen-Anwendungsnachricht: Klartext plus die von
