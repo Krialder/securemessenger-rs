@@ -108,6 +108,7 @@ impl TenantStore for PgTenantStore {
         &self,
         token_hash: &str,
         tenant_id: &str,
+        scopes: &[String],
         expires_at: u64,
     ) -> Result<(), StoreError> {
         let tenant = parse_uuid(tenant_id, "Mandanten-ID")?;
@@ -118,11 +119,12 @@ impl TenantStore for PgTenantStore {
             .await
             .map_err(backend)?;
         sqlx::query(
-            "INSERT INTO integration_tokens (token_hash, tenant_id, expires_at) \
-             VALUES ($1, $2, to_timestamp($3))",
+            "INSERT INTO integration_tokens (token_hash, tenant_id, scopes, expires_at) \
+             VALUES ($1, $2, $3, to_timestamp($4))",
         )
         .bind(token_hash)
         .bind(tenant)
+        .bind(scopes)
         .bind(expires_at as f64)
         .execute(&self.pool)
         .await
@@ -131,8 +133,10 @@ impl TenantStore for PgTenantStore {
     }
 
     async fn find_token(&self, token_hash: &str) -> Result<Option<Tenant>, StoreError> {
+        // k.scopes AS scopes: der zurückgegebene Mandant trägt bewusst die
+        // *Token*-Scopes, nicht t.scopes; row_to_tenant liest sie als scopes.
         let row = sqlx::query(
-            "SELECT t.id, t.name, t.oidc_client_id, t.scopes, t.rate_limit, \
+            "SELECT t.id, t.name, t.oidc_client_id, k.scopes AS scopes, t.rate_limit, \
                     (t.disabled_at IS NOT NULL) AS disabled \
              FROM integration_tokens k \
              JOIN integration_tenants t ON t.id = k.tenant_id \

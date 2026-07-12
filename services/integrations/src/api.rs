@@ -203,8 +203,9 @@ struct TokenForm {
     client_id: Option<String>,
     client_secret: Option<String>,
     /// Optional angefragte Scopes (leerzeichengetrennt). Muss eine Teilmenge
-    /// der Mandanten-Scopes sein; das Token traegt heute die vollen
-    /// Mandanten-Rechte (die Verengung je Token folgt separat).
+    /// der Mandanten-Scopes sein und verengt das ausgestellte Token auf genau
+    /// diese Rechte (Least Privilege je Token). Fehlt der Parameter, traegt
+    /// das Token die vollen Mandanten-Rechte.
     scope: Option<String>,
 }
 
@@ -307,15 +308,23 @@ async fn token(
     };
 
     // Angefragte Scopes muessen eine Teilmenge der Mandanten-Rechte sein.
-    if let Some(requested) = req.scope.as_deref() {
-        if let Some(unknown) = requested.split_whitespace().find(|s| !tenant.has_scope(s)) {
-            return oauth_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_scope",
-                &format!("Scope '{unknown}' liegt nicht beim Mandanten"),
-            );
+    // Ein leerer oder fehlender scope-Parameter bedeutet "gib die vollen
+    // Mandanten-Rechte" (RFC 6749 3.3: scope ist optional); ein angefragter,
+    // engerer Satz verengt das Token auf genau diese Rechte (Least Privilege).
+    let granted: Vec<String> = match req.scope.as_deref() {
+        Some(requested) if requested.split_whitespace().next().is_some() => {
+            let asked: Vec<String> = requested.split_whitespace().map(String::from).collect();
+            if let Some(unknown) = asked.iter().find(|s| !tenant.has_scope(s)) {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_scope",
+                    &format!("Scope '{unknown}' liegt nicht beim Mandanten"),
+                );
+            }
+            asked
         }
-    }
+        _ => tenant.scopes.clone(),
+    };
 
     let access_token = auth::new_tenant_token();
     let expires_at = std::time::SystemTime::now()
@@ -325,7 +334,12 @@ async fn token(
         + TOKEN_TTL_SECS;
     if let Err(error) = st
         .store
-        .save_token(&auth::token_hash(&access_token), &tenant.id, expires_at)
+        .save_token(
+            &auth::token_hash(&access_token),
+            &tenant.id,
+            &granted,
+            expires_at,
+        )
         .await
     {
         tracing::error!(%error, "Token-Ablage fehlgeschlagen");
@@ -337,7 +351,7 @@ async fn token(
             access_token,
             token_type: "Bearer",
             expires_in: TOKEN_TTL_SECS,
-            scope: tenant.scopes.join(" "),
+            scope: granted.join(" "),
         }),
     )
         .into_response()

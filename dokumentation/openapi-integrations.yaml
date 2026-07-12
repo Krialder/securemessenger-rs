@@ -230,7 +230,10 @@ components:
           type: string
           description: >
             Optional, leerzeichengetrennt. Muss eine Teilmenge der
-            Mandanten-Scopes sein (sonst 400 invalid_scope).
+            Mandanten-Scopes sein (sonst 400 invalid_scope) und verengt das
+            ausgestellte Token auf genau diese Rechte (Least Privilege je
+            Token). Fehlt der Parameter, traegt das Token die vollen
+            Mandanten-Rechte.
     TokenResponse:
       type: object
       required: [access_token, token_type, expires_in, scope]

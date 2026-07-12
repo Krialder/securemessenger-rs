@@ -53,17 +53,23 @@ pub trait TenantStore: Send + Sync {
         client_id: &str,
     ) -> Result<Option<(Tenant, String)>, StoreError>;
 
-    /// Legt ein Token (als Hash) mit Ablaufzeit ab und räumt bei der
-    /// Gelegenheit abgelaufene Tokens weg.
+    /// Legt ein Token (als Hash) mit den gewährten Scopes und der
+    /// Ablaufzeit ab und räumt bei der Gelegenheit abgelaufene Tokens weg.
+    /// Die Scopes sind eine Teilmenge der Mandanten-Rechte (Least Privilege
+    /// je Token, F100): so kann ein Fremdprojekt bewusst enge Tokens
+    /// ausstellen, statt jedem Token die vollen Rechte zu geben.
     async fn save_token(
         &self,
         token_hash: &str,
         tenant_id: &str,
+        scopes: &[String],
         expires_at: u64,
     ) -> Result<(), StoreError>;
 
     /// Löst einen Token-Hash zum Mandanten auf; None = unbekannt,
-    /// abgelaufen oder Mandant gesperrt.
+    /// abgelaufen oder Mandant gesperrt. Der zurückgegebene Mandant trägt
+    /// die *Token*-Scopes (nicht zwingend die vollen Mandanten-Scopes),
+    /// damit die Autorisierung transparent das enge Token durchsetzt.
     async fn find_token(&self, token_hash: &str) -> Result<Option<Tenant>, StoreError>;
 }
 
@@ -74,12 +80,20 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
+/// Abgelegtes Token: an welchen Mandanten es gebunden ist, welche Scopes es
+/// gewährt (Teilmenge der Mandanten-Rechte) und wann es verfällt.
+struct TokenRecord {
+    tenant_id: String,
+    scopes: Vec<String>,
+    expires_at: u64,
+}
+
 #[derive(Default)]
 struct Inner {
     /// client_id -> (Tenant, secret_hash)
     tenants: HashMap<String, (Tenant, String)>,
-    /// token_hash -> (tenant_id, expires_at)
-    tokens: HashMap<String, (String, u64)>,
+    /// token_hash -> TokenRecord
+    tokens: HashMap<String, TokenRecord>,
 }
 
 /// Prozesslokale Umsetzung für Entwicklung und Tests.
@@ -128,31 +142,44 @@ impl TenantStore for InMemoryTenantStore {
         &self,
         token_hash: &str,
         tenant_id: &str,
+        scopes: &[String],
         expires_at: u64,
     ) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().expect("Lock nicht vergiftet");
         let now = now_epoch();
-        inner.tokens.retain(|_, (_, expiry)| *expiry > now);
-        inner
-            .tokens
-            .insert(token_hash.to_string(), (tenant_id.to_string(), expires_at));
+        inner.tokens.retain(|_, record| record.expires_at > now);
+        inner.tokens.insert(
+            token_hash.to_string(),
+            TokenRecord {
+                tenant_id: tenant_id.to_string(),
+                scopes: scopes.to_vec(),
+                expires_at,
+            },
+        );
         Ok(())
     }
 
     async fn find_token(&self, token_hash: &str) -> Result<Option<Tenant>, StoreError> {
         let inner = self.inner.lock().expect("Lock nicht vergiftet");
-        let Some((tenant_id, expires_at)) = inner.tokens.get(token_hash) else {
+        let Some(record) = inner.tokens.get(token_hash) else {
             return Ok(None);
         };
-        if *expires_at <= now_epoch() {
+        if record.expires_at <= now_epoch() {
             return Ok(None);
         }
+        // Der Mandant liefert Identität und Rate-Limit; die *Scopes* kommen
+        // vom Token, damit ein eng ausgestelltes Token nicht die vollen
+        // Mandanten-Rechte erbt.
         let tenant = inner
             .tenants
             .values()
-            .find(|(t, _)| &t.id == tenant_id)
+            .find(|(t, _)| t.id == record.tenant_id)
             .map(|(t, _)| t.clone())
-            .filter(|t| !t.disabled);
+            .filter(|t| !t.disabled)
+            .map(|t| Tenant {
+                scopes: record.scopes.clone(),
+                ..t
+            });
         Ok(tenant)
     }
 }
@@ -189,17 +216,25 @@ mod tests {
         let tenant_id = tenant.id.clone();
         store.create(tenant).await.unwrap();
 
+        let scopes = vec!["notify".to_string()];
         store
-            .save_token("hash-gueltig", &tenant_id, now_epoch() + 3600)
+            .save_token("hash-gueltig", &tenant_id, &scopes, now_epoch() + 3600)
             .await
             .unwrap();
         store
-            .save_token("hash-abgelaufen", &tenant_id, now_epoch().saturating_sub(1))
+            .save_token(
+                "hash-abgelaufen",
+                &tenant_id,
+                &scopes,
+                now_epoch().saturating_sub(1),
+            )
             .await
             .unwrap();
 
         let found = store.find_token("hash-gueltig").await.unwrap().unwrap();
         assert_eq!(found.id, tenant_id);
+        // Der Mandant hat 'notify'; das enge Token trägt genau diesen Scope.
+        assert_eq!(found.scopes, scopes);
         assert!(store.find_token("hash-abgelaufen").await.unwrap().is_none());
         assert!(store.find_token("hash-unbekannt").await.unwrap().is_none());
     }

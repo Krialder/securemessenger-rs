@@ -50,7 +50,7 @@ Antwort (200):
 { "access_token": "…", "token_type": "Bearer", "expires_in": 3600, "scope": "notify presence" }
 ```
 
-Optional kannst du mit `-d 'scope=notify'` weniger als die vollen Mandanten-Rechte anfragen (muss eine Teilmenge sein, sonst `400 invalid_scope`). Fehler folgen dem OAuth2-Schema `{ "error": "...", "error_description": "..." }`: falsche Zugangsdaten oder ein gesperrter Mandant antworten identisch mit `401 invalid_client` (die Antwort verraet nicht, ob es den Mandanten gibt), ein falscher `grant_type` mit `400 unsupported_grant_type`. Hole ein frisches Token, bevor das alte ablaeuft; ein abgelaufenes Token liefert bei den API-Aufrufen `401 invalid_token`.
+Optional kannst du mit `-d 'scope=notify'` ein bewusst enges Token anfragen (muss eine Teilmenge der Mandanten-Rechte sein, sonst `400 invalid_scope`). Das ausgestellte Token traegt dann genau diese Rechte und nichts darueber hinaus (Least Privilege): so kannst du je Einsatzort ein eigenes, minimales Token ausstellen, statt ueberall das Voll-Token zu verteilen. Ohne `scope` bekommst du die vollen Mandanten-Rechte. Das gewaehrte `scope` steht in der Antwort. Fehler folgen dem OAuth2-Schema `{ "error": "...", "error_description": "..." }`: falsche Zugangsdaten oder ein gesperrter Mandant antworten identisch mit `401 invalid_client` (die Antwort verraet nicht, ob es den Mandanten gibt), ein falscher `grant_type` mit `400 unsupported_grant_type`. Hole ein frisches Token, bevor das alte ablaeuft; ein abgelaufenes Token liefert bei den API-Aufrufen `401 invalid_token`.
 
 ## Schritt 3: Benachrichtigen
 

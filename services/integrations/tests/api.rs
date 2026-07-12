@@ -440,6 +440,57 @@ async fn token_accepts_http_basic_and_rejects_wrong_grant() {
 }
 
 #[tokio::test]
+async fn narrow_scope_token_cannot_exceed_its_grant() {
+    // Least Privilege je Token: der Mandant darf notify UND presence, stellt
+    // aber ein Token nur fuer notify aus. Dieses Token darf dann keine
+    // Praesenz abfragen, obwohl der Mandant das Recht haette.
+    let (app, _) = test_app();
+    let (client_id, client_secret, _) =
+        provision_tenant(&app, "eng", json!(["notify", "presence"])).await;
+
+    let (status, body) = send_token(
+        &app,
+        &[
+            ("grant_type", "client_credentials"),
+            ("client_id", &client_id),
+            ("client_secret", &client_secret),
+            ("scope", "notify"),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Die Antwort spiegelt genau den verengten Scope, nicht die vollen Rechte.
+    assert_eq!(body["scope"], "notify");
+    let narrow = body["access_token"].as_str().unwrap().to_string();
+
+    // notify: erlaubt.
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/integrations/eng/notify",
+        Some(json!({ "handle": "kai", "title": "geht" })),
+        Some(&narrow),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // presence: 403, obwohl der Mandant das Recht hat, das Token aber nicht.
+    let (status, body) = send(
+        &app,
+        "GET",
+        "/integrations/eng/presence/kai",
+        None,
+        Some(&narrow),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "missing_scope");
+}
+
+#[tokio::test]
 async fn rate_limit_returns_429_with_retry_after() {
     let (app, _) = test_app();
     let (status, body) = send(

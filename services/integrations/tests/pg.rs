@@ -67,19 +67,24 @@ async fn tenant_and_token_roundtrip() {
         .unwrap()
         .is_none());
 
-    // Token-Umlauf: gültig auflösbar, abgelaufen nicht.
+    // Token-Umlauf: gültig auflösbar, abgelaufen nicht. Das Token trägt hier
+    // bewusst nur 'notify' (Teilmenge der Mandanten-Rechte), damit die
+    // Least-Privilege-Verengung auch über PostgreSQL geprüft ist.
     let valid_hash = format!("hash-{}", Uuid::new_v4().simple());
     let expired_hash = format!("hash-{}", Uuid::new_v4().simple());
+    let token_scopes = vec!["notify".to_string()];
     store
-        .save_token(&valid_hash, &tenant_id, now_epoch() + 3600)
+        .save_token(&valid_hash, &tenant_id, &token_scopes, now_epoch() + 3600)
         .await
         .unwrap();
     store
-        .save_token(&expired_hash, &tenant_id, now_epoch() - 1)
+        .save_token(&expired_hash, &tenant_id, &token_scopes, now_epoch() - 1)
         .await
         .unwrap();
     let resolved = store.find_token(&valid_hash).await.unwrap().unwrap();
     assert_eq!(resolved.id, tenant_id);
+    // Nicht die vollen Mandanten-Scopes, sondern die des Tokens.
+    assert_eq!(resolved.scopes, token_scopes);
     assert!(store.find_token(&expired_hash).await.unwrap().is_none());
     assert!(store.find_token("unbekannt").await.unwrap().is_none());
 
@@ -87,7 +92,7 @@ async fn tenant_and_token_roundtrip() {
     // bleibt bestehen.
     let another_hash = format!("hash-{}", Uuid::new_v4().simple());
     store
-        .save_token(&another_hash, &tenant_id, now_epoch() + 3600)
+        .save_token(&another_hash, &tenant_id, &token_scopes, now_epoch() + 3600)
         .await
         .unwrap();
     assert!(store.find_token(&valid_hash).await.unwrap().is_some());
