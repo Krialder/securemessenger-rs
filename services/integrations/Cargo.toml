@@ -16,6 +16,8 @@ serde_json.workspace = true
 # Ablage (pflichtenheft.md 7, NF040), Tokens nur als SHA-256-Digest.
 argon2.workspace = true
 sha2.workspace = true
+# Fuer die HTTP-Basic-Zugangsdaten des OAuth2-Token-Endpunkts (RFC 6749).
+base64.workspace = true
 sqlx.workspace = true
 async-trait.workspace = true
 uuid.workspace = true
@@ -26,3 +28,5 @@ reqwest.workspace = true
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Fuer den HTTP-Basic-Pfad des Token-Tests (RFC 6749).
+base64.workspace = true

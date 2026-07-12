@@ -21,7 +21,9 @@ use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Form, Json, Router};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -190,10 +192,20 @@ fn authorize(st: &AppState, tenant: &Tenant, scope: &'static str) -> Option<Resp
     None
 }
 
+/// Der Token-Request als standardkonformer OAuth2-Client-Credentials-Grant
+/// (RFC 6749, Abschnitt 4.4): `application/x-www-form-urlencoded` mit
+/// `grant_type`. Die Client-Zugangsdaten kommen entweder im HTTP-Basic-Header
+/// oder im Body (`client_secret_basic` bzw. `client_secret_post`), damit jede
+/// gängige OAuth2-Bibliothek in ihrer Standard-Konfiguration anbinden kann.
 #[derive(Deserialize)]
-struct TokenRequest {
-    client_id: String,
-    client_secret: String,
+struct TokenForm {
+    grant_type: String,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    /// Optional angefragte Scopes (leerzeichengetrennt). Muss eine Teilmenge
+    /// der Mandanten-Scopes sein; das Token traegt heute die vollen
+    /// Mandanten-Rechte (die Verengung je Token folgt separat).
+    scope: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -201,14 +213,71 @@ struct TokenResponse {
     access_token: String,
     token_type: &'static str,
     expires_in: u64,
+    /// Die tatsaechlich gewaehrten Scopes (leerzeichengetrennt, RFC 6749).
+    scope: String,
 }
 
-/// `POST /integrations/token`: Client-Credentials gegen ein kurzlebiges
-/// Token tauschen. Unbekannte Client-ID, falsches Secret und gesperrter
-/// Mandant antworten identisch (401), damit die Antwort nichts über
-/// existierende Mandanten verrät.
-async fn token(State(st): State<AppState>, Json(req): Json<TokenRequest>) -> Response {
-    let found = match st.store.find_by_client_id(&req.client_id).await {
+/// OAuth2-Fehlerantwort (`{error, error_description}`, RFC 6749 Abschnitt
+/// 5.2), getrennt vom `{code, message}`-Schema der uebrigen Routen, damit
+/// Standard-OAuth2-Clients die Fehler maschinell verstehen. Bei
+/// `invalid_client` gehoert ein `WWW-Authenticate: Basic` dazu.
+fn oauth_error(status: StatusCode, error: &'static str, description: &str) -> Response {
+    let mut response = (
+        status,
+        Json(json!({ "error": error, "error_description": description })),
+    )
+        .into_response();
+    if error == "invalid_client" {
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            header::HeaderValue::from_static("Basic realm=\"integrations\""),
+        );
+    }
+    response
+}
+
+/// Client-Zugangsdaten aus dem HTTP-Basic-Header lesen (RFC 6749 Abschnitt
+/// 2.3.1). `None`, wenn kein oder ein unlesbarer Basic-Header vorliegt.
+fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
+    let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let encoded = raw.strip_prefix("Basic ")?.trim();
+    let decoded = String::from_utf8(BASE64.decode(encoded).ok()?).ok()?;
+    let (id, secret) = decoded.split_once(':')?;
+    Some((id.to_string(), secret.to_string()))
+}
+
+/// `POST /integrations/token`: standardkonformer OAuth2-Client-Credentials-
+/// Grant. Unbekannte Client-ID, falsches Secret und gesperrter Mandant
+/// antworten identisch (`invalid_client`, 401), damit die Antwort nichts
+/// ueber existierende Mandanten verraet.
+async fn token(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Form(req): Form<TokenForm>,
+) -> Response {
+    if req.grant_type != "client_credentials" {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_grant_type",
+            "Nur grant_type=client_credentials wird unterstuetzt",
+        );
+    }
+    // Zugangsdaten bevorzugt aus dem HTTP-Basic-Header, sonst aus dem Body.
+    let (client_id, client_secret) = match basic_credentials(&headers) {
+        Some(pair) => pair,
+        None => match (req.client_id, req.client_secret) {
+            (Some(id), Some(secret)) => (id, secret),
+            _ => {
+                return oauth_error(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_client",
+                    "client_id und client_secret fehlen (HTTP-Basic oder im Body)",
+                )
+            }
+        },
+    };
+
+    let found = match st.store.find_by_client_id(&client_id).await {
         Ok(found) => found,
         Err(error) => {
             tracing::error!(%error, "Mandanten-Suche fehlgeschlagen");
@@ -218,7 +287,7 @@ async fn token(State(st): State<AppState>, Json(req): Json<TokenRequest>) -> Res
     // Argon2 ist bewusst teuer: nicht auf dem Request-Thread rechnen.
     let verified = match &found {
         Some((_, secret_hash)) => {
-            let secret = req.client_secret.clone();
+            let secret = client_secret.clone();
             let hash = secret_hash.clone();
             tokio::task::spawn_blocking(move || auth::verify_secret(&secret, &hash))
                 .await
@@ -229,13 +298,24 @@ async fn token(State(st): State<AppState>, Json(req): Json<TokenRequest>) -> Res
     let tenant = match (found, verified) {
         (Some((tenant, _)), true) if !tenant.disabled => tenant,
         _ => {
-            return api_error(
+            return oauth_error(
                 StatusCode::UNAUTHORIZED,
                 "invalid_client",
                 "Client-ID oder Secret ist falsch",
             )
         }
     };
+
+    // Angefragte Scopes muessen eine Teilmenge der Mandanten-Rechte sein.
+    if let Some(requested) = req.scope.as_deref() {
+        if let Some(unknown) = requested.split_whitespace().find(|s| !tenant.has_scope(s)) {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_scope",
+                &format!("Scope '{unknown}' liegt nicht beim Mandanten"),
+            );
+        }
+    }
 
     let access_token = auth::new_tenant_token();
     let expires_at = std::time::SystemTime::now()
@@ -257,6 +337,7 @@ async fn token(State(st): State<AppState>, Json(req): Json<TokenRequest>) -> Res
             access_token,
             token_type: "Bearer",
             expires_in: TOKEN_TTL_SECS,
+            scope: tenant.scopes.join(" "),
         }),
     )
         .into_response()

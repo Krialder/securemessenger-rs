@@ -2112,6 +2112,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "axum",
+ "base64",
  "common",
  "http-body-util",
  "reqwest",

@@ -23,23 +23,34 @@ Jedes Fremdprojekt ist ein eigener Mandant mit eigenem Token und eigenem Rate-Li
 
 Bewahre das `client_secret` wie ein Passwort auf. Fuer die interne Anlage-Route selbst (falls du sie als Betreiber ausfuehrst) gilt: der Aufruf braucht den Header `x-internal-token: <Shared Secret>`, Body `{ "name": "azubios", "scopes": ["notify", "presence"], "rate_limit": 60 }`.
 
-## Schritt 2: Ein Token holen (Client Credentials)
+## Schritt 2: Ein Token holen (OAuth2 Client Credentials)
 
-Tausche `client_id` und `client_secret` gegen ein kurzlebiges Bearer-Token (Laufzeit 1 Stunde). Das ist ein Maschine-zu-Maschine-Fluss, kein Nutzer-Login.
+Der Token-Endpunkt ist ein standardkonformer OAuth2-Client-Credentials-Grant (RFC 6749). Du kannst also jede beliebige OAuth2-Bibliothek in deiner Sprache benutzen (Python `authlib`/`requests-oauthlib`, PHP `league/oauth2-client`, Go, JS), Token-URL ist `$BASE/integrations/token`. Der Request ist `application/x-www-form-urlencoded` mit `grant_type=client_credentials`; die Zugangsdaten gehen entweder als Body-Felder oder im HTTP-Basic-Header. Das ist ein Maschine-zu-Maschine-Fluss, kein Nutzer-Login; das `client_secret` gehoert nie in einen Browser.
+
+Zugangsdaten im Body (`client_secret_post`):
 
 ```bash
 curl -sS -X POST "$BASE/integrations/token" \
-  -H 'Content-Type: application/json' \
-  -d '{"client_id":"azubios","client_secret":"<geheim>"}'
+  -d 'grant_type=client_credentials' \
+  -d 'client_id=azubios' \
+  -d 'client_secret=<geheim>'
+```
+
+Oder per HTTP-Basic (`client_secret_basic`, was viele Bibliotheken als Vorgabe nutzen):
+
+```bash
+curl -sS -X POST "$BASE/integrations/token" \
+  -u 'azubios:<geheim>' \
+  -d 'grant_type=client_credentials'
 ```
 
 Antwort (200):
 
 ```json
-{ "access_token": "…", "token_type": "Bearer", "expires_in": 3600 }
+{ "access_token": "…", "token_type": "Bearer", "expires_in": 3600, "scope": "notify presence" }
 ```
 
-Falsche Zugangsdaten oder ein gesperrter Mandant antworten identisch mit `401 invalid_client` (die Antwort verraet nicht, ob es den Mandanten gibt). Hole ein frisches Token, bevor das alte ablaeuft; ein abgelaufenes Token liefert `401 invalid_token`.
+Optional kannst du mit `-d 'scope=notify'` weniger als die vollen Mandanten-Rechte anfragen (muss eine Teilmenge sein, sonst `400 invalid_scope`). Fehler folgen dem OAuth2-Schema `{ "error": "...", "error_description": "..." }`: falsche Zugangsdaten oder ein gesperrter Mandant antworten identisch mit `401 invalid_client` (die Antwort verraet nicht, ob es den Mandanten gibt), ein falscher `grant_type` mit `400 unsupported_grant_type`. Hole ein frisches Token, bevor das alte ablaeuft; ein abgelaufenes Token liefert bei den API-Aufrufen `401 invalid_token`.
 
 ## Schritt 3: Benachrichtigen
 

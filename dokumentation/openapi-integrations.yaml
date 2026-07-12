@@ -26,13 +26,21 @@ servers:
 paths:
   /integrations/token:
     post:
-      summary: Client-Credentials gegen ein kurzlebiges Bearer-Token tauschen
+      summary: OAuth2-Client-Credentials-Grant gegen ein kurzlebiges Bearer-Token
+      description: >
+        Standardkonformer OAuth2-Client-Credentials-Grant (RFC 6749, Abschnitt
+        4.4). Die Client-Zugangsdaten kommen entweder im HTTP-Basic-Header
+        (client_secret_basic) oder als Body-Felder client_id/client_secret
+        (client_secret_post); jede gaengige OAuth2-Bibliothek kann so anbinden.
+        Server-zu-Server, das client_secret gehoert nie in einen Browser.
       operationId: token
-      security: []
+      security:
+        - {}
+        - clientBasic: []
       requestBody:
         required: true
         content:
-          application/json:
+          application/x-www-form-urlencoded:
             schema:
               $ref: '#/components/schemas/TokenRequest'
       responses:
@@ -42,15 +50,25 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TokenResponse'
-        '401':
+        '400':
           description: >
-            Client-ID oder Secret falsch, oder Mandant gesperrt. Unbekannte
-            und falsche Zugangsdaten antworten identisch (code invalid_client),
-            damit die Antwort die Existenz eines Mandanten nicht verraet.
+            OAuth2-Fehler: error=unsupported_grant_type (nur
+            client_credentials), invalid_request oder invalid_scope
+            (angefragter Scope liegt nicht beim Mandanten).
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ApiError'
+                $ref: '#/components/schemas/OAuthError'
+        '401':
+          description: >
+            error=invalid_client: Client-ID oder Secret falsch, oder Mandant
+            gesperrt. Unbekannte und falsche Zugangsdaten antworten identisch,
+            damit die Antwort die Existenz eines Mandanten nicht verraet. Traegt
+            einen WWW-Authenticate: Basic Header.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthError'
   /integrations/{tenant}/notify:
     post:
       summary: Markierte Maschinen-Benachrichtigung an alle Geraete eines Nutzers
@@ -183,20 +201,39 @@ components:
       type: http
       scheme: bearer
       description: Das Bearer-Token aus POST /integrations/token (Laufzeit 1 Stunde).
+    clientBasic:
+      type: http
+      scheme: basic
+      description: >
+        HTTP-Basic mit client_id als Nutzer und client_secret als Passwort
+        (client_secret_basic, RFC 6749). Alternativ die Felder im Body.
   schemas:
     TokenRequest:
       type: object
-      required: [client_id, client_secret]
+      required: [grant_type]
       properties:
+        grant_type:
+          type: string
+          enum: [client_credentials]
+          description: OAuth2-Grant-Typ; nur client_credentials wird unterstuetzt.
         client_id:
           type: string
-          description: Vom Betreiber vergeben (gleich dem Mandanten-Namen).
+          description: >
+            Vom Betreiber vergeben (gleich dem Mandanten-Namen). Weglassen,
+            wenn die Zugangsdaten im HTTP-Basic-Header stehen.
         client_secret:
           type: string
-          description: Vom Betreiber genau einmal bei der Anlage ausgegeben.
+          description: >
+            Vom Betreiber genau einmal bei der Anlage ausgegeben. Weglassen,
+            wenn im HTTP-Basic-Header.
+        scope:
+          type: string
+          description: >
+            Optional, leerzeichengetrennt. Muss eine Teilmenge der
+            Mandanten-Scopes sein (sonst 400 invalid_scope).
     TokenResponse:
       type: object
-      required: [access_token, token_type, expires_in]
+      required: [access_token, token_type, expires_in, scope]
       properties:
         access_token:
           type: string
@@ -206,6 +243,19 @@ components:
         expires_in:
           type: integer
           description: Restlaufzeit in Sekunden (3600).
+        scope:
+          type: string
+          description: Die tatsaechlich gewaehrten Scopes (leerzeichengetrennt).
+    OAuthError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: OAuth2-Fehlercode (RFC 6749 Abschnitt 5.2).
+          enum: [invalid_client, invalid_request, unsupported_grant_type, invalid_scope]
+        error_description:
+          type: string
     NotifyRequest:
       type: object
       required: [handle, title]

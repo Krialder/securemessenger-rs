@@ -148,6 +148,45 @@ async fn send(
     (status, value)
 }
 
+/// Fragt am OAuth2-Token-Endpunkt ein Token ab: form-kodiert (RFC 6749).
+/// `params` sind die Body-Felder; `basic` schaltet die Client-Zugangsdaten
+/// stattdessen auf den HTTP-Basic-Header um (client_secret_basic). Die Werte
+/// (Mandantenname, Hex-Secret) sind URL-sicher, daher reicht schlichtes
+/// Zusammensetzen.
+async fn send_token(
+    app: &Router,
+    params: &[(&str, &str)],
+    basic: Option<(&str, &str)>,
+) -> (StatusCode, Value) {
+    let form = params
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/integrations/token")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+    if let Some((id, secret)) = basic {
+        use base64::Engine as _;
+        let cred = base64::engine::general_purpose::STANDARD.encode(format!("{id}:{secret}"));
+        builder = builder.header(header::AUTHORIZATION, format!("Basic {cred}"));
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::from(form)).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, value)
+}
+
 /// Legt einen Mandanten an und tauscht direkt ein Token; liefert
 /// (client_id, client_secret, access_token).
 async fn provision_tenant(app: &Router, name: &str, scopes: Value) -> (String, String, String) {
@@ -164,12 +203,13 @@ async fn provision_tenant(app: &Router, name: &str, scopes: Value) -> (String, S
     let client_id = body["client_id"].as_str().unwrap().to_string();
     let client_secret = body["client_secret"].as_str().unwrap().to_string();
 
-    let (status, body) = send(
+    let (status, body) = send_token(
         app,
-        "POST",
-        "/integrations/token",
-        Some(json!({ "client_id": client_id, "client_secret": client_secret })),
-        None,
+        &[
+            ("grant_type", "client_credentials"),
+            ("client_id", &client_id),
+            ("client_secret", &client_secret),
+        ],
         None,
     )
     .await;
@@ -328,23 +368,75 @@ async fn token_exchange_rejects_bad_credentials() {
     let (client_id, client_secret, _) =
         provision_tenant(&app, "projekt-x", json!(["notify"])).await;
 
-    // Falsches Secret und unbekannte Client-ID: identische 401-Antwort.
+    // Falsches Secret und unbekannte Client-ID: identische 401-Antwort im
+    // OAuth2-Fehlerschema ({error, error_description}).
     for (id, secret) in [
         (client_id.as_str(), "falsches-secret"),
         ("unbekannt", client_secret.as_str()),
     ] {
-        let (status, body) = send(
+        let (status, body) = send_token(
             &app,
-            "POST",
-            "/integrations/token",
-            Some(json!({ "client_id": id, "client_secret": secret })),
-            None,
+            &[
+                ("grant_type", "client_credentials"),
+                ("client_id", id),
+                ("client_secret", secret),
+            ],
             None,
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body["code"], "invalid_client");
+        assert_eq!(body["error"], "invalid_client");
     }
+}
+
+#[tokio::test]
+async fn token_accepts_http_basic_and_rejects_wrong_grant() {
+    let (app, _) = test_app();
+    let (client_id, client_secret, _) =
+        provision_tenant(&app, "basic-projekt", json!(["notify", "presence"])).await;
+
+    // HTTP-Basic statt Body-Parameter (client_secret_basic): muss klappen,
+    // damit jede OAuth2-Bibliothek in ihrer Standard-Konfiguration anbindet.
+    let (status, body) = send_token(
+        &app,
+        &[("grant_type", "client_credentials")],
+        Some((&client_id, &client_secret)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["token_type"], "Bearer");
+    // Die gewaehrten Scopes stehen in der Antwort (RFC 6749).
+    let granted = body["scope"].as_str().unwrap();
+    assert!(granted.contains("notify") && granted.contains("presence"));
+
+    // Falscher grant_type: unsupported_grant_type (400).
+    let (status, body) = send_token(
+        &app,
+        &[
+            ("grant_type", "password"),
+            ("client_id", &client_id),
+            ("client_secret", &client_secret),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "unsupported_grant_type");
+
+    // Angefragter Scope ausserhalb der Mandanten-Rechte: invalid_scope (400).
+    let (status, body) = send_token(
+        &app,
+        &[
+            ("grant_type", "client_credentials"),
+            ("client_id", &client_id),
+            ("client_secret", &client_secret),
+            ("scope", "notify webhook"),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid_scope");
 }
 
 #[tokio::test]
@@ -360,15 +452,15 @@ async fn rate_limit_returns_429_with_retry_after() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    let (status, body) = send(
+    let client_id = body["client_id"].as_str().unwrap().to_string();
+    let client_secret = body["client_secret"].as_str().unwrap().to_string();
+    let (status, body) = send_token(
         &app,
-        "POST",
-        "/integrations/token",
-        Some(json!({
-            "client_id": body["client_id"],
-            "client_secret": body["client_secret"],
-        })),
-        None,
+        &[
+            ("grant_type", "client_credentials"),
+            ("client_id", &client_id),
+            ("client_secret", &client_secret),
+        ],
         None,
     )
     .await;
