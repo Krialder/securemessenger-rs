@@ -302,17 +302,21 @@ fn group_session_byte_interface_roundtrip() {
     assert_eq!(alice.epoch(), bob.epoch(), "beide auf derselben Epoche");
     assert_eq!(bob.group_id(), b"gruppe-bytes".to_vec());
 
-    // Anwendungsnachricht hin und zurück, nur über Blobs.
+    // Anwendungsnachricht hin und zurück, nur über Blobs; der Absender
+    // kommt aus der von MLS geprüften Credential, nicht aus der Hülle.
     let ciphertext = alice.create_message(b"hallo gruppe").unwrap();
-    assert_eq!(
-        bob.process(&ciphertext).unwrap().as_deref(),
-        Some(b"hallo gruppe".as_slice())
-    );
+    let inbound = bob.process(&ciphertext).unwrap().expect("Anwendung");
+    assert_eq!(inbound.plaintext, b"hallo gruppe");
+    assert_eq!(inbound.sender_identity, b"alice");
     let reply = bob.create_message(b"hallo zurueck").unwrap();
-    assert_eq!(
-        alice.process(&reply).unwrap().as_deref(),
-        Some(b"hallo zurueck".as_slice())
-    );
+    let inbound = alice.process(&reply).unwrap().expect("Anwendung");
+    assert_eq!(inbound.plaintext, b"hallo zurueck");
+    assert_eq!(inbound.sender_identity, b"bob");
+
+    // Die Mitgliederliste kommt aus dem Ratchet-Tree.
+    let mut identities = bob.member_identities();
+    identities.sort();
+    assert_eq!(identities, vec![b"alice".to_vec(), b"bob".to_vec()]);
 }
 
 /// Der Neustart-Beweis der persistenten MLS-Ablage: beide Seiten frieren
@@ -339,8 +343,8 @@ fn group_session_survives_restart_via_exported_state() {
     let mut bob = GroupSession::join_group(bob_restored, &outcome.welcome).unwrap();
     let first = alice.create_message(b"vor dem neustart").unwrap();
     assert_eq!(
-        bob.process(&first).unwrap().as_deref(),
-        Some(b"vor dem neustart".as_slice())
+        bob.process(&first).unwrap().expect("Anwendung").plaintext,
+        b"vor dem neustart"
     );
     // Export NACH der letzten Operation beider Seiten: auch das Erzeugen
     // einer Nachricht rückt den Sende-Ratchet vor. Ein Export davor ließe
@@ -367,13 +371,13 @@ fn group_session_survives_restart_via_exported_state() {
 
     let second = alice.create_message(b"nach dem neustart").unwrap();
     assert_eq!(
-        bob.process(&second).unwrap().as_deref(),
-        Some(b"nach dem neustart".as_slice())
+        bob.process(&second).unwrap().expect("Anwendung").plaintext,
+        b"nach dem neustart"
     );
     let reply = bob.create_message(b"zurueck nach neustart").unwrap();
     assert_eq!(
-        alice.process(&reply).unwrap().as_deref(),
-        Some(b"zurueck nach neustart".as_slice())
+        alice.process(&reply).unwrap().expect("Anwendung").plaintext,
+        b"zurueck nach neustart"
     );
 
     // Eine unbekannte Gruppen-ID lädt nichts (kein Fehler, kein Panik).

@@ -24,14 +24,18 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use client_app::account::IdentityKeypair;
 use client_app::delivery::{
-    parse_ws_event, ws_auth_frame, DeliveryClient, OutgoingEnvelope, WsEvent,
+    parse_ws_event, ws_auth_frame, DeliveryClient, GroupOutgoing, OutgoingEnvelope, WsEvent,
 };
 use client_app::directory::DirectoryClient;
+use client_app::grouptext::{self, GroupPayload, RosterDevice};
 use client_app::identity::DeviceEnrollment;
-use client_app::prekeys::{bundle_from_directory, device_id_from_u32, publication_from_bundle};
+use client_app::prekeys::{
+    bundle_from_directory, device_id_from_u32, new_uuid, publication_from_bundle, DirectoryPrekey,
+};
 use client_app::protocol_store::{has_own_identity, store_own_identity, PersistentProtocolStore};
 use client_app::storage::{FileStorage, KeyValueStorage as _};
 use client_app::{wire, IdentityClient, NewAccount};
+use client_core::group::{GroupMember, GroupSession};
 use client_core::libsignal_protocol::ProtocolAddress;
 use client_core::onetoone::Device;
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -50,6 +54,17 @@ const DEFAULT_KT_URL: &str = "http://127.0.0.1:8083";
 const CREDENTIAL_TTL_SECONDS: u64 = 60 * 60 * 24 * 365;
 /// Storage-Schlüssel des Prekey-ID-Zählers (client-core `next_prekey_id`).
 const COUNTER_KEY: &str = "counter/next_prekey_id";
+/// Storage-Schlüssel des persistenten MLS-Zustands (smmls.v1-Blob mit
+/// Signierschlüssel, KeyPackage-Privatteilen und allen Gruppenzuständen;
+/// EIN Mitglied je Gerät für alle Gruppen). Liegt wie alles andere hinter
+/// dem keystore, wenn SM_PASSPHRASE gesetzt ist.
+const MLS_STATE_KEY: &str = "mls/state";
+/// Storage-Schlüssel der lokalen Gruppenliste (`sm groups`).
+const GROUPS_INDEX_KEY: &str = "groups/index";
+/// Wie viele MLS-KeyPackages `sm publish-keys` je Lauf nachlegt. Das
+/// Verzeichnis konsumiert je Einladung eines, ein kleiner Vorrat erlaubt
+/// mehrere Einladungen zwischen zwei Läufen.
+const MLS_KEY_PACKAGE_BATCH: usize = 4;
 
 /// Das lokal abgelegte Client-Profil. Der Konto-Seed ist der private
 /// Wurzelschlüssel; wer diese Datei hat, hat das Konto.
@@ -125,6 +140,9 @@ async fn run() -> Result<(), String> {
         "undelete" => undelete().await,
         "rename" => rename(&args[1..]).await,
         "publish-keys" => publish_keys().await,
+        "group-create" => group_create(&args[1..]).await,
+        "groups" => groups_list(),
+        "group-send" => group_send(&args[1..]).await,
         "send" => send(&args[1..]).await,
         "recv" => recv().await,
         "listen" => listen(&args[1..]).await,
@@ -298,15 +316,38 @@ async fn publish_keys() -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     let publication = publication_from_bundle(&bundle).map_err(|e| e.to_string())?;
-    let counts = DirectoryClient::new(directory_url())
+    let directory = DirectoryClient::new(directory_url());
+    let counts = directory
         .publish(&token, &publication)
         .await
         .map_err(|e| e.to_string())?;
     save_counter(&storage, device.next_prekey_id())?;
 
+    // Dazu ein kleiner Vorrat MLS-KeyPackages, damit andere dieses Konto
+    // in Gruppen einladen können (das Verzeichnis konsumiert je Einladung
+    // eines). Die Privatteile wandern in den persistenten MLS-Zustand:
+    // erst sichern, dann veröffentlichen, sonst wäre ein Welcome auf ein
+    // KeyPackage möglich, dessen Privatteil nie gespeichert wurde.
+    let member = load_or_new_member(&storage, &profile.handle)?;
+    let mut packages = Vec::with_capacity(MLS_KEY_PACKAGE_BATCH);
+    for _ in 0..MLS_KEY_PACKAGE_BATCH {
+        let blob = member.key_package_blob()?;
+        packages.push(DirectoryPrekey {
+            id: new_uuid(),
+            key: BASE64.encode(&blob),
+        });
+    }
+    save_member_state(&storage, &member.export_state()?)?;
+    directory
+        .publish_mls_key_packages(&token, &packages)
+        .await
+        .map_err(|e| e.to_string())?;
+
     println!(
-        "Prekeys veröffentlicht (Einmal-Vorrat: {} klassisch, {} PQ)",
-        counts.one_time, counts.pq_one_time
+        "Prekeys veröffentlicht (Einmal-Vorrat: {} klassisch, {} PQ, {} MLS-KeyPackages)",
+        counts.one_time,
+        counts.pq_one_time,
+        packages.len()
     );
     Ok(())
 }
@@ -771,6 +812,27 @@ async fn drain_waiting(
                     eprintln!("Hülle {} nicht entsiegelbar: {error}", message.id);
                     // Bestätigen wie unten: ein erneuter Abruf scheitert
                     // am selben Fehler.
+                    acked.push(message.id.clone());
+                }
+            }
+            continue;
+        }
+        // Gruppen-Hüllen (smgrp.v1): MLS verarbeiten statt Double Ratchet.
+        if matches!(wire::classify(&message.envelope), wire::Framed::Group) {
+            let opened = match wire::open_group(&message.envelope) {
+                Ok(opened) => opened,
+                Err(error) => {
+                    eprintln!("Gruppen-Hülle {} übersprungen: {error}", message.id);
+                    continue;
+                }
+            };
+            match handle_group_envelope(storage, &own_handle, &opened.group_id, &opened.blob) {
+                // Auch fehlgeschlagene Verarbeitung bestätigen: ein
+                // erneuter Abruf scheiterte am selben Fehler (MLS-Zustand
+                // kennt die Epoche bzw. den Schlüssel nicht mehr).
+                Ok(()) => acked.push(message.id.clone()),
+                Err(error) => {
+                    eprintln!("Gruppen-Hülle {} nicht verarbeitbar: {error}", message.id);
                     acked.push(message.id.clone());
                 }
             }
@@ -1325,6 +1387,361 @@ async fn rename(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Ein Eintrag der lokalen Gruppenliste: die Zustell-ID plus die
+/// Mitglieder-Handles (aus dem MLS-Ratchet-Tree bzw. der Gründung).
+#[derive(Serialize, Deserialize)]
+struct GroupEntry {
+    id: String,
+    members: Vec<String>,
+}
+
+fn roster_key(group_id: &str) -> String {
+    format!("group/{group_id}/roster")
+}
+
+/// Lädt das MLS-Mitglied aus der Ablage oder legt ein frisches an und
+/// persistiert es sofort (die KeyPackage-Privatteile müssen jeden
+/// Prozesswechsel überleben, sonst wäre ein späterer Welcome wertlos).
+fn load_or_new_member(storage: &SharedStorage, handle: &str) -> Result<GroupMember, String> {
+    let existing = storage
+        .borrow()
+        .get(MLS_STATE_KEY)
+        .map_err(|e| e.to_string())?;
+    match existing {
+        Some(state) => GroupMember::restore(handle.as_bytes(), &state),
+        None => {
+            let member = GroupMember::new(handle.as_bytes())?;
+            save_member_state(storage, &member.export_state()?)?;
+            Ok(member)
+        }
+    }
+}
+
+fn save_member_state(storage: &SharedStorage, state: &[u8]) -> Result<(), String> {
+    storage
+        .borrow_mut()
+        .put(MLS_STATE_KEY, state)
+        .map_err(|e| e.to_string())
+}
+
+fn load_group_index(storage: &SharedStorage) -> Result<Vec<GroupEntry>, String> {
+    let raw = storage
+        .borrow()
+        .get(GROUPS_INDEX_KEY)
+        .map_err(|e| e.to_string())?;
+    match raw {
+        Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn save_group_index(storage: &SharedStorage, index: &[GroupEntry]) -> Result<(), String> {
+    let bytes = serde_json::to_vec(index).map_err(|e| e.to_string())?;
+    storage
+        .borrow_mut()
+        .put(GROUPS_INDEX_KEY, &bytes)
+        .map_err(|e| e.to_string())
+}
+
+/// Merkt eine Gruppe in der lokalen Liste vor (ersetzt einen bestehenden
+/// Eintrag derselben ID, etwa nach einer Mitglieder-Änderung).
+fn remember_group(storage: &SharedStorage, entry: GroupEntry) -> Result<(), String> {
+    let mut index = load_group_index(storage)?;
+    index.retain(|g| g.id != entry.id);
+    index.push(entry);
+    save_group_index(storage, &index)
+}
+
+fn save_roster(
+    storage: &SharedStorage,
+    group_id: &str,
+    devices: &[RosterDevice],
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec(devices).map_err(|e| e.to_string())?;
+    storage
+        .borrow_mut()
+        .put(&roster_key(group_id), &bytes)
+        .map_err(|e| e.to_string())
+}
+
+fn load_roster(storage: &SharedStorage, group_id: &str) -> Result<Vec<RosterDevice>, String> {
+    let raw = storage
+        .borrow()
+        .get(&roster_key(group_id))
+        .map_err(|e| e.to_string())?;
+    match raw {
+        Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
+        None => Err(
+            "Geräte-Roster dieser Gruppe fehlt noch; 'sm recv' holt ihn (der Gründer schickt ihn \
+             als erste Gruppen-Nachricht)."
+                .to_string(),
+        ),
+    }
+}
+
+/// `sm group-create <mitglied> [<mitglied>...]`: gründet eine MLS-Gruppe
+/// mit sich selbst plus den genannten Handles. Die Eingeladenen brauchen
+/// veröffentlichte MLS-KeyPackages (`sm publish-keys`). Ablauf wie in
+/// specs/mls-delivery-service.md: Gruppe beim Zustelldienst anlegen
+/// (Epoche 0), KeyPackages je Gerät der Eingeladenen aus dem Verzeichnis
+/// holen (konsumiert je eins), ein Commit lädt alle ein (Epoche 1), die
+/// Welcome-Hüllen gehen an die eingeladenen Geräte, und der Geräte-Roster
+/// folgt als erste Anwendungsnachricht (Ende-zu-Ende, wie alles).
+async fn group_create(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("Aufruf: sm group-create <mitglied> [<mitglied>...]".to_string());
+    }
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    let mut invitees: Vec<String> = Vec::new();
+    for handle in args {
+        if handle != &profile.handle && !invitees.contains(handle) {
+            invitees.push(handle.clone());
+        }
+    }
+    if invitees.is_empty() {
+        return Err("Eine Gruppe braucht mindestens ein anderes Mitglied.".to_string());
+    }
+    let mut members = vec![profile.handle.clone()];
+    members.extend(invitees.iter().cloned());
+
+    // Zuerst die KeyPackages holen: scheitert ein Eingeladener (nichts
+    // veröffentlicht), ist noch nichts angelegt worden.
+    let directory = DirectoryClient::new(directory_url());
+    let mut invite_blobs = Vec::new();
+    let mut roster = Vec::new();
+    for handle in &invitees {
+        let packages = directory
+            .mls_key_packages(&token, handle)
+            .await
+            .map_err(|e| e.to_string())?;
+        if packages.devices.is_empty() {
+            return Err(format!(
+                "{handle} hat kein MLS-KeyPackage veröffentlicht; dort 'sm publish-keys' ausführen."
+            ));
+        }
+        for entry in packages.devices {
+            invite_blobs.push(
+                BASE64
+                    .decode(&entry.key_package)
+                    .map_err(|e| format!("KeyPackage von {handle} unlesbar: {e}"))?,
+            );
+            roster.push(RosterDevice {
+                handle: handle.clone(),
+                device_id: entry.device_id,
+            });
+        }
+    }
+
+    // Der Roster führt ALLE Mitglieds-Geräte einschließlich des eigenen:
+    // Beigetretene adressieren daraus auch den Gründer. Die Fanouts unten
+    // filtern die eigenen Geräte heraus (das eigene MLS-Leaf kann die
+    // eigene Nachricht nicht entschlüsseln).
+    roster.push(RosterDevice {
+        handle: profile.handle.clone(),
+        device_id: profile.device_id.clone(),
+    });
+
+    let delivery = DeliveryClient::new(delivery_url());
+    let group_id = new_uuid();
+    let created = delivery
+        .create_group(&token, &group_id, &members)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let storage = open_storage()?;
+    let member = load_or_new_member(&storage, &profile.handle)?;
+    let mut session = GroupSession::create(member, group_id.as_bytes())?;
+    let outcome = session.add_members(&invite_blobs)?;
+    // Zustand VOR dem Verteilen sichern: bricht der Prozess nach dem
+    // Commit ab, kennt die Ablage die Gruppe trotzdem schon.
+    save_member_state(&storage, &session.export_state()?)?;
+
+    let welcome_fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &profile.handle)
+        .map(|device| {
+            Ok(GroupOutgoing {
+                id: new_uuid(),
+                device_id: device.device_id.clone(),
+                envelope: wire::seal_group(&group_id, &outcome.welcome)
+                    .map_err(|e| e.to_string())?,
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    delivery
+        .group_commit(&token, &group_id, 0, &members, &welcome_fanout)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Der Geräte-Roster als erste Anwendungsnachricht: Beigetretene
+    // erfahren daraus, an welche Geräte sie ihre Hüllen adressieren
+    // (der Zustelldienst hat bewusst keine GET-Route dafür).
+    let roster_blob = session.create_message(&grouptext::encode_roster(&roster))?;
+    // Auch das Erzeugen rückt den Sende-Ratchet vor: Zustand sichern,
+    // BEVOR der Chiffretext das Gerät verlässt (sonst nutzte ein
+    // Wiederanlauf dieselbe Ratchet-Position erneut).
+    save_member_state(&storage, &session.export_state()?)?;
+    let roster_fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &profile.handle)
+        .map(|device| {
+            Ok(GroupOutgoing {
+                id: new_uuid(),
+                device_id: device.device_id.clone(),
+                envelope: wire::seal_group(&group_id, &roster_blob).map_err(|e| e.to_string())?,
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    delivery
+        .group_messages(&token, &group_id, &roster_fanout)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    save_roster(&storage, &group_id, &roster)?;
+    remember_group(
+        &storage,
+        GroupEntry {
+            id: group_id.clone(),
+            members: members.clone(),
+        },
+    )?;
+    println!(
+        "Gruppe {group_id} angelegt: {} ({} Gerät(e) beim Dienst)",
+        members.join(", "),
+        created.devices
+    );
+    Ok(())
+}
+
+/// `sm groups`: die lokale Gruppenliste (Zustell-ID plus Mitglieder).
+fn groups_list() -> Result<(), String> {
+    let storage = open_storage()?;
+    let index = load_group_index(&storage)?;
+    if index.is_empty() {
+        println!("Keine Gruppen. Mit 'sm group-create <mitglied>...' die erste gründen.");
+        return Ok(());
+    }
+    for entry in index {
+        println!("{}  {}", entry.id, entry.members.join(", "));
+    }
+    Ok(())
+}
+
+/// `sm group-send <gruppen-id> <text>`: verschlüsselt den Text mit MLS an
+/// die Gruppe und stellt ihn an alle Geräte des lokalen Rosters zu.
+async fn group_send(args: &[String]) -> Result<(), String> {
+    let [group_id, text] = args else {
+        return Err("Aufruf: sm group-send <gruppen-id> <text>".to_string());
+    };
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    let storage = open_storage()?;
+    let member = load_or_new_member(&storage, &profile.handle)?;
+    let Some(mut session) = GroupSession::load(member, group_id.as_bytes())? else {
+        return Err(format!(
+            "Gruppe {group_id} ist in der lokalen Ablage unbekannt ('sm groups' zeigt die eigenen)."
+        ));
+    };
+    let roster = load_roster(&storage, group_id)?;
+    let blob = session.create_message(&grouptext::encode_text(text))?;
+    // Zustand sichern, BEVOR der Chiffretext das Gerät verlässt (siehe
+    // group_create: sonst Ratchet-Wiederverwendung nach einem Abbruch).
+    save_member_state(&storage, &session.export_state()?)?;
+    let fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &profile.handle)
+        .map(|device| {
+            Ok(GroupOutgoing {
+                id: new_uuid(),
+                device_id: device.device_id.clone(),
+                envelope: wire::seal_group(group_id, &blob).map_err(|e| e.to_string())?,
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    let sent = delivery_client()
+        .group_messages(&token, group_id, &fanout)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("An die Gruppe gesendet ({} Gerät(e))", sent.accepted);
+    Ok(())
+}
+
+fn delivery_client() -> DeliveryClient {
+    DeliveryClient::new(delivery_url())
+}
+
+/// Die Zustell-Ziele aus einem Roster: alle Geräte AUSSER den eigenen
+/// (das eigene MLS-Leaf kann die eigene Nachricht nicht entschlüsseln,
+/// eine Kopie an sich selbst wäre nur eine Fehlermeldung beim Abholen).
+fn fanout_targets<'a>(
+    roster: &'a [RosterDevice],
+    own_handle: &'a str,
+) -> impl Iterator<Item = &'a RosterDevice> {
+    roster
+        .iter()
+        .filter(move |device| device.handle != own_handle)
+}
+
+/// Verarbeitet eine eingehende Gruppen-Hülle: bekannte Gruppe -> MLS
+/// verarbeiten (Text ausgeben, Roster übernehmen, fremde Commits
+/// anwenden); unbekannte Gruppe -> der Blob muss ein Welcome sein, also
+/// beitreten und die Gruppe lokal vormerken. Der MLS-Zustand wird nach
+/// JEDER Verarbeitung gesichert (der Ratchet ist weitergelaufen).
+fn handle_group_envelope(
+    storage: &SharedStorage,
+    own_handle: &str,
+    group_id: &str,
+    blob: &[u8],
+) -> Result<(), String> {
+    let member = load_or_new_member(storage, own_handle)?;
+    match GroupSession::load(member, group_id.as_bytes())? {
+        Some(mut session) => {
+            let inbound = session.process(blob)?;
+            save_member_state(storage, &session.export_state()?)?;
+            match inbound {
+                Some(application) => {
+                    let sender = String::from_utf8_lossy(&application.sender_identity).to_string();
+                    match grouptext::decode(&application.plaintext).map_err(|e| e.to_string())? {
+                        GroupPayload::Text { text } => {
+                            println!("[gruppe {group_id}] {sender}: {text}");
+                        }
+                        GroupPayload::Roster { devices } => {
+                            save_roster(storage, group_id, &devices)?;
+                            println!(
+                                "[gruppe {group_id}] Geräte-Roster von {sender} übernommen ({} Gerät(e))",
+                                devices.len()
+                            );
+                        }
+                    }
+                }
+                None => println!("[gruppe {group_id}] Gruppen-Update angewandt"),
+            }
+            Ok(())
+        }
+        None => {
+            // `load` hat das Mitglied konsumiert; für den Beitritt frisch
+            // aus der (unveränderten) Ablage wiederherstellen.
+            let member = load_or_new_member(storage, own_handle)?;
+            let session = GroupSession::join_group(member, blob)
+                .map_err(|e| format!("Hülle einer unbekannten Gruppe, Beitritt scheitert: {e}"))?;
+            let members: Vec<String> = session
+                .member_identities()
+                .into_iter()
+                .map(|identity| String::from_utf8_lossy(&identity).to_string())
+                .collect();
+            save_member_state(storage, &session.export_state()?)?;
+            remember_group(
+                storage,
+                GroupEntry {
+                    id: group_id.to_string(),
+                    members: members.clone(),
+                },
+            )?;
+            println!(
+                "[gruppe {group_id}] beigetreten ({} Mitglieder: {})",
+                members.len(),
+                members.join(", ")
+            );
+            Ok(())
+        }
+    }
+}
+
 /// `sm verify`: die KT-Selbstprüfung des eigenen Kontos
 /// (specs/key-transparency.md). Rechnet das Commitment aus Konto-Schlüssel
 /// und eigener Gerätemenge nach und verifiziert den Inklusionsbeweis gegen
@@ -1379,7 +1796,10 @@ fn print_usage() {
          \x20 delete-account <passwort>     Konto-Loeschung vormerken (Widerrufsfrist)\n\
          \x20 undelete                      vorgemerkte Loeschung widerrufen\n\
          \x20 rename <anzeigename>          Anzeigename aendern (Handle bleibt)\n\
-         \x20 publish-keys                   Prekey-Satz im Verzeichnis veröffentlichen\n\
+         \x20 publish-keys                   Prekey-Satz + MLS-KeyPackages veroeffentlichen\n\
+         \x20 group-create <mitglied>...     MLS-Gruppe mit sich + den Handles gruenden\n\
+         \x20 groups                         lokale Gruppenliste (ID + Mitglieder)\n\
+         \x20 group-send <id> <text>         E2EE-Gruppennachricht senden\n\
          \x20 send <handle> <text> [--ttl s] [--sealed]  E2EE senden (--ttl: verschwindet; --sealed: ohne Absender-Klartext)\n\
          \x20 recv                           wartende Nachrichten abholen und entschlüsseln\n\
          \x20 listen [--once]                Hinweiskanal halten und bei Hinweisen abholen\n\

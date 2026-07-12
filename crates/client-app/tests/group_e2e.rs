@@ -244,17 +244,21 @@ async fn three_users_exchange_a_group_message_over_real_services() {
         .expect("Gruppennachricht senden");
     assert_eq!(sent.accepted, 2);
 
-    // Beide holen ab und entschlüsseln denselben Klartext.
+    // Beide holen ab und entschlüsseln denselben Klartext; der Absender
+    // kommt aus der von MLS geprüften Credential.
     for (group, party) in [(&mut bob_group, &bob), (&mut carol_group, &carol)] {
         let blobs = drain_group_blobs(&delivery, &party.access_token).await;
         assert_eq!(blobs.len(), 1, "{} bekommt die Nachricht", party.handle);
-        let plaintext = group.process(&blobs[0]).expect("verarbeiten");
+        let inbound = group
+            .process(&blobs[0])
+            .expect("verarbeiten")
+            .expect("Anwendungsnachricht");
         assert_eq!(
-            plaintext.as_deref(),
-            Some(b"hallo gruppe, ende-zu-ende".as_slice()),
+            inbound.plaintext, b"hallo gruppe, ende-zu-ende",
             "{} entschlüsselt die Gruppennachricht",
             party.handle
         );
+        assert_eq!(inbound.sender_identity, b"alice");
     }
 
     // Neustart-Beweis über die echten Dienste: Bob friert seinen Zustand
@@ -288,8 +292,9 @@ async fn three_users_exchange_a_group_message_over_real_services() {
         bob_group
             .process(&blobs[0])
             .expect("verarbeiten")
-            .as_deref(),
-        Some(b"nach bobs neustart".as_slice()),
+            .expect("Anwendungsnachricht")
+            .plaintext,
+        b"nach bobs neustart",
         "der wiederhergestellte Bob liest mit fortgesetztem Ratchet"
     );
 }

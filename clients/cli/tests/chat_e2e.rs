@@ -613,3 +613,86 @@ async fn account_deletion_schedule_and_undelete() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// MLS-Gruppen über die CLI: gründen, beitreten (Welcome plus Roster über
+/// den normalen Abholweg), senden in beide Richtungen -- und jeder
+/// `sm`-Befehl ist ein eigener Prozess. Dass ein Beigetretener in einem
+/// SPÄTEREN Prozess senden und der Gründer in wieder einem anderen lesen
+/// kann, beweist die persistente MLS-Ablage (smmls.v1) über
+/// Prozessgrenzen, analog zum 1:1-Ratchet-Beweis oben.
+#[tokio::test(flavor = "multi_thread")]
+async fn group_chat_over_separate_cli_processes() {
+    let urls = start_stack().await;
+    let dir = std::env::temp_dir().join(format!("sm-grp-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("Testverzeichnis");
+
+    let anna = CliUser::new(&dir, "anna", &urls);
+    let bert = CliUser::new(&dir, "bert", &urls);
+    let carl = CliUser::new(&dir, "carl", &urls);
+    for (user, handle) in [(&anna, "anna"), (&bert, "bert"), (&carl, "carl")] {
+        user.run(&["register", handle, "ein-langes-gruppen-passwort"]);
+        user.run(&["login", "ein-langes-gruppen-passwort"]);
+        // publish-keys legt neben den 1:1-Prekeys auch MLS-KeyPackages
+        // nach; ohne sie könnte niemand eingeladen werden.
+        let published = user.run(&["publish-keys"]);
+        assert!(
+            published.contains("MLS-KeyPackages"),
+            "publish-keys muss MLS-KeyPackages nachlegen, stdout war: {published}"
+        );
+    }
+
+    // Anna gründet die Gruppe; die Zustell-ID steht in der Ausgabe.
+    let created = anna.run(&["group-create", "bert", "carl"]);
+    let group_id = created
+        .split_whitespace()
+        .nth(1)
+        .expect("Gruppen-ID in der Ausgabe")
+        .to_string();
+    assert!(
+        created.contains("anna, bert, carl"),
+        "stdout war: {created}"
+    );
+
+    // Bert und Carl holen ab: Beitritt (Welcome) und Geräte-Roster kommen
+    // im selben Lauf über den normalen Abholweg.
+    let bert_recv = bert.run(&["recv"]);
+    assert!(
+        bert_recv.contains("beigetreten") && bert_recv.contains("Roster"),
+        "Bert muss beitreten und den Roster übernehmen, stdout war: {bert_recv}"
+    );
+    let carl_recv = carl.run(&["recv"]);
+    assert!(
+        carl_recv.contains("beigetreten"),
+        "Carl muss beitreten, stdout war: {carl_recv}"
+    );
+
+    // Die Gruppe steht in Berts lokaler Liste (samt Mitgliedern aus dem
+    // MLS-Ratchet-Tree, nicht aus einer Server-Antwort).
+    let groups = bert.run(&["groups"]);
+    assert!(
+        groups.contains(&group_id) && groups.contains("anna"),
+        "stdout war: {groups}"
+    );
+
+    // Bert sendet in einem frischen Prozess: sein MLS-Zustand kommt aus
+    // der Ablage. Anna (Gründerin) und Carl lesen denselben Text, der
+    // Absender stammt aus der von MLS geprüften Credential.
+    bert.run(&["group-send", &group_id, "hallo gruppe aus der cli"]);
+    for user in [&anna, &carl] {
+        let received = user.run(&["recv"]);
+        assert!(
+            received.contains("bert: hallo gruppe aus der cli"),
+            "stdout war: {received}"
+        );
+    }
+
+    // Und zurück: die Gründerin antwortet, der Beigetretene liest.
+    anna.run(&["group-send", &group_id, "willkommen ihr zwei"]);
+    let bert_reads = bert.run(&["recv"]);
+    assert!(
+        bert_reads.contains("anna: willkommen ihr zwei"),
+        "stdout war: {bert_reads}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -24,6 +24,7 @@ pub mod directory;
 pub mod discovery;
 pub mod error;
 pub mod franking;
+pub mod grouptext;
 mod http;
 pub mod identity;
 pub mod kt;

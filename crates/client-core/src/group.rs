@@ -327,9 +327,11 @@ impl GroupSession {
     }
 
     /// Verarbeitet einen eingehenden Wire-Blob. Eine Anwendungsnachricht
-    /// liefert ihren Klartext; ein Handshake (Commit anderer Mitglieder)
-    /// wird angewandt und ergibt `None`.
-    pub fn process(&mut self, wire: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    /// liefert Klartext samt Absender-Identität aus der von MLS geprüften
+    /// Credential (die Transport-Hülle trägt bewusst keinen Absender;
+    /// nur die kryptografisch verifizierte Identität zählt); ein Handshake
+    /// (Commit anderer Mitglieder) wird angewandt und ergibt `None`.
+    pub fn process(&mut self, wire: &[u8]) -> Result<Option<GroupApplication>, String> {
         let message = MlsMessageIn::tls_deserialize_exact(wire)
             .map_err(|err| format!("Gruppen-Blob unlesbar: {err}"))?;
         let protocol = message
@@ -339,9 +341,15 @@ impl GroupSession {
             .group
             .process_message(&self.member.provider, protocol)
             .map_err(|err| format!("Gruppennachricht verarbeiten: {err}"))?;
+        let sender_identity = BasicCredential::try_from(processed.credential().clone())
+            .map(|basic| basic.identity().to_vec())
+            .unwrap_or_default();
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(application) => {
-                Ok(Some(application.into_bytes()))
+                Ok(Some(GroupApplication {
+                    sender_identity,
+                    plaintext: application.into_bytes(),
+                }))
             }
             ProcessedMessageContent::StagedCommitMessage(staged) => {
                 self.group
@@ -353,6 +361,21 @@ impl GroupSession {
             // tragen ihre Proposals selbst (add_members).
             _ => Ok(None),
         }
+    }
+
+    /// Die Identitäten aller Mitglieder der aktuellen Epoche (bei
+    /// plattform-eigenen Gruppen die Handle-Bytes aus den Credentials).
+    /// Ein Beigetretener liest daraus, wer in der Gruppe ist, ohne dem
+    /// Transport zu vertrauen.
+    pub fn member_identities(&self) -> Vec<Vec<u8>> {
+        self.group
+            .members()
+            .filter_map(|member| {
+                BasicCredential::try_from(member.credential)
+                    .ok()
+                    .map(|basic| basic.identity().to_vec())
+            })
+            .collect()
     }
 
     /// Anzahl der Mitglieder in der aktuellen Epoche.
@@ -391,4 +414,16 @@ pub struct AddMembersOutcome {
     pub commit: Vec<u8>,
     /// Welcome für die neu eingeladenen Mitglieder.
     pub welcome: Vec<u8>,
+}
+
+/// Eine entschlüsselte Gruppen-Anwendungsnachricht: Klartext plus die von
+/// MLS geprüfte Absender-Identität (Handle-Bytes der Credential). Die
+/// Identität kommt aus der Signaturprüfung des Ratchet-Trees, nicht aus
+/// der Transport-Hülle; ein Absender kann sie nicht frei behaupten.
+pub struct GroupApplication {
+    /// Identität des Absenders (bei plattform-eigenen Gruppen die
+    /// Handle-Bytes); leer nur bei einem fremden Credential-Typ.
+    pub sender_identity: Vec<u8>,
+    /// Der entschlüsselte Anwendungs-Klartext.
+    pub plaintext: Vec<u8>,
 }
