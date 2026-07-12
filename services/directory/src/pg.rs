@@ -83,19 +83,24 @@ impl PrekeyStore for PgPrekeyStore {
         // Ein Stapel ist eine Transaktion: entweder kommt der ganze Upload
         // an oder nichts, halbe Pools gibt es nicht.
         let mut tx = self.pool.begin().await.map_err(backend)?;
-        // MLS-Pool deckeln: die Zeile des Geräts sperren (FOR UPDATE), die
-        // ungenutzten KeyPackages zählen und ablehnen, wenn der Upload die
-        // Obergrenze überschritte. In derselben Transaktion, also atomar
-        // gegen ein zweites gleichzeitiges Nachladen desselben Geräts.
+        // MLS-Pool deckeln: die Uploads desselben Geräts über eine
+        // Transaktions-Advisory-Sperre serialisieren (FOR UPDATE geht bei
+        // count(*) nicht), dann die ungenutzten KeyPackages zählen und
+        // ablehnen, wenn der Stapel die Obergrenze überschritte. Die Sperre
+        // fällt am Transaktionsende automatisch.
         let new_mls = uploads
             .iter()
             .filter(|u| u.kind == PrekeyKind::MlsKeyPackage)
             .count() as i64;
         if new_mls > 0 {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
+                .bind(device_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
             let existing_mls: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM prekeys \
-                 WHERE device_id = $1 AND kind = 'mls_key_package' AND used = FALSE \
-                 FOR UPDATE",
+                 WHERE device_id = $1 AND kind = 'mls_key_package' AND used = FALSE",
             )
             .bind(device_id)
             .fetch_one(&mut *tx)

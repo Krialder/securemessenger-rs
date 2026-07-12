@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use directory::domain::{PoolCounts, Prekey, PrekeyKind};
 use directory::pg::{connect_and_migrate, PgPrekeyStore};
-use directory::store::{PrekeyStore, PrekeyUpload, StoreError};
+use directory::store::{PrekeyStore, PrekeyUpload, StoreError, MAX_MLS_KEY_PACKAGES};
 use uuid::Uuid;
 
 async fn store() -> Option<PgPrekeyStore> {
@@ -161,4 +161,38 @@ async fn mls_key_packages_claim_over_postgres() {
     assert_ne!(first.id, second.id);
     assert!(store.take_mls_key_package(&device).await.unwrap().is_none());
     assert_eq!(store.counts(&device).await.unwrap().mls_key_package, 0);
+}
+
+#[tokio::test]
+async fn mls_pool_cap_enforced_against_postgres() {
+    let Some(store) = store().await else { return };
+    let device = Uuid::new_v4().to_string();
+
+    // Bis zum Deckel füllen (in einem Stapel) ist in Ordnung.
+    let full: Vec<PrekeyUpload> = (0..MAX_MLS_KEY_PACKAGES)
+        .map(|_| upload(PrekeyKind::MlsKeyPackage))
+        .collect();
+    store.upload(&device, full).await.unwrap();
+    assert_eq!(
+        store.counts(&device).await.unwrap().mls_key_package,
+        MAX_MLS_KEY_PACKAGES
+    );
+
+    // Eines mehr wird abgelehnt (der Pool ist voll).
+    let err = store
+        .upload(&device, vec![upload(PrekeyKind::MlsKeyPackage)])
+        .await
+        .unwrap_err();
+    assert_eq!(err, StoreError::MlsPoolFull);
+
+    // Nach dem Verbrauch eines KeyPackages ist wieder Platz für genau eines.
+    store.take_mls_key_package(&device).await.unwrap();
+    store
+        .upload(&device, vec![upload(PrekeyKind::MlsKeyPackage)])
+        .await
+        .unwrap();
+    assert_eq!(
+        store.counts(&device).await.unwrap().mls_key_package,
+        MAX_MLS_KEY_PACKAGES
+    );
 }
