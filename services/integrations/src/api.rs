@@ -180,10 +180,12 @@ async fn authenticate_tenant(
 /// Scope- und Rate-Limit-Prüfung nach der Authentifizierung.
 fn authorize(st: &AppState, tenant: &Tenant, scope: &'static str) -> Option<Response> {
     if !tenant.has_scope(scope) {
+        // "Token", nicht "Mandant": seit Least Privilege je Token kann das
+        // Token enger sein als der Mandant (der das Recht durchaus haette).
         return Some(api_error(
             StatusCode::FORBIDDEN,
             "missing_scope",
-            format!("Mandant hat den Scope '{scope}' nicht"),
+            format!("Das Token hat den Scope '{scope}' nicht"),
         ));
     }
     if let Err(retry_after) = st.limiter.check(&tenant.id, tenant.rate_limit) {

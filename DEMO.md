@@ -7,7 +7,7 @@ Das Drehbuch für eine Live-Vorführung des SecureMessengers auf einer frischen 
 Einmalig `scripts\sm.ps1 -Setup` ausführen (installiert Rust, MSVC, protoc, Docker samt WSL, trunk und legt den `sm-postgres`-Container an); die grafische `SecureMessenger.cmd` erledigt dasselbe per Haken-Auswahl. Danach genügt für jede Vorführung:
 
 ```powershell
-scripts\sm.ps1          # startet Dienste (8080-8083) und Web-Clients (3000, 3001)
+scripts\sm.ps1          # startet Dienste (8080-8083, integrations 8085) und Web-Clients (3000, 3001)
 scripts\sm.ps1 -Reset   # dasselbe mit frischen demo_*-Datenbanken
 scripts\sm.ps1 -Stop    # beendet alles wieder
 ```
@@ -89,6 +89,48 @@ Das Melden bricht die Ende-zu-Ende-Verschlüsselung nicht: Der Server lernt den 
 ```
 
 Wird die Hülle nicht binnen zehn Sekunden abgeholt, liefert die Zustellung sie nicht mehr aus; ein `recv` nach Ablauf bleibt leer.
+
+## 8. Integrations-API: ein Fremdprojekt bindet an (das Fundament)
+
+Zeigt den maschinellen Weg, auf dem ein anderes Ausbildungsprojekt (etwa AzubiOS) den Messenger nutzt, ohne den eigenen Stack zu ändern: standardkonformer OAuth2-Fluss, Benachrichtigung und Präsenz. Der `integrations`-Dienst läuft auf Port 8085.
+
+```powershell
+$B = "http://127.0.0.1:8085"
+
+# 1) Der Betrieb legt das Fremdprojekt als Mandanten an (interne Route, Shared Secret).
+$tenant = Invoke-RestMethod -Method Post "$B/internal/tenants" `
+  -Headers @{ 'x-internal-token' = 'demo-internes-secret' } `
+  -ContentType 'application/json' `
+  -Body '{"name":"azubios","scopes":["notify","presence"],"rate_limit":60}'
+$secret = $tenant.client_secret   # genau EINMAL sichtbar, danach nur noch als Hash
+
+# 2) Das Fremdprojekt holt ein OAuth2-Token (Client Credentials, hier per HTTP Basic).
+$basic = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("azubios:$secret"))
+$token = (Invoke-RestMethod -Method Post "$B/integrations/token" `
+  -Headers @{ Authorization = "Basic $basic" } -Body 'grant_type=client_credentials').access_token
+
+# 3) Benachrichtigen und Präsenz abfragen (bob muss registriert sein, siehe Abschnitt 1).
+Invoke-RestMethod -Method Post "$B/integrations/azubios/notify" `
+  -Headers @{ Authorization = "Bearer $token" } `
+  -ContentType 'application/json' -Body '{"handle":"bob","title":"Neue Aufgabe faellig"}'
+Invoke-RestMethod "$B/integrations/azubios/presence/bob" -Headers @{ Authorization = "Bearer $token" }
+```
+
+`notify` antwortet mit `devices` und `connected` (etwa `{devices:1, connected:0}`, wenn bobs Browser gerade zu ist); ist bobs Web-Client offen, erscheint der markierte Maschinen-Hinweis dort in Echtzeit. `presence` liefert `online: true`, sobald ein Gerät verbunden ist.
+
+Der Least-Privilege-Beweis: ein bewusst enges Token (nur `notify`) darf keine Präsenz abfragen, obwohl der Mandant das Recht hätte.
+
+```powershell
+$narrow = (Invoke-RestMethod -Method Post "$B/integrations/token" `
+  -Headers @{ Authorization = "Basic $basic" } -Body 'grant_type=client_credentials&scope=notify').access_token
+try {
+  Invoke-RestMethod "$B/integrations/azubios/presence/bob" -Headers @{ Authorization = "Bearer $narrow" }
+} catch {
+  "presence mit notify-Token -> HTTP $($_.Exception.Response.StatusCode.value__) (403 missing_scope, wie erwartet)"
+}
+```
+
+Der Chat-Inhalt bleibt dabei tabu: die API bietet Benachrichtigung und Präsenz, aber nie Lesezugriff auf Nachrichten (die sind Ende-zu-Ende verschlüsselt). Der ausführliche konsumentenseitige Weg samt Beispielen in Python, JavaScript und PHP steht in [dokumentation/integration-leitfaden.md](dokumentation/integration-leitfaden.md) und [dokumentation/integration-beispiele.md](dokumentation/integration-beispiele.md).
 
 ## Was die Vorführung nicht zeigt
 

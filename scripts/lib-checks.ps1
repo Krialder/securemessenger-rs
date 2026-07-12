@@ -129,8 +129,8 @@ function Get-SmNewestSourceTime {
 }
 
 # Die Binaries, die der Start (sm.ps1) braucht.
-$script:SmBinaries = @('identity', 'directory', 'delivery', 'kt', 'sm')
-$script:SmBuildPackages = @('identity', 'directory', 'delivery', 'kt', 'sm-cli')
+$script:SmBinaries = @('identity', 'directory', 'delivery', 'kt', 'integrations', 'sm')
+$script:SmBuildPackages = @('identity', 'directory', 'delivery', 'kt', 'integrations', 'sm-cli')
 
 # Der gepinnte Kanal einmal beim Laden aufloesen und im Skript-Scope ablegen.
 # Die Check-/Fix-Bloecke greifen ueber $script: darauf zu, weil PowerShell-

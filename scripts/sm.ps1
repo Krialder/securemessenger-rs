@@ -61,7 +61,7 @@ if ($Stop) {
             try { Stop-Process -Id $p.Id -Force -Confirm:$false -ErrorAction Stop; $stopped++ } catch {}
         }
     }
-    foreach ($name in 'identity', 'directory', 'delivery', 'kt', 'trunk') {
+    foreach ($name in 'identity', 'directory', 'delivery', 'kt', 'integrations', 'trunk') {
         foreach ($p in Get-Process $name -ErrorAction SilentlyContinue) {
             $exePath = try { $p.Path } catch { '' }
             if ($exePath -like "$root*" -or $name -eq 'trunk') {
@@ -105,9 +105,12 @@ if ($Setup) {
 }
 
 # ---------------------------------------------------------------------------
-# Starten: die frueher eigene demo.ps1. Vier Dienste (identity 8080,
-# directory 8081, delivery 8082, kt 8083) mit eigenen demo_*-Datenbanken und
-# deterministischen Demo-Schluesseln, dazu die Web-Clients ueber trunk.
+# Starten: die frueher eigene demo.ps1. Fuenf Dienste (identity 8080,
+# directory 8081, delivery 8082, kt 8083, integrations 8085) mit eigenen
+# demo_*-Datenbanken und deterministischen Demo-Schluesseln, dazu die
+# Web-Clients ueber trunk. integrations ist die Mandanten-API fuer
+# Fremdprojekte (OAuth2, notify, presence); der Chat-Demo nutzt sie nicht,
+# aber sie gehoert zum Fundament fuer die anderen Projekte und laeuft mit.
 # ---------------------------------------------------------------------------
 
 # Werkzeuge aufloesen (PATH-Rueckfaelle fuer frische Sitzungen).
@@ -136,7 +139,7 @@ $internalToken = 'demo-internes-secret'
 
 # 1. Datenbanken
 Write-Step 'Demo-Datenbanken (sm-postgres)'
-$databases = @('demo_identity', 'demo_directory', 'demo_delivery', 'demo_kt')
+$databases = @('demo_identity', 'demo_directory', 'demo_delivery', 'demo_kt', 'demo_integrations')
 docker start sm-postgres *> $null
 $ready = $false
 for ($i = 0; $i -lt 30; $i++) {
@@ -165,14 +168,14 @@ if ($NoBuild) {
 } else {
     Write-Step 'Baue Dienste und CLI (cargo build, erster Lauf dauert)'
     Push-Location $root
-    cargo build -p identity -p directory -p delivery -p kt -p sm-cli
+    cargo build -p identity -p directory -p delivery -p kt -p integrations -p sm-cli
     if ($LASTEXITCODE -ne 0) { Pop-Location; Write-Bad 'Build fehlgeschlagen'; exit 1 }
     Pop-Location
     Write-Ok 'Build fertig'
 }
 
 # 3. Dienste starten, je Dienst ein Fenster mit sichtbaren Logs.
-Write-Step 'Starte Dienste (identity 8080, directory 8081, delivery 8082, kt 8083)'
+Write-Step 'Starte Dienste (identity 8080, directory 8081, delivery 8082, kt 8083, integrations 8085)'
 $pids = @()
 $windowStyle = if ($Hidden) { 'Hidden' } else { 'Normal' }
 function Start-Service([string]$name, [string]$bind, [hashtable]$extraEnv) {
@@ -206,10 +209,18 @@ Start-Service 'kt' '127.0.0.1:8083' @{
     KT_VRF_KEY       = $ktVrfKey
     KT_EPOCH_SECONDS = '5'
 }
+# Mandanten-API fuer Fremdprojekte: braucht identity (Nutzer aufloesen) und
+# delivery (Events, Praesenz) sowie dasselbe INTERNAL_TOKEN, das Start-Service
+# ohnehin setzt (schaltet die interne Mandanten-Anlage-Route frei).
+Start-Service 'integrations' '127.0.0.1:8085' @{
+    DATABASE_URL = "$pg/demo_integrations"
+    IDENTITY_URL = 'http://127.0.0.1:8080'
+    DELIVERY_URL = 'http://127.0.0.1:8082'
+}
 
 # 4. Auf Bereitschaft warten
 Write-Step 'Warte auf /ready aller Dienste'
-$ports = @(8080, 8081, 8082, 8083)
+$ports = @(8080, 8081, 8082, 8083, 8085)
 foreach ($port in $ports) {
     $ok = $false
     for ($i = 0; $i -lt 60; $i++) {
