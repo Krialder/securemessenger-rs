@@ -16,11 +16,11 @@ Der Konsolen-Einstieg für Entwickler. Ruft `scripts/setup.ps1` mit gelockerter 
 
 Richtet die Umgebung ein, idempotent (schon Vorhandenes wird übersprungen):
 
-1. **Prüft die Werkzeuge:** winget, Rust (`cargo`), protoc, Docker.
-2. **Installiert Fehlendes:** Rust über winget (`Rustlang.Rustup`), protoc von GitHub nach `%LOCALAPPDATA%\protoc` (braucht der Krypto-Kern für den libsignal-Build), bei Bedarf Docker Desktop (`Docker.DockerDesktop`).
+1. **Prüft die Werkzeuge:** winget, Rust (`cargo`), MSVC Build Tools (Linker für den nativen Build), protoc, das Rust-Target `wasm32-unknown-unknown` (Web-Client), trunk (WASM-Bündler), WSL und Docker.
+2. **Installiert Fehlendes:** Rust über winget (`Rustlang.Rustup`), MSVC Build Tools, protoc von GitHub nach `%LOCALAPPDATA%\protoc` (braucht der Krypto-Kern für den libsignal-Build), das wasm32-Target, trunk, bei Bedarf WSL und Docker Desktop (`Docker.DockerDesktop`).
 3. **Rüstet Rust-Komponenten nach:** rustfmt und clippy für die Format- und Lint-Prüfung (`cargo fmt`, `cargo clippy`).
 4. **Startet Docker Desktop**, wenn der Daemon nicht erreichbar ist, und wartet bis zu 120 Sekunden, bis er bereit ist.
-5. **Legt die Entwicklungs-Datenbank an:** Container `sm-postgres` (postgres:17-alpine, Passwort `dev`, Port 5432) mit einer Datenbank je Dienst (`identity`, `directory`, `delivery`, `integrations`) - jeder Dienst braucht seine eigene, sonst kollidieren die sqlx-Migrationstabellen (siehe [ENTWICKLUNG.md](../ENTWICKLUNG.md)). Wegwerf-Instanz: `docker rm -f sm-postgres` setzt alles zurück.
+5. **Legt die Entwicklungs-Datenbank an:** Container `sm-postgres` (postgres:17-alpine, Passwort `dev`, Port 5432) mit einer Datenbank je Dienst (`identity`, `directory`, `delivery`, `integrations`, `kt`) - jeder Dienst braucht seine eigene, sonst kollidieren die sqlx-Migrationstabellen (siehe [ENTWICKLUNG.md](../ENTWICKLUNG.md)). Wegwerf-Instanz: `docker rm -f sm-postgres` setzt alles zurück.
 
 Am Ende steht eine Statusübersicht und die nächsten Build-Befehle. Die Installationen können einen UAC-Dialog auslösen, das ist beim ersten Lauf normal. Falls Rust frisch installiert wurde, ist `cargo` erst in einem neuen Terminal im PATH; die `PROTOC`-Variable gilt nur für die Setup-Sitzung, dauerhaft setzt sie `setx PROTOC "%LOCALAPPDATA%\protoc\bin\protoc.exe"`.
 

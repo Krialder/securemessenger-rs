@@ -72,6 +72,39 @@ jobs:
           TEST_DATABASE_URL_KT: postgres://postgres:ci@localhost:5432/kt
         run: cargo test --workspace --locked
 
+  wasm:
+    name: WASM-Build und Lint (Web-Client)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Der Krypto-Kern zieht libsignal-Protobufs; protoc wird auch fuer den
+      # wasm-Build gebraucht.
+      - name: protoc installieren
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: wasm-Target hinzufuegen
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cargo-Cache (wasm)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-wasm-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      # Der Web-Client ist cfg-gegatet auf wasm32; der native check-Job
+      # kompiliert davon nur den Stub. Erst hier durchlaufen app.rs, storage.rs
+      # und die wasm-Zweige der geteilten Crates den Compiler und clippy. Das
+      # getrandom-wasm_js-Flag kommt aus .cargo/config.toml.
+      - name: Clippy wasm (Warnungen sind Fehler)
+        run: cargo clippy --target wasm32-unknown-unknown -p sm-web --locked -- -D warnings
+
+      - name: Build wasm
+        run: cargo build --target wasm32-unknown-unknown -p sm-web --locked
+
   docker:
     name: Docker-Image ${{ matrix.service }}
     runs-on: ubuntu-latest

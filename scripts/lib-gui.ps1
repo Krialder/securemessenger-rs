@@ -1,6 +1,9 @@
 <#
   Gemeinsame WPF-Bausteine der beiden grafischen Einstiege.
 
+  BIBLIOTHEK, nicht direkt starten: wird per Dot-Sourcing (`. lib-gui.ps1`)
+  von install-gui.ps1 und start-gui.ps1 eingebunden.
+
   Enthaelt das Farbthema im Stil des Web-Clients (Segoe UI als System-Schrift
   unter Windows, das Blau #0078D7 aus der App, abgerundete Ecken), einen
   XAML-Lader und die Hintergrund-Mechanik. Letztere ist noetig, weil die

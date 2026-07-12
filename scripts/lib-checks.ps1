@@ -1,6 +1,9 @@
 <#
   Gemeinsame Pruef- und Reparatur-Bibliothek der Einrichtung.
 
+  BIBLIOTHEK, nicht direkt starten: wird per Dot-Sourcing (`. lib-checks.ps1`)
+  von install-gui.ps1, start-gui.ps1 und dem Konsolen-Weg eingebunden.
+
   Das ist die einzige Wahrheit ueber den Zustand der Umgebung: Welche
   Werkzeuge fehlen, was veraltet ist, ob Docker und die Datenbank laufen und
   ob die gebauten Programme aktuell sind. Beide grafischen Einstiege
@@ -181,6 +184,11 @@ function Get-SmComponents {
             }
             if ($script:SmPinned -and $rustup) {
                 & $log "Installiere/repariere Toolchain $script:SmPinned (Download dauert einige Minuten)..."
+                # Erst deinstallieren: eine beschaedigte Toolchain ("Missing
+                # manifest") repariert 'toolchain install' NICHT, nur ein
+                # sauberer Neustand hilft (Paritaet zu setup.ps1). Ist sie gar
+                # nicht installiert, ist die Deinstallation ein harmloser No-op.
+                & $rustup toolchain uninstall "$script:SmPinned-x86_64-pc-windows-msvc" *> $null
                 & $rustup toolchain install $script:SmPinned --component rustfmt --component clippy
                 & $rustup run $script:SmPinned rustc --version *> $null
                 return ($LASTEXITCODE -eq 0)

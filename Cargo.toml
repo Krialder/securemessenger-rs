@@ -90,9 +90,6 @@ pow = { path = "crates/pow" }
 # Sealed-Sender-Zertifikate: identity stellt aus, Clients prüfen beim
 # Entsiegeln (Format aus libsignal, kein Eigenbau).
 sealed-cert = { path = "crates/sealed-cert" }
-# Binary-Transparency-Log (ADR-0007): Mechanismus als Bibliothek plus
-# sm-bt-Werkzeug.
-btlog = { path = "crates/btlog" }
 # Verschlüsselte Geräte-Ablage, geteilt zwischen CLI und Web-Client.
 keystore = { path = "crates/keystore" }
 # Provisioning-Chiffre für die QR-Kopplung: das Zweitgerät verschlüsselt
