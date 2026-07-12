@@ -168,9 +168,12 @@ async fn three_users_exchange_a_group_message_over_real_services() {
     assert_eq!(created.epoch, 0);
     assert_eq!(created.devices, 3);
 
-    // Alice startet ihre Gruppensitzung und holt Bobs und Carols
-    // KeyPackages (konsumiert je eins).
-    let mut alice_group = GroupSession::create(b"alice").expect("Gruppe gründen");
+    // Alice startet ihre Gruppensitzung unter der Zustell-ID (dieselbe ID
+    // findet die Gruppe nach einem Neustart wieder) und holt Bobs und
+    // Carols KeyPackages (konsumiert je eins).
+    let alice_member = GroupMember::new(b"alice").expect("MLS-Mitglied");
+    let mut alice_group =
+        GroupSession::create(alice_member, group_id.as_bytes()).expect("Gruppe gründen");
     let mut invite_blobs = Vec::new();
     let mut invited_devices = Vec::new();
     for handle in ["bob", "carol"] {
@@ -253,4 +256,40 @@ async fn three_users_exchange_a_group_message_over_real_services() {
             party.handle
         );
     }
+
+    // Neustart-Beweis über die echten Dienste: Bob friert seinen Zustand
+    // ein (wie es die CLI je Prozess und der Browser je Reload tun),
+    // Alice schickt eine zweite Nachricht, und der WIEDERHERGESTELLTE Bob
+    // entschlüsselt sie mit fortgesetztem Ratchet.
+    let bob_state = bob_group.export_state().expect("Zustand exportieren");
+    drop(bob_group);
+    let second = alice_group
+        .create_message(b"nach bobs neustart")
+        .expect("zweite Gruppennachricht");
+    let second_fanout: Vec<GroupOutgoing> = invited_devices
+        .iter()
+        .map(|device_id| GroupOutgoing {
+            id: new_uuid(),
+            device_id: device_id.clone(),
+            envelope: wire::seal_group(&group_id, &second).expect("Nachricht rahmen"),
+        })
+        .collect();
+    delivery
+        .group_messages(&alice.access_token, &group_id, &second_fanout)
+        .await
+        .expect("zweite Gruppennachricht senden");
+    let bob_restored = GroupMember::restore(b"bob", &bob_state).expect("Bob wiederherstellen");
+    let mut bob_group = GroupSession::load(bob_restored, group_id.as_bytes())
+        .expect("Gruppe laden")
+        .expect("Bobs Ablage kennt die Gruppe");
+    let blobs = drain_group_blobs(&delivery, &bob.access_token).await;
+    assert_eq!(blobs.len(), 1, "Bob bekommt die zweite Nachricht");
+    assert_eq!(
+        bob_group
+            .process(&blobs[0])
+            .expect("verarbeiten")
+            .as_deref(),
+        Some(b"nach bobs neustart".as_slice()),
+        "der wiederhergestellte Bob liest mit fortgesetztem Ratchet"
+    );
 }

@@ -28,10 +28,19 @@ fn sender_ratchet() -> SenderRatchetConfiguration {
     SenderRatchetConfiguration::new(OUT_OF_ORDER_TOLERANCE, MAX_FORWARD_DISTANCE)
 }
 
+/// Formatkennung des exportierten MLS-Zustands (`export_state`). Bewusst
+/// längenpräfixiert statt getrennt (die btlog-Lehre: Trennzeichen
+/// kollidieren mit Nutzdaten, Längen nicht).
+const STATE_MAGIC: &[u8] = b"smmls.v1";
+
 /// Ein Gruppenmitglied: Provider (Krypto und Ablage), Credential und
 /// Signaturschlüssel. [ANNAHME: BasicCredential, bis die Geräte-
 /// Credentials aus specs/geraete-identitaet.md die MLS-Credentials
-/// stellen; die Ablage ist der In-Memory-Provider bis zur Client-Etappe.]
+/// stellen.] Der Provider hält alle MLS-Geheimnisse (Signierschlüssel,
+/// KeyPackage-Privatteile, Gruppenzustände) in seiner Ablage; über
+/// `export_state`/`restore` überlebt genau diese Ablage einen
+/// Prozess-Neustart, verschlüsselt abgelegt von der Client-Schicht
+/// (keystore). Ein Gerät hat EIN Mitglied für alle seine Gruppen.
 pub struct GroupMember {
     provider: OpenMlsRustCrypto,
     credential: CredentialWithKey,
@@ -78,22 +87,107 @@ impl GroupMember {
             .map_err(|err| format!("KeyPackage: {err}"))
     }
 
-    /// Erzeugt eine neue Gruppe mit den Plattform-Festlegungen. Der
+    /// Erzeugt eine neue Gruppe unter der gegebenen Gruppen-ID mit den
+    /// Plattform-Festlegungen. Die ID ist die des Zustelldienstes (UUID
+    /// als Bytes), damit ein Neustart die Gruppe über `MlsGroup::load`
+    /// unter derselben ID wiederfindet; eine zufällige interne ID ließe
+    /// sich nach dem Laden nicht mehr der Zustell-Gruppe zuordnen. Der
     /// Ratchet-Tree reist in der Welcome-Nachricht mit, damit der
     /// Beitritt keinen separaten Tree-Abruf braucht.
-    pub fn create_group(&self) -> Result<MlsGroup, String> {
+    pub fn create_group(&self, group_id: &[u8]) -> Result<MlsGroup, String> {
         let config = MlsGroupCreateConfig::builder()
             .ciphersuite(CIPHERSUITE)
             .use_ratchet_tree_extension(true)
             .sender_ratchet_configuration(sender_ratchet())
             .build();
-        MlsGroup::new(
+        MlsGroup::new_with_group_id(
             &self.provider,
             &self.signer,
             &config,
+            GroupId::from_slice(group_id),
             self.credential.clone(),
         )
         .map_err(|err| format!("Gruppe anlegen: {err}"))
+    }
+
+    /// Exportiert den kompletten MLS-Zustand dieses Mitglieds als opaken
+    /// Blob: die Provider-Ablage (Signierschlüssel, KeyPackage-Privatteile,
+    /// alle Gruppenzustände) plus den öffentlichen Signierschlüssel als
+    /// Wiederfinde-Anker. Nach JEDER zustandsändernden Operation (Gruppe
+    /// anlegen, beitreten, Nachricht erzeugen oder verarbeiten, Mitglieder
+    /// hinzufügen) neu exportieren und ablegen, sonst reißt der Ratchet
+    /// beim nächsten Laden. Der Blob enthält private Schlüssel; die
+    /// Client-Schicht legt ihn nur verschlüsselt ab (keystore).
+    pub fn export_state(&self) -> Result<Vec<u8>, String> {
+        let values = self
+            .provider
+            .storage()
+            .values
+            .read()
+            .map_err(|_| "MLS-Ablage-Lock vergiftet".to_string())?;
+        // Sortiert exportieren: deterministische Blobs erleichtern Tests
+        // und Vergleiche; die HashMap-Ordnung wäre zufällig.
+        let mut entries: Vec<(&Vec<u8>, &Vec<u8>)> = values.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        let public = self.signer.to_public_vec();
+        let mut out = Vec::with_capacity(64 + entries.len() * 128);
+        out.extend_from_slice(STATE_MAGIC);
+        out.extend_from_slice(&(public.len() as u32).to_be_bytes());
+        out.extend_from_slice(&public);
+        out.extend_from_slice(&(entries.len() as u64).to_be_bytes());
+        for (key, value) in entries {
+            out.extend_from_slice(&(key.len() as u32).to_be_bytes());
+            out.extend_from_slice(key);
+            out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            out.extend_from_slice(value);
+        }
+        Ok(out)
+    }
+
+    /// Stellt ein Mitglied aus einem exportierten Zustand wieder her.
+    /// `identity` muss dieselbe sein wie beim Anlegen (das eigene Handle):
+    /// das Credential wird daraus neu gebaut, der Signierschlüssel kommt
+    /// aus der wiederhergestellten Ablage. Ein manipulierter oder
+    /// abgeschnittener Blob wird abgewiesen, bevor irgendetwas davon in
+    /// den Provider gelangt.
+    pub fn restore(identity: &[u8], state: &[u8]) -> Result<Self, String> {
+        let rest = state
+            .strip_prefix(STATE_MAGIC)
+            .ok_or("MLS-Zustand: unbekanntes Format")?;
+        let (public, rest) = read_prefixed(rest, "Signierschlüssel")?;
+        let (count_bytes, mut rest) = split_checked(rest, 8, "Eintragszahl")?;
+        let count = u64::from_be_bytes(count_bytes.try_into().expect("8 Bytes"));
+        let mut values = std::collections::HashMap::new();
+        for _ in 0..count {
+            let (key, after_key) = read_prefixed(rest, "Ablage-Schlüssel")?;
+            let (value, after_value) = read_prefixed(after_key, "Ablage-Wert")?;
+            values.insert(key.to_vec(), value.to_vec());
+            rest = after_value;
+        }
+        if !rest.is_empty() {
+            return Err("MLS-Zustand: überzählige Bytes am Ende".to_string());
+        }
+        let provider = OpenMlsRustCrypto::default();
+        *provider
+            .storage()
+            .values
+            .write()
+            .map_err(|_| "MLS-Ablage-Lock vergiftet".to_string())? = values;
+        let signer = SignatureKeyPair::read(
+            provider.storage(),
+            public,
+            CIPHERSUITE.signature_algorithm(),
+        )
+        .ok_or("MLS-Zustand: Signierschlüssel fehlt in der Ablage")?;
+        let credential = BasicCredential::new(identity.to_vec());
+        Ok(Self {
+            provider,
+            credential: CredentialWithKey {
+                credential: credential.into(),
+                signature_key: signer.to_public_vec().into(),
+            },
+            signer,
+        })
     }
 
     /// Tritt einer Gruppe über die Welcome-Nachricht bei.
@@ -121,26 +215,59 @@ impl GroupMember {
     }
 }
 
+/// Liest einen u32-längenpräfixierten Abschnitt; lehnt zu kurze Eingaben
+/// mit dem benannten Feld ab, damit ein kaputter Blob eine deutbare
+/// Fehlermeldung ergibt statt eines Panics.
+fn read_prefixed<'a>(input: &'a [u8], what: &str) -> Result<(&'a [u8], &'a [u8]), String> {
+    let (len_bytes, rest) = split_checked(input, 4, what)?;
+    let len = u32::from_be_bytes(len_bytes.try_into().expect("4 Bytes")) as usize;
+    split_checked(rest, len, what)
+}
+
+fn split_checked<'a>(
+    input: &'a [u8],
+    at: usize,
+    what: &str,
+) -> Result<(&'a [u8], &'a [u8]), String> {
+    if input.len() < at {
+        return Err(format!("MLS-Zustand: {what} abgeschnitten"));
+    }
+    Ok(input.split_at(at))
+}
+
 /// Eine laufende Gruppensitzung: ein Mitglied plus sein MLS-Gruppenzustand
 /// (TreeKEM). Die Byte-Ein-Byte-Aus-Schnittstelle hält die MLS-Krypto
 /// vollständig im Kern; die Client-Schicht (client-app) bewegt die opaken
 /// Blobs nur über den Zustelldienst und interpretiert sie nie.
 ///
-/// [ANNAHME: Die Ablage ist der In-Memory-Provider (wie beim 1:1-Kern bis
-/// zur persistenten Geräte-Ablage). Ein Prozessende verliert den
-/// Gruppenzustand; die persistente MLS-Ablage ist eine eigene Etappe.]
+/// Der Zustand überlebt Neustarts über das Mitglied: OpenMLS schreibt
+/// jede Änderung in die Provider-Ablage, `export_state` friert sie ein,
+/// und `load` findet die Gruppe nach `GroupMember::restore` unter ihrer
+/// Zustell-ID wieder. Die Client-Schicht exportiert nach jeder
+/// zustandsändernden Operation.
 pub struct GroupSession {
     member: GroupMember,
     group: MlsGroup,
 }
 
 impl GroupSession {
-    /// Gründet eine neue Gruppe mit diesem Mitglied als erstem und
-    /// einzigem Teilnehmer.
-    pub fn create(identity: &[u8]) -> Result<Self, String> {
-        let member = GroupMember::new(identity)?;
-        let group = member.create_group()?;
+    /// Gründet eine neue Gruppe unter der Zustell-Gruppen-ID mit diesem
+    /// Mitglied als erstem und einzigem Teilnehmer. Das Mitglied kommt vom
+    /// Aufrufer (frisch oder wiederhergestellt), damit ein Gerät EIN
+    /// Mitglied über alle Gruppen teilt und dessen Ablage alles hält.
+    pub fn create(member: GroupMember, group_id: &[u8]) -> Result<Self, String> {
+        let group = member.create_group(group_id)?;
         Ok(Self { member, group })
+    }
+
+    /// Lädt eine bestehende Gruppe aus der Ablage des Mitglieds über ihre
+    /// Zustell-ID. `Ok(None)`, wenn die Ablage diese Gruppe nicht kennt
+    /// (nie beigetreten oder Zustand verloren): der Aufrufer entscheidet,
+    /// ob das ein Fehler ist.
+    pub fn load(member: GroupMember, group_id: &[u8]) -> Result<Option<Self>, String> {
+        let group = MlsGroup::load(member.provider.storage(), &GroupId::from_slice(group_id))
+            .map_err(|err| format!("Gruppe laden: {err}"))?;
+        Ok(group.map(|group| Self { member, group }))
     }
 
     /// Tritt einer Gruppe über einen Welcome-Blob bei. Das Mitglied muss
@@ -236,6 +363,25 @@ impl GroupSession {
     /// Die aktuelle MLS-Epoche (steigt mit jedem angewandten Commit).
     pub fn epoch(&self) -> u64 {
         self.group.epoch().as_u64()
+    }
+
+    /// Die Gruppen-ID (bei plattform-eigenen Gruppen die Zustell-ID als
+    /// Bytes; nach einem Beitritt kommt sie aus der Welcome-Nachricht).
+    pub fn group_id(&self) -> Vec<u8> {
+        self.group.group_id().as_slice().to_vec()
+    }
+
+    /// Exportiert den MLS-Zustand des tragenden Mitglieds (siehe
+    /// `GroupMember::export_state`): nach jeder zustandsändernden
+    /// Operation aufrufen und verschlüsselt ablegen.
+    pub fn export_state(&self) -> Result<Vec<u8>, String> {
+        self.member.export_state()
+    }
+
+    /// Gibt das tragende Mitglied zurück, etwa um nach einer Operation an
+    /// dieser Gruppe eine weitere Gruppe desselben Geräts zu laden.
+    pub fn into_member(self) -> GroupMember {
+        self.member
     }
 }
 

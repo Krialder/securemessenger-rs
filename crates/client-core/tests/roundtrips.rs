@@ -205,8 +205,9 @@ fn mls_group_roundtrip_with_pinned_ciphersuite() {
     let alice = GroupMember::new(b"alice").unwrap();
     let bob = GroupMember::new(b"bob").unwrap();
 
-    // alice gründet die Gruppe und lädt bob über dessen KeyPackage ein.
-    let mut alice_group = alice.create_group().unwrap();
+    // alice gründet die Gruppe (unter einer Zustell-ID) und lädt bob über
+    // dessen KeyPackage ein.
+    let mut alice_group = alice.create_group(b"gruppe-1").unwrap();
     assert_eq!(alice_group.ciphersuite(), CIPHERSUITE);
 
     let bob_key_package = bob.key_package().unwrap();
@@ -288,15 +289,18 @@ fn group_session_byte_interface_roundtrip() {
     let bob_key_package = bob_member.key_package_blob().unwrap();
 
     // Alice gründet die Gruppe und lädt Bob über den KeyPackage-Blob ein.
-    let mut alice = GroupSession::create(b"alice").unwrap();
+    let alice_member = GroupMember::new(b"alice").unwrap();
+    let mut alice = GroupSession::create(alice_member, b"gruppe-bytes").unwrap();
     assert_eq!(alice.member_count(), 1);
     let outcome = alice.add_members(&[bob_key_package]).unwrap();
     assert_eq!(alice.member_count(), 2);
 
-    // Bob tritt über den Welcome-Blob mit derselben Ablage bei.
+    // Bob tritt über den Welcome-Blob mit derselben Ablage bei; die
+    // Gruppen-ID aus der Welcome ist die der Gründung.
     let mut bob = GroupSession::join_group(bob_member, &outcome.welcome).unwrap();
     assert_eq!(bob.member_count(), 2);
     assert_eq!(alice.epoch(), bob.epoch(), "beide auf derselben Epoche");
+    assert_eq!(bob.group_id(), b"gruppe-bytes".to_vec());
 
     // Anwendungsnachricht hin und zurück, nur über Blobs.
     let ciphertext = alice.create_message(b"hallo gruppe").unwrap();
@@ -309,4 +313,97 @@ fn group_session_byte_interface_roundtrip() {
         alice.process(&reply).unwrap().as_deref(),
         Some(b"hallo zurueck".as_slice())
     );
+}
+
+/// Der Neustart-Beweis der persistenten MLS-Ablage: beide Seiten frieren
+/// ihren Zustand mit `export_state` ein, werden aus den Blobs
+/// wiederhergestellt (`GroupMember::restore` plus `GroupSession::load`
+/// über die Zustell-ID) und setzen den Ratchet in beide Richtungen fort.
+/// Genau das braucht die CLI (Prozess je Befehl) und der Browser (Reload).
+#[test]
+fn group_session_survives_restart_via_exported_state() {
+    // Runde 1: Gruppe gründen, Bob tritt bei, eine Nachricht fließt.
+    let bob_member = GroupMember::new(b"bob").unwrap();
+    let bob_key_package = bob_member.key_package_blob().unwrap();
+    // Bobs Zustand SOFORT nach der KeyPackage-Erzeugung einfrieren: die
+    // privaten Anteile müssen den "Neustart" bis zur Welcome überleben.
+    let bob_state_before_join = bob_member.export_state().unwrap();
+
+    let alice_member = GroupMember::new(b"alice").unwrap();
+    let mut alice = GroupSession::create(alice_member, b"gruppe-neustart").unwrap();
+    let outcome = alice.add_members(&[bob_key_package]).unwrap();
+
+    // "Neustart" auf Bobs Seite: Mitglied aus dem Blob, Beitritt klappt,
+    // weil die KeyPackage-Privatteile im wiederhergestellten Zustand liegen.
+    let bob_restored = GroupMember::restore(b"bob", &bob_state_before_join).unwrap();
+    let mut bob = GroupSession::join_group(bob_restored, &outcome.welcome).unwrap();
+    let first = alice.create_message(b"vor dem neustart").unwrap();
+    assert_eq!(
+        bob.process(&first).unwrap().as_deref(),
+        Some(b"vor dem neustart".as_slice())
+    );
+    // Export NACH der letzten Operation beider Seiten: auch das Erzeugen
+    // einer Nachricht rückt den Sende-Ratchet vor. Ein Export davor ließe
+    // die wiederhergestellte Alice dieselbe Ratchet-Position erneut nutzen,
+    // und Bob wiese den schon konsumierten Schlüssel ab (Forward Secrecy;
+    // genau so schlug die erste Fassung dieses Tests fehl).
+    let alice_state = alice.export_state().unwrap();
+    let bob_state = bob.export_state().unwrap();
+    drop(alice);
+    drop(bob);
+
+    // "Neustart" beider Seiten: Zustand aus den Blobs, Gruppe über die
+    // Zustell-ID laden, Ratchet läuft in beide Richtungen weiter.
+    let alice_member = GroupMember::restore(b"alice", &alice_state).unwrap();
+    let mut alice = GroupSession::load(alice_member, b"gruppe-neustart")
+        .unwrap()
+        .expect("Alices Ablage kennt die Gruppe");
+    let bob_member = GroupMember::restore(b"bob", &bob_state).unwrap();
+    let mut bob = GroupSession::load(bob_member, b"gruppe-neustart")
+        .unwrap()
+        .expect("Bobs Ablage kennt die Gruppe");
+    assert_eq!(alice.member_count(), 2);
+    assert_eq!(bob.member_count(), 2);
+
+    let second = alice.create_message(b"nach dem neustart").unwrap();
+    assert_eq!(
+        bob.process(&second).unwrap().as_deref(),
+        Some(b"nach dem neustart".as_slice())
+    );
+    let reply = bob.create_message(b"zurueck nach neustart").unwrap();
+    assert_eq!(
+        alice.process(&reply).unwrap().as_deref(),
+        Some(b"zurueck nach neustart".as_slice())
+    );
+
+    // Eine unbekannte Gruppen-ID lädt nichts (kein Fehler, kein Panik).
+    let stranger = GroupMember::restore(b"alice", &alice.export_state().unwrap()).unwrap();
+    assert!(GroupSession::load(stranger, b"gibt-es-nicht")
+        .unwrap()
+        .is_none());
+}
+
+/// Manipulierte oder abgeschnittene Zustands-Blobs werden abgewiesen,
+/// bevor etwas davon in den Provider gelangt.
+#[test]
+fn corrupted_group_state_is_rejected() {
+    let member = GroupMember::new(b"mallory").unwrap();
+    let state = member.export_state().unwrap();
+
+    // Falsche Formatkennung.
+    let mut wrong_magic = state.clone();
+    wrong_magic[0] ^= 0xff;
+    assert!(GroupMember::restore(b"mallory", &wrong_magic).is_err());
+
+    // Abgeschnitten mitten in einem Eintrag.
+    let truncated = &state[..state.len() - 3];
+    assert!(GroupMember::restore(b"mallory", truncated).is_err());
+
+    // Überzählige Bytes am Ende.
+    let mut padded = state.clone();
+    padded.extend_from_slice(b"rest");
+    assert!(GroupMember::restore(b"mallory", &padded).is_err());
+
+    // Der unverfälschte Blob stellt wieder her.
+    assert!(GroupMember::restore(b"mallory", &state).is_ok());
 }
