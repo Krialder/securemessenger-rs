@@ -1,6 +1,6 @@
 # Integrations-Leitfaden fuer Fremdprojekte
 
-Dieser Leitfaden richtet sich an ein anderes Ausbildungsprojekt (etwa AzubiOS), das den SecureMessenger einbinden will, ohne den eigenen Stack zu aendern. Er beschreibt den konsumentenseitigen Weg Schritt fuer Schritt, mit Beispielen. Die maschinenlesbare Form der oeffentlichen Endpunkte liegt in [openapi-integrations.yaml](openapi-integrations.yaml); die Handler in `services/integrations/src/api.rs` sind die letzte Quelle der Wahrheit.
+Dieser Leitfaden richtet sich an ein anderes Ausbildungsprojekt (etwa AzubiOS), das den SecureMessenger einbinden will, ohne den eigenen Stack zu aendern. Er beschreibt den konsumentenseitigen Weg Schritt fuer Schritt, mit Beispielen. Fertige Schnipsel in Python, JavaScript und PHP (plus ein Weg, einen typisierten Client zu generieren) stehen in [integration-beispiele.md](integration-beispiele.md). Die maschinenlesbare Form der oeffentlichen Endpunkte liegt in [openapi-integrations.yaml](openapi-integrations.yaml); die Handler in `services/integrations/src/api.rs` sind die letzte Quelle der Wahrheit.
 
 ## Was der Kern anbietet, und was nicht
 

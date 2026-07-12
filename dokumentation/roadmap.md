@@ -32,8 +32,10 @@ Baut auf Identität und Auth auf, macht den Kern zum Fundament für die übrigen
 - [ ] OIDC-Provider für Single Sign-on, ein Konto für alle Abteilungs-Werkzeuge (Keycloak liegt als Deployment-Skelett vor, der Nutzer-Login-Fluss ist noch nicht scharf)
 - [x] Benachrichtigungs-Gateway für Fremdprojekte (markierte Maschinen-Hinweise, getrennt vom E2E-Chat): `integrations`-Dienst, `POST /integrations/notify`
 - [x] Präsenz-Abruf über eine mandantenfähige REST-Schnittstelle (`integrations`-Dienst, `GET /integrations/presence`)
-- [x] Mandantenfähigkeit mit eigenem Token und Rate-Limit je Projekt (`integrations`-Dienst: Mandanten, `POST /integrations/token` als Client-Credentials-Fluss, Rate-Limit je Mandant)
-- [ ] Ein Drittprojekt (z. B. AzubiOS) bindet die Dienste testweise ein, ohne eigenen Umbau (braucht noch einen konsumentenseitigen Integrations-Leitfaden)
+- [x] Mandantenfähigkeit mit eigenem Token und Rate-Limit je Projekt (`integrations`-Dienst: Mandanten, `POST /integrations/token` als standardkonformer OAuth2-Client-Credentials-Grant nach RFC 6749, Rate-Limit je Mandant)
+- [x] Least Privilege je Token: der OAuth2-`scope`-Parameter verengt das ausgestellte Token auf eine Teilmenge der Mandanten-Rechte (ein geleaktes notify-Token kann keine Präsenz abfragen)
+- [x] Konsumentenseitiger Integrations-Leitfaden plus Beispiele in mehreren Sprachen (`dokumentation/integration-leitfaden.md`, `integration-beispiele.md`): ein Drittprojekt bindet ohne eigenen Umbau an, in Python, JavaScript oder PHP oder mit einem aus der OpenAPI generierten Client
+- [ ] Testweise Einbindung durch ein echtes Drittprojekt (z. B. AzubiOS) gegen einen laufenden Cluster steht noch aus (die konsumentenseitige Grundlage dafür ist da)
 
 ## Phase 2: 1:1-Nachrichten
 
