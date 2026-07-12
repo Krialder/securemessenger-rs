@@ -181,12 +181,19 @@ cargo test -p kt --test pg
 | Endpunkt | Zweck |
 |----------|-------|
 | `POST /accounts` | Konto samt erstem Gerät anlegen (Handle, Passwort, Identitätsschlüssel, Geräte-Credential); 201, 400, 409 |
+| `DELETE /accounts` | Konto-Löschung vormerken (NF030, Bearer plus Passwort), Widerrufsfrist; Antwort nennt die Frist; rate-limitiert; 200, 401, 429 |
+| `PATCH /accounts` | Anzeigename ändern (F010, nur Bearer, umkehrbar); echot die getrimmte Form; 200, 400, 401 |
+| `POST /accounts/undelete` | vorgemerkte Löschung innerhalb der Frist widerrufen (nur Bearer, idempotent); 204, 401 |
+| `POST /accounts/rotate-identity` | Konto-Wurzelschlüssel rotieren (ADR-0010, Bearer plus Kontinuitätssignatur des alten Schlüssels); atomar unter Kontosperre; 204, 400 (`invalid_continuity`), 401, 409 (`concurrent_update`) |
 | `POST /sessions` | Login mit Handle, Passwort und Geräte-ID, liefert Access- und Refresh-Token (OAuth-Feldnamen); 200, 401 |
 | `POST /sessions/refresh` | rotiert das Token-Paar und entwertet das alte; 200, 401 |
+| `POST /sessions/password` | Passwort ändern (Bearer plus altes Passwort); meldet alle ANDEREN Geräte-Sessions ab (fail-closed); 204, 400, 401 |
 | `DELETE /sessions` | Logout über `Authorization: Bearer <token>`, widerruft die Session-Familie; immer 204 |
 | `GET /devices` | gültige Gerätemenge des eigenen Kontos; 200, 401 |
 | `POST /devices` | weiteres Gerät freischalten (Credential vom Konto-Identitätsschlüssel signiert); 201, 400, 401, 409 |
 | `DELETE /devices/{id}` | Gerät revozieren, widerruft dessen Sessions; das eigene Gerät nicht (409); 204, 401, 404 |
+| `POST /provision` | QR-Kopplung: das neue Gerät legt seinen verschlüsselten Kopplungs-Antrag im Relay ab (tokenlos, 8-KiB-Body-Deckel, first-writer-wins); 201, 409 (`channel_taken`), 413 |
+| `GET /provision/{channel}` | QR-Kopplung: das freischaltende Gerät holt den Antrag ab (tokenlos, consume-on-read, TTL 10 min); 200, 404 |
 | `GET /pow` | aktuelle Proof-of-Work-Schwierigkeit der Registrierung (Sybil-Bremse); `{difficulty}`, 0 = aus |
 | `GET /sealed-sender` | öffentlicher Trust Root der Sealed-Sender-Zertifikatskette (Base64); nur bei gesetztem `SEALED_SENDER_TRUST_ROOT`, sonst 404 |
 | `GET /sender-certificate` | kurzlebiges Absender-Zertifikat fürs eigene Gerät (Bearer, TTL 24 h); der Identitätsschlüssel kommt aus der Registrierung, nie aus dem Request; `?device=` nennt die Protokoll-Gerätenummer; 200, 400, 401, 403 |
@@ -284,4 +291,4 @@ Die Nachrichten-Kryptografie wird nicht im Backend gebaut. Sie lebt im Client-Co
 
 Der gemeinsame Kern der Clients (ADR-0005): PQXDH, Double Ratchet und SPQR aus libsignal, MLS (RFC 9420) aus OpenMLS. Beide Bibliotheken sind per `rev` auf einen Release-Commit gepinnt (libsignal v0.96.4, OpenMLS v0.8.1; die Commits stehen in [krypto-kern.md](dokumentation/specs/krypto-kern.md) und in `crates/client-core/Cargo.toml`). Das Crate orchestriert nur: die heiklen Konstruktionen - die Hybrid-Bindung von PQXDH, die SPQR-Mischung - kommen unverändert aus libsignal, eigene Krypto-Konstruktionen sind dort verboten. Festgelegt an genau einer Stelle: die MLS-Suite 0x0003 (ChaCha20-Poly1305) und das Skipped-Keys-Fenster (2000 vorwärts).
 
-Die Tests in `crates/client-core/tests/roundtrips.rs` sind Integrations-Beweise, keine Krypto-Tests: PQXDH-Aufbau mit ML-KEM-Chiffretext auf der Leitung, Ratchet-Roundtrip in beide Richtungen, Out-of-Order-Zustellung, Replay-Erkennung, MLS-Gruppen-Roundtrip über das TLS-Wire-Format. FFI- und WASM-Schichten sowie die persistente Geräte-Ablage folgen mit der Client-Etappe.
+Die Tests in `crates/client-core/tests/roundtrips.rs` sind Integrations-Beweise, keine Krypto-Tests: PQXDH-Aufbau mit ML-KEM-Chiffretext auf der Leitung, Ratchet-Roundtrip in beide Richtungen, Out-of-Order-Zustellung, Replay-Erkennung, MLS-Gruppen-Roundtrip über das TLS-Wire-Format. Die WASM-Schicht (Web-Client) und die persistente, verschlüsselte Geräte-Ablage (Keystore, `crates/keystore`) sind gebaut; eine native FFI-Schicht für Mobile- und Desktop-Clients bleibt offen.

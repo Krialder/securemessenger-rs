@@ -92,4 +92,4 @@ Wird die Hülle nicht binnen zehn Sekunden abgeholt, liefert die Zustellung sie 
 
 ## Was die Vorführung nicht zeigt
 
-Gruppen (MLS) laufen bibliotheksseitig und sind über den Drei-Parteien-Test `cargo test -p client-app --test group_e2e` bewiesen; ein Gruppen-UI ist ein eigener Schnitt. Offen markiert bleiben die Punkte aus [live-dokument.md](dokumentation/live-dokument.md) Abschnitt 9a, allen voran das externe Audit (ADR-0008): diese Vorführung zeigt Funktionsfähigkeit, keine geprüfte Produktionsreife.
+Gruppen (MLS) sind gebaut und sowohl im CLI (`sm group-create`, `groups`, `group-send`, Einladungen annehmen, Entfernen und Verlassen) als auch im Web-Client bedienbar; diese Vorführung konzentriert sich auf den 1:1-Weg und geht nicht eigens durch den Gruppen-Ablauf (der Drei-Parteien-Test `cargo test -p client-app --test group_e2e` belegt ihn). Offen markiert bleiben die Punkte aus [live-dokument.md](dokumentation/live-dokument.md) Abschnitt 9a, allen voran das externe Audit (ADR-0008): diese Vorführung zeigt Funktionsfähigkeit, keine geprüfte Produktionsreife.

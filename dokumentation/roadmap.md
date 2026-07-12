@@ -29,18 +29,18 @@ Sortiert nach Abhängigkeiten, ohne Termine. Zwei Dinge sind bewusst eingebaut: 
 
 Baut auf Identität und Auth auf, macht den Kern zum Fundament für die übrigen Ausbildungsprojekte.
 
-- [ ] OIDC-Provider für Single Sign-on, ein Konto für alle Abteilungs-Werkzeuge
-- [ ] Benachrichtigungs-Gateway für Fremdprojekte (markierte Maschinen-Hinweise, getrennt vom E2E-Chat)
-- [ ] Präsenz-Abruf über eine mandantenfähige REST-Schnittstelle
-- [ ] Mandantenfähigkeit mit eigenem Token und Rate-Limit je Projekt
-- [ ] Ein Drittprojekt (z. B. AzubiOS) bindet die Dienste testweise ein, ohne eigenen Umbau
+- [ ] OIDC-Provider für Single Sign-on, ein Konto für alle Abteilungs-Werkzeuge (Keycloak liegt als Deployment-Skelett vor, der Nutzer-Login-Fluss ist noch nicht scharf)
+- [x] Benachrichtigungs-Gateway für Fremdprojekte (markierte Maschinen-Hinweise, getrennt vom E2E-Chat): `integrations`-Dienst, `POST /integrations/notify`
+- [x] Präsenz-Abruf über eine mandantenfähige REST-Schnittstelle (`integrations`-Dienst, `GET /integrations/presence`)
+- [x] Mandantenfähigkeit mit eigenem Token und Rate-Limit je Projekt (`integrations`-Dienst: Mandanten, `POST /integrations/token` als Client-Credentials-Fluss, Rate-Limit je Mandant)
+- [ ] Ein Drittprojekt (z. B. AzubiOS) bindet die Dienste testweise ein, ohne eigenen Umbau (braucht noch einen konsumentenseitigen Integrations-Leitfaden)
 
 ## Phase 2: 1:1-Nachrichten
 
 - [x] Sitzungsaufbau über PQXDH, Double Ratchet plus SPQR (client-core, gepinnt libsignal; Roundtrip-Beweise)
 - [x] Senden und Empfangen, Echtzeit-Push (WebSocket-Hinweiskanal), idempotente Zustellung (Dedupe-Tabelle)
 - [x] Multi-Device-Fanout (eine Hülle je Zielgerät, delivery löst die Gerätemenge über identity auf)
-- [ ] Volles Threat Model (LINDDUN, STRIDE) und ein formales Handshake-Modell-Skelett (ProVerif oder Tamarin), parallel zum Kern
+- [x] Volles Threat Model (LINDDUN, STRIDE) steht ([bedrohungsmodell.md](bedrohungsmodell.md), siehe Phase 0); das formale Handshake-Modell-Skelett (ProVerif oder Tamarin) bleibt der Härtungsphase offen
 - [ ] Erstes externes Audit des Krypto-Kerns
 
 ## Phase 3: Metadaten, Verifikation, Abuse
@@ -54,8 +54,8 @@ Baut auf Identität und Auth auf, macht den Kern zum Fundament für die übrigen
 
 ## Phase 4: Gruppen
 
-- [ ] MLS-Gruppen über OpenMLS, Beitritt, Austritt, Neuschlüsseln
-- [ ] Delivery Service gehärtet gegen Ghost Users, External Commits, Reorder
+- [x] MLS-Gruppen über OpenMLS: Gründen, Senden, Beitritt per Einladung, Entfernen und Verlassen, Multi-Device-Teilnahme, in CLI und Web bedienbar (live-dokument v0.60 bis v0.66; persistente MLS-Ablage, Einladungs-UX statt Auto-Beitritt, KeyPackage-Pool-Deckel)
+- [ ] Delivery Service gegen Ghost Users, External Commits, Reorder gehärtet: die Epochen-Serialisierung steht (CAS auf die Epoche, `409 stale_epoch`, erst-schreibt-gewinnt, Commit 8a638f4); eine gezielte Erkennung von Ghost Users und External Commits bleibt offen
 
 ## Phase 5: Medien und Anrufe
 

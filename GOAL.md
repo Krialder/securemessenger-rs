@@ -7,14 +7,14 @@ Dieses Dokument ist Ziel und Arbeits-Prompt in einem. Verweise darauf mit `/goal
 In dieser Reihenfolge, dann `git log` und `git status`:
 
 1. `dokumentation/uebergabe-abschluss.md` — Wiedereinstieg, Verifikations-Loop, technische Fallen.
-2. Das Repo-Gedächtnis (Projekt-Stand), das dort genannt ist.
+2. `dokumentation/live-dokument.md` Abschnitt 9a: der aktuelle, verbindliche Funktionsstand (die einzige maßgebliche Status-Quelle).
 3. `ENTWICKLUNG.md` — Struktur, Bauanleitung, Endpunkt-Tabellen aller Dienste.
 4. `dokumentation/live-dokument.md` Abschnitt 10 — was in welcher Etappe entstand.
 5. `dokumentation/pflichtenheft.md`, `dokumentation/roadmap.md`, `dokumentation/specs/`, `dokumentation/entscheidungen/` — Soll-Stand und die verbindlichen Entscheidungen.
 
 ## Ist-Stand (Kurzfassung, Details in den Quellen oben)
 
-Fertig und committet: sechs Backend-Dienste (identity, directory, delivery, integrations, media, kt), der Krypto-Kern `crates/client-core` (libsignal, OpenMLS gepinnt), PostgreSQL pro Dienst, CI, Kubernetes-Manifeste. Meilenstein 0 ist erreicht (`client-core` und `client-app` bauen nach wasm32); von Meilenstein 1 steht der erste Schnitt: `crates/client-app` mit Konto-Layer (Registrierung, Login, Rotation, Logout, Geräte-Credential) plus Headless-CLI `clients/cli`, bewiesen durch End-to-End-Tests gegen den echten identity-Router. **Es gibt noch keine Nutzeroberfläche** und keinen Nachrichten-Layer. Beschlossen: die libsignal-Nachrichten-Identität wird der Geräteschlüssel im Credential (Weg A, ADR folgt mit dem Nachrichten-Layer). Offen laut Roadmap: Nachrichten-Layer und Web-Client, Sealed Sender, Contact Discovery, MLS-Gruppen, Betrieb (NATS/Redis/Operatoren), externes Audit. Der jeweils genaue Stand: `live-dokument.md` Abschnitt 10.
+GOAL.md pflegt bewusst KEINEN eigenen Ist-Stand, damit er nicht veraltet. Der aktuelle, verbindliche Funktionsstand steht ausschließlich im [Live-Dokument](dokumentation/live-dokument.md), Abschnitt 9a (Bilanz) und Abschnitt 10 (Verlauf). Grober Rahmen zur Orientierung: der Kern (1:1- und Gruppen-E2EE-Chat in Web und CLI, Multi-Device mit Self-Sync, Key Transparency, Sealed Sender, Contact Discovery, Abuse-Abwehr, Kontoverwaltung samt Wurzelschlüssel-Rotation) ist gebaut und vorführbar. Offen bleibt vor allem, was eine echte Organisation oder ein externes Ereignis braucht (externes Audit nach ADR-0008, unabhängige KT-Auditoren, Push-Provider-Konten, Produktivbetrieb).
 
 ## Was "fertig" heißt (gestaffelt und messbar, nicht "perfekt")
 

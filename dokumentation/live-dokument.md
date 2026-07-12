@@ -11,13 +11,15 @@
 | Status | Entwurf, in Arbeit |
 | Anspruch | Industrie-Niveau (produktiver E2EE-Messenger), kein Übungsmaßstab |
 
-**Quellen (ausschließlich):** Lastenheft v1.2, Pflichtenheft v1.2, README, architektur.md, protokoll.md, sicherheit.md, datenmodell.md, identitaet-und-geraete.md, schnittstellen.md, betrieb.md, roadmap.md, offene-fragen.md, die ADRs 0001 bis 0007 und die Specs (krypto-kern, mls-delivery-service, sealed-sender-und-abuse, key-transparency, geraete-identitaet, contact-discovery, backup-und-recovery).
+**Quellen (ausschließlich):** Lastenheft v1.2, Pflichtenheft v1.2, README, architektur.md, protokoll.md, sicherheit.md, datenmodell.md, identitaet-und-geraete.md, schnittstellen.md, betrieb.md, roadmap.md, offene-fragen.md, die ADRs 0001 bis 0010 und die Specs (krypto-kern, mls-delivery-service, sealed-sender-und-abuse, key-transparency, geraete-identitaet, contact-discovery, backup-und-recovery).
 
 **Methodischer Rahmen:** Design Doc nach Google (industrialempathy.com), Google Engineering Practices, Working-Backwards PR/FAQ nach Amazon, Postmortem-Kultur nach Google SRE.
 
 **Legende:** **[ANNAHME: …]** kennzeichnet eine Festlegung, die nicht aus der Doku folgt, sondern hier getroffen wird. **[OFFENE FRAGE: …]** kennzeichnet einen ungeklärten Punkt mit Vorschlag zur Klärung.
 
 **Regel zur Bearbeitungsreihenfolge:** Abschnitt 1 und 2 sind vollständig formuliert und gehen jeder Implementierung voraus. Die Abschnitte 5 und 6 fassen den bereits dokumentierten Entwurf zusammen und verweisen darauf. Neuer Produktivcode und neue API-Spezifikationen entstehen erst nach Bestätigung von Problem und Zielen durch den Owner.
+
+**Einzige Status-Quelle:** Dieses Dokument ist die einzige maßgebliche Quelle für den Funktionsstand. Der aktuelle Stand steht in Abschnitt 9a (Bilanz „Erreichter Stand vs. Roadmap"), der Verlauf je Etappe in Abschnitt 10 (Änderungshistorie). Andere Dokumente (README, GOAL.md, offene-fragen.md, uebergabe-abschluss.md) pflegen bewusst keinen eigenen Ist-Stand, sondern verweisen hierauf, damit der Stand nur an einer Stelle gepflegt wird und nicht mehrfach driftet. Wer eine Etappe abschließt, erhöht das Versionsfeld um 0.1 und pflegt Abschnitt 9a und 10.
 
 ---
 
@@ -290,20 +292,23 @@ Logs, Metriken, Diagramme, Links.
 
 **Beispiel-Vorfallklassen für dieses System:** KT-Inkonsistenz oder Split-View-Verdacht (SEV-1, Security-Prozess), Verdacht auf Schlüssel-Leak (SEV-1), SSO-Ausfall mit Blast Radius auf Fremdprojekte (SEV-2), Prekey-Erschöpfung eines Geräts (SEV-3), Latenz-SLO-Bruch in der Zustellung (SEV-2/3).
 
-## 9a Erreichter Stand gegenüber der Roadmap (Stand 04.07.2026)
+## 9a Erreichter Stand gegenüber der Roadmap (Stand 12.07.2026, live-dokument v0.67)
 
-Diese Bilanz sagt ehrlich, was funktioniert und was aussteht. Der Maßstab ist nicht "perfekt", sondern grüne Gates plus ein vorführbarer Beweis. Der gesamte Baum ist grün: `cargo test --workspace` über 52 Test-Binaries mit allen fünf PostgreSQL-Datenbanken, `clippy -D warnings` nativ und nach wasm32, `fmt`, die Docker-Builds der Dienste und der `trunk`-Build des Web-Clients.
+Diese Bilanz sagt ehrlich, was funktioniert und was aussteht. Der Maßstab ist nicht "perfekt", sondern grüne Gates plus ein vorführbarer Beweis. Der gesamte Baum ist grün: `cargo test --workspace` mit allen fünf PostgreSQL-Datenbanken, `clippy -D warnings` nativ und nach wasm32, `fmt`, die Docker-Builds der Dienste und der `trunk`-Build des Web-Clients.
 
 **Gebaut, verifiziert und vorgeführt:**
 
-- **Meilenstein 1, der Kern:** 1:1-E2EE-Chat über PQXDH und Double Ratchet, in Web-Client (Leptos/WASM) und CLI, Echtzeit-Empfang über den WebSocket-Hinweiskanal, IndexedDB-Persistenz im Browser. Abnahme bestanden (zwei Browser-Sessions chatten beidseitig, die Zustell-Datenbank enthält nur Chiffretext, der untergeschobene Schlüssel fällt auf).
+- **Meilenstein 1, der Kern:** 1:1-E2EE-Chat über PQXDH und Double Ratchet, in Web-Client (Leptos/WASM) und CLI, Echtzeit-Empfang über den WebSocket-Hinweiskanal, verschlüsselte IndexedDB-Persistenz im Browser. Abnahme bestanden (zwei Browser-Sessions chatten beidseitig, die Zustell-Datenbank enthält nur Chiffretext, der untergeschobene Schlüssel fällt auf).
 - **Sechs Backend-Dienste** mit je eigener PostgreSQL-Datenbank, CI und Kubernetes-Manifesten.
-- **Key Transparency:** Selbstprüfung und Konsistenzprüfung (Auditor-Logik) client-seitig; Safety Number und sichtbare Warnung bei Schlüsselwechsel.
-- **MLS-Gruppen:** Backend mit Epochen-Serialisierung konkurrierender Commits (über PostgreSQL-Zeilensperre bewiesen), Client-Gruppensitzungen über OpenMLS, KeyPackage-Verteilung.
+- **MLS-Gruppen, voll bedienbar in CLI und Web:** Gründen, Senden, Beitritt per Einladung (kein Auto-Beitritt), Entfernen und Verlassen, Multi-Device-Teilnahme, persistente MLS-Ablage über Neustart, KeyPackage-Pool-Deckel; das delivery-Backend serialisiert konkurrierende Commits über eine Epochen-Zeilensperre.
+- **Multi-Device:** Geräte-Kopplung in CLI und Web (per eingefügtem Antrag oder QR-Code über einen verschlüsselten Relay), Self-Sync gesendeter Nachrichten an die eigenen Geräte, Verlaufs-Nachzug an frisch gekoppelte Geräte, der Browser auch als Zweitgerät.
+- **Kontoverwaltung:** Passwortwechsel (meldet die anderen Geräte ab), Konto-Löschung mit Widerrufsfrist (NF030), Anzeigename (F010) und Rotation des Konto-Wurzelschlüssels mit Kontinuitätssignatur, atomar und absturzsicher (ADR-0010).
+- **Key Transparency:** Selbstprüfung und Konsistenzprüfung (Auditor-Logik) client-seitig; Safety Number und sichtbare Warnung bei Schlüsselwechsel, in CLI und Web.
+- **Verschlüsselte Geräte-Ablage (Keystore):** der gesamte lokale Zustand (Identität, Sitzungen, Kontakte, Verlauf, Konto-Seed) liegt unter Argon2id plus ChaCha20-Poly1305 gesealt (CLI unter einer Passphrase, Web unter dem Login-Passwort).
 - **Contact Discovery** oblivious über eine OPRF (RFC 9497).
-- **Abuse-Abwehr:** Message Franking (beweisbare Meldung, HMAC-Commitment), empfängerseitiges Blockieren, Sybil-Bremse über Proof-of-Work.
+- **Abuse-Abwehr:** Message Franking (beweisbare Meldung, HMAC-Commitment), empfängerseitiges Blockieren, Sybil-Bremse über Proof-of-Work; in CLI und Web bedienbar.
 - **Disappearing Messages** server-seitig (unabgeholte Hüllen laufen ab).
-- **Sealed Sender** über selbst ausgestellte, austauschbare Absender-Zertifikate (libsignal-Konstruktion, eigener Trust Root, tokenlose Einreichung; v0.35).
+- **Sealed Sender** über selbst ausgestellte, austauschbare Absender-Zertifikate (libsignal-Konstruktion, eigener Trust Root, tokenlose Einreichung), in CLI und Web.
 - **Volles Bedrohungsmodell** (STRIDE je Dienst, LINDDUN je Datenfluss, Restrisiko-Register).
 
 **Bewusst offen, weil es ein externes Ereignis oder eine echte Organisation braucht (nicht gefaked, ADR-0008):**
@@ -314,6 +319,7 @@ Diese Bilanz sagt ehrlich, was funktioniert und was aussteht. Der Maßstab ist n
 - **PQ-Signaturen (ML-DSA)** für die Authentizität und **PQ-MLS**: warten auf Bibliotheks- beziehungsweise Upstream-Unterstützung (OpenMLS-Combiner-Draft); 1:1-Vertraulichkeit ist über PQXDH schon post-quantum.
 - **Binary-Transparency-Log-Betrieb, Push-Gateway mit echten APNs/FCM-Konten, NATS/Redis/Operatoren im Produktivbetrieb, Föderation, SVR-Enclave, Anrufe (SFrame/DTLS-SRTP):** Betriebs- und Organisations-Themen jenseits des baubaren Kerns.
 - **Client-seitige Löschung nach dem Lesen, Edits und Reactions** (mit ihrer Wechselwirkung zum Franking) und das **formale Handshake-Modell** (ProVerif/Tamarin): Härtungsphase.
+- **Rollierende Rotations-Übergangsvariante** (alter und neuer Wurzelschlüssel eine Zeit lang gleichzeitig gültig): die Rotation ersetzt heute die ganze Gerätemenge auf einmal (ADR-0010), die rollierende Form bleibt eine spätere Verfeinerung.
 
 Der Kern ist damit vollständig und vorführbar, die Breite darüber weitgehend gebaut, und was bleibt, ist ehrlich als offen ausgewiesen statt als erledigt behauptet.
 

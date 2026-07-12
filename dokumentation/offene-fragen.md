@@ -2,9 +2,9 @@
 
 Was noch nicht entschieden ist. Manches hat schon eine Tendenz, manches ist offen, manches ist nur ein Stichwort, das nicht vergessen werden soll. Jeder Punkt sollte fallen, bevor das zugehörige Stück gebaut wird.
 
-## Was inzwischen gebaut ist (Stand 04.07.2026)
+## Was inzwischen gebaut ist
 
-Ein Teil der früher offenen Punkte ist umgesetzt und im [Live-Dokument](live-dokument.md) Abschnitt 10 dokumentiert: Contact Discovery über eine OPRF (voprf, RFC 9497), Message Franking (HMAC-Commitment) mit beweisbarer Meldung, empfängerseitiges Blockieren, die Sybil-Bremse über Proof-of-Work bei der Registrierung, die KT-Selbstprüfung und die KT-Konsistenzprüfung (Auditor-Logik client-seitig), die sichtbare Warnung bei Schlüsselwechsel samt Safety Number, das MLS-Gruppen-Backend mit Epochen-Serialisierung samt Client-Gruppensitzungen, und die server-seitigen Disappearing Messages. Was unten steht, ist entweder noch offen oder braucht ein externes Ereignis (Audit) beziehungsweise eine echte Organisation (unabhängige Auditoren, Push-Konten, Cluster) und bleibt deshalb bewusst offen.
+Viele früher offene Punkte sind inzwischen umgesetzt (Contact Discovery, Message Franking und Blockieren, Sybil-Proof-of-Work, KT-Selbst- und Konsistenzprüfung, Schlüsselwechsel-Warnung samt Safety Number, MLS-Gruppen in CLI und Web, Multi-Device, verschlüsselte Geräte-Ablage, Kontoverwaltung samt Wurzelschlüssel-Rotation, server-seitige Disappearing Messages und mehr). Der aktuelle, verbindliche Funktionsstand steht ausschließlich im [Live-Dokument](live-dokument.md), Abschnitt 9a (Bilanz) und 10 (Verlauf); diese Datei hier führt bewusst keine eigene, driftende Fertig-Liste mehr. Was unten steht, ist entweder noch offen oder braucht ein externes Ereignis (Audit) beziehungsweise eine echte Organisation (unabhängige Auditoren, Push-Konten, Cluster) und bleibt deshalb bewusst offen.
 
 ## Das Dickste zuerst
 

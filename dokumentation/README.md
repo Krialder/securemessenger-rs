@@ -46,7 +46,7 @@ Diese Doku ist eine Übersicht plus die Specs, an denen so ein System steht oder
 
 ## Stand
 
-Der Kern funktioniert und ist vorgeführt (Meilenstein 1), und die Breite darüber ist weitgehend gebaut: sechs Backend-Dienste, 1:1-E2EE-Chat in Web- und CLI-Client mit Echtzeit-Empfang, Key Transparency mit Selbst- und Konsistenzprüfung, MLS-Gruppen, Contact Discovery über OPRF, Abuse-Abwehr (Message Franking, Blockieren, Proof-of-Work), Disappearing Messages und ein volles Bedrohungsmodell. Die Bilanz gegenüber der Roadmap steht im [Live-Dokument](live-dokument.md) Abschnitt 9a; der jeweils genaue Verlauf in Abschnitt 10. Drei Dinge gehören vorneweg gesagt:
+Der Kern funktioniert und ist vorgeführt (Meilenstein 1), und die Breite darüber ist weitgehend gebaut: sechs Backend-Dienste, 1:1- und Gruppen-E2EE-Chat in Web- und CLI-Client mit Echtzeit-Empfang, Multi-Device mit Self-Sync, verschlüsselte Geräte-Ablage (Keystore), Kontoverwaltung samt Wurzelschlüssel-Rotation, Key Transparency mit Selbst- und Konsistenzprüfung, Contact Discovery über OPRF, Abuse-Abwehr (Message Franking, Blockieren, Proof-of-Work), Disappearing Messages und ein volles Bedrohungsmodell. Die verbindliche Bilanz gegenüber der Roadmap steht im [Live-Dokument](live-dokument.md), Abschnitt 9a (die einzige maßgebliche Status-Quelle); der jeweils genaue Verlauf in Abschnitt 10. Drei Dinge gehören vorneweg gesagt:
 
 - Gruppen sind aktuell nicht post-quantum. MLS nach RFC 9420 ist in den Standard-Suites klassisch, PQ-MLS läuft noch über einen IETF-Draft. 1:1 ist über PQXDH schon post-quantum.
 - Backup über Secure Value Recovery ist eingeplant, kommt aber erst nach dem Fundament. Bis dahin gilt: Recovery-Key sichern.

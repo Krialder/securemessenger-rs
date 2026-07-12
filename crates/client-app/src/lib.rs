@@ -13,10 +13,13 @@
 //! HTTP-Client, den es auf beiden Zielen gibt.
 //!
 //! Umfang aktuell: Konto-Layer (Registrierung, Login, Session-Rotation,
-//! Logout gegen identity), Nachrichten-Layer (Prekey-Veröffentlichung und
-//! Bündel-Abruf gegen directory, Hüllen-Umlauf gegen delivery, Wire-Framing),
-//! die persistente Protokoll-Ablage hinter dem Storage-Trait und die
-//! KT-Selbstprüfung (kt-Modul). Offen: WebSocket-Hinweiskanal.
+//! Passwortwechsel, Konto-Löschung, Anzeigename, Wurzelschlüssel-Rotation,
+//! Geräte-Kopplung gegen identity), Nachrichten-Layer (Prekey-Veröffentlichung
+//! und Bündel-Abruf gegen directory, Hüllen-Umlauf gegen delivery samt
+//! WebSocket-Hinweiskanal, Wire-Framing), Sealed Sender, Contact Discovery,
+//! Message Franking und Blockieren, MLS-Gruppen (grouptext), Multi-Device-
+//! Self-Sync, die KT-Selbstprüfung (kt-Modul) und die persistente Protokoll-
+//! Ablage hinter dem Storage-Trait.
 
 pub mod account;
 pub mod delivery;
