@@ -260,7 +260,17 @@ if ($OpenBrowser -and $startedPorts.Count -gt 0) {
 
 Write-Host "`nUmgebung laeuft." -ForegroundColor White
 $webInfo = if ($Solo) { 'http://localhost:3000' } else { 'http://localhost:3000 (Alice)  http://localhost:3001 (Bob)' }
-if (-not $NoWeb) { Write-Host "    Web:     $webInfo" }
+if (-not $NoWeb) {
+    Write-Host "    Web:     $webInfo"
+    # Vorschlags-Konten fuer die Vorfuehrung: die Konten legt der Vorfuehrende
+    # beim ersten Mal selbst an (Passwort mindestens 12 Zeichen), danach nur
+    # noch anmelden. Diese Werte passen zu den Beispielen in DEMO.md.
+    Write-Host "    Demo-Konten (beim ersten Mal 'Konto anlegen', danach anmelden):"
+    Write-Host "      Alice (3000): Handle 'alice'  Passwort 'alices-langes-passwort'"
+    if (-not $Solo) {
+        Write-Host "      Bob   (3001): Handle 'bob'    Passwort 'bobs-langes-passwort'"
+    }
+}
 Write-Host "    CLI:     $root\target\debug\sm.exe (im PATH-freien Aufruf: .\target\debug\sm.exe help)"
 Write-Host '    Stoppen: scripts\sm.ps1 -Stop'
 Write-Host '    Drehbuch der Vorfuehrung: DEMO.md im Projekt-Root'

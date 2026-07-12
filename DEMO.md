@@ -17,7 +17,7 @@ Das Skript nutzt eigene `demo_*`-Datenbanken (getrennt von den Test-Datenbanken,
 ## 1. Zwei Browser chatten Ende-zu-Ende (Meilenstein 1)
 
 1. Öffne http://localhost:3000 (Alice) und http://localhost:3001 (Bob), am besten zwei Browserprofile oder ein normales plus ein privates Fenster, damit die IndexedDB-Ablagen getrennt sind.
-2. Registriere in beiden Fenstern je ein Konto (`alice`, `bob`, Passwort frei). Die Registrierung löst nebenbei den Proof-of-Work (Sybil-Bremse, im Demo-Betrieb 8 Bit) und veröffentlicht die Prekey-Bündel.
+2. Registriere in beiden Fenstern je ein Konto: `alice` mit Passwort `alices-langes-passwort`, `bob` mit `bobs-langes-passwort` (dieselben Vorschlags-Konten gibt das Start-Skript am Ende im Protokoll aus; das Passwort braucht mindestens 12 Zeichen). Die Registrierung löst nebenbei den Proof-of-Work (Sybil-Bremse, im Demo-Betrieb 8 Bit) und veröffentlicht die Prekey-Bündel.
 3. Alice startet einen Chat mit `bob` und schreibt. Die Nachricht erscheint bei Bob in Echtzeit (WebSocket-Hinweiskanal), ohne dass er lädt; Antworten laufen genauso zurück.
 4. Zeige die Safety Number in beiden Fenstern: dieselben 60 Ziffern auf beiden Seiten. Stimmen sie überein, spricht niemand mit einem untergeschobenen Schlüssel.
 
