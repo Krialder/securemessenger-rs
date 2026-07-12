@@ -37,7 +37,7 @@ Ein Backlog-Punkt pro Iteration, dann der Loop, erst danach der nächste:
 5. Doku synchron: `ENTWICKLUNG.md`, `live-dokument.md` (Version plus 0.1, Changelog-Zeile, Autor "Kai Delor"), `datenmodell.md`/`schnittstellen.md` wo berührt, Repo-Gedächtnis.
 6. Conventional Commit `typ(scope): Imperativ` mit Warum-Body und Footer `Co-Authored-By`; Commit-Text ohne Umlaute (ue/oe/ae).
 
-Behaupte nie grün, ohne den Befehl wirklich laufen zu lassen. `cargo` liegt unter `%USERPROFILE%\.cargo\bin`, `protoc` unter `%LOCALAPPDATA%\protoc\bin` (setup.ps1 setzt `PROTOC` pro Sitzung), Docker-Daemon und `sm-postgres` müssen laufen (`scripts/setup.ps1` richtet alles ein).
+Behaupte nie grün, ohne den Befehl wirklich laufen zu lassen. `cargo` liegt unter `%USERPROFILE%\.cargo\bin`, `protoc` unter `%LOCALAPPDATA%\protoc\bin` (`sm.ps1 -Setup` setzt `PROTOC` pro Sitzung), Docker-Daemon und `sm-postgres` müssen laufen (`scripts/sm.ps1 -Setup` bzw. die GUI `SecureMessenger.cmd` richtet alles ein).
 
 ## Standards
 

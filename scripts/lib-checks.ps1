@@ -2,15 +2,15 @@
   Gemeinsame Pruef- und Reparatur-Bibliothek der Einrichtung.
 
   BIBLIOTHEK, nicht direkt starten: wird per Dot-Sourcing (`. lib-checks.ps1`)
-  von install-gui.ps1, start-gui.ps1 und dem Konsolen-Weg eingebunden.
+  von der grafischen Oberflaeche (sm-gui.ps1) und dem Konsolen-Einstieg
+  (sm.ps1 -Setup) eingebunden.
 
   Das ist die einzige Wahrheit ueber den Zustand der Umgebung: Welche
   Werkzeuge fehlen, was veraltet ist, ob Docker und die Datenbank laufen und
-  ob die gebauten Programme aktuell sind. Beide grafischen Einstiege
-  (install-gui.ps1, start-gui.ps1) dot-sourcen diese Datei und iterieren
-  dieselbe Komponentenliste; so pruefen Installation und Alltagsstart mit
-  exakt derselben Logik. Das Konsolen-Setup (setup.ps1) bleibt als
-  eigenstaendiger Rueckfall bestehen.
+  ob die gebauten Programme aktuell sind. Beide Einstiege (die GUI sm-gui.ps1
+  und die Konsole sm.ps1 -Setup) dot-sourcen diese Datei und iterieren
+  dieselbe Komponentenliste; so richten grafischer und Konsolen-Weg mit exakt
+  derselben Logik ein, ohne dass die Pruef-Logik doppelt gepflegt wird.
 
   Jede Komponente traegt zwei Skriptbloecke: Check liest den Zustand
   (schnell, ohne Nebenwirkung) und liefert ok/missing/outdated/unknown mit
@@ -25,8 +25,8 @@ $script:SmRoot = Split-Path $PSScriptRoot -Parent
 # Werkzeuge liegen nach einer frischen Installation nicht immer im PATH der
 # aktuellen Sitzung (rustup und Docker tragen sich erst fuer neue Terminals
 # ein). Diese Rueckfaelle machen die Pruefungen verlaesslich, ohne auf ein
-# neues Fenster zu warten. Auch als eigene Funktion, damit die GUIs und
-# demo.ps1 die Umgebung gleich aufsetzen.
+# neues Fenster zu warten. Auch als eigene Funktion, damit die GUI und
+# sm.ps1 die Umgebung gleich aufsetzen.
 function Initialize-SmEnv {
     $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
     if ((Test-Path $cargoBin) -and ($env:Path -notlike "*$cargoBin*")) {
@@ -55,9 +55,8 @@ function Test-SmDockerDaemon {
 # accessed by the system" sterben; der Inference-Manager legt sie auch bei
 # abgeschaltetem EnableInference wieder an (Stand 07/2026). Loeschen
 # scheitert oft, das Umbenennen des Ordners funktioniert, Docker legt ihn
-# frisch an. Dieselbe Routine wie in setup.ps1; sie MUSS vor jedem
-# programmatischen Docker-Desktop-Start laufen, sonst haengt der Start im
-# Fehlerdialog.
+# frisch an. Sie MUSS vor jedem programmatischen Docker-Desktop-Start
+# laufen, sonst haengt der Start im Fehlerdialog.
 function Clear-SmStaleDockerSockets {
     $dirs = @(
         (Join-Path $env:LOCALAPPDATA 'Docker\run'),
@@ -129,7 +128,7 @@ function Get-SmNewestSourceTime {
     return ($times | Sort-Object -Descending | Select-Object -First 1)
 }
 
-# Die Binaries, die der Start (demo.ps1) braucht.
+# Die Binaries, die der Start (sm.ps1) braucht.
 $script:SmBinaries = @('identity', 'directory', 'delivery', 'kt', 'sm')
 $script:SmBuildPackages = @('identity', 'directory', 'delivery', 'kt', 'sm-cli')
 
@@ -186,8 +185,8 @@ function Get-SmComponents {
                 & $log "Installiere/repariere Toolchain $script:SmPinned (Download dauert einige Minuten)..."
                 # Erst deinstallieren: eine beschaedigte Toolchain ("Missing
                 # manifest") repariert 'toolchain install' NICHT, nur ein
-                # sauberer Neustand hilft (Paritaet zu setup.ps1). Ist sie gar
-                # nicht installiert, ist die Deinstallation ein harmloser No-op.
+                # sauberer Neustand hilft. Ist sie gar nicht installiert, ist
+                # die Deinstallation ein harmloser No-op.
                 & $rustup toolchain uninstall "$script:SmPinned-x86_64-pc-windows-msvc" *> $null
                 & $rustup toolchain install $script:SmPinned --component rustfmt --component clippy
                 & $rustup run $script:SmPinned rustc --version *> $null

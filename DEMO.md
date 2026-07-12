@@ -4,12 +4,12 @@ Das Drehbuch für eine Live-Vorführung des SecureMessengers auf einer frischen 
 
 ## Voraussetzungen
 
-Einmalig `scripts\setup.ps1` ausführen (installiert Rust, MSVC, protoc, Docker samt WSL, trunk und legt den `sm-postgres`-Container an). Danach genügt für jede Vorführung:
+Einmalig `scripts\sm.ps1 -Setup` ausführen (installiert Rust, MSVC, protoc, Docker samt WSL, trunk und legt den `sm-postgres`-Container an); die grafische `SecureMessenger.cmd` erledigt dasselbe per Haken-Auswahl. Danach genügt für jede Vorführung:
 
 ```powershell
-scripts\demo.ps1          # startet Dienste (8080-8083) und Web-Clients (3000, 3001)
-scripts\demo.ps1 -Reset   # dasselbe mit frischen demo_*-Datenbanken
-scripts\demo-stop.ps1     # beendet alles wieder
+scripts\sm.ps1          # startet Dienste (8080-8083) und Web-Clients (3000, 3001)
+scripts\sm.ps1 -Reset   # dasselbe mit frischen demo_*-Datenbanken
+scripts\sm.ps1 -Stop    # beendet alles wieder
 ```
 
 Das Skript nutzt eigene `demo_*`-Datenbanken (getrennt von den Test-Datenbanken, in denen `cargo test` arbeitet) und deterministische Demo-Schlüssel; in jeder echten Umgebung kämen die Schlüssel aus einem Secret-Store. Jeder Dienst läuft in einem eigenen Fenster mit sichtbaren Logs, weil die Logs Teil der Vorführung sind: dort sieht man, was der Server sieht, und vor allem, was er nicht sieht.

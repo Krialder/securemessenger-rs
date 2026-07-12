@@ -26,7 +26,7 @@ Umsetzen, gegenprüfen, verbessern. Jede Etappe endet grün, committet und mit s
 
 - Migrationen nach der Anwendung NIE ändern (sqlx-Prüfsumme); stattdessen die Wegwerf-Datenbank neu anlegen.
 - Jeder Dienst hat eine eigene Datenbank (die sqlx-Migrationstabellen würden sonst kollidieren).
-- `client-core` braucht `protoc` (setup.ps1 installiert es, env `PROTOC`).
+- `client-core` braucht `protoc` (die Einrichtung `scripts/sm.ps1 -Setup` bzw. die GUI installiert es, env `PROTOC`).
 - `akd` braucht seine Standard-Features (ohne `public_auditing` bricht 0.12.0 der Build).
 - Neue Dienste: den `common::metrics::track`-Layer und den ops_router nicht vergessen; `/internal`-Routen nur bei gesetztem Secret einhängen (sonst ein echtes 404).
 - Das identity-Image nach `/internal`-Vertragsänderungen neu bauen.

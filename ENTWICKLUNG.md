@@ -117,9 +117,9 @@ cargo run -p identity     # Dienst starten
 
 Argon2 ist in Debug-Builds sonst unbrauchbar langsam, deshalb baut das Dev-Profil die Krypto-Pakete optimiert (siehe `profile.dev.package` in der Workspace-Cargo.toml).
 
-Für den Krypto-Kern (`crates/client-core`) braucht der Build zusätzlich `protoc` (libsignal kompiliert seine Protobuf-Schemas beim Bauen). `scripts/setup.ps1` installiert es nach `%LOCALAPPDATA%\protoc` und setzt `PROTOC`; die Backend-Dienste bauen auch ohne, weil kein Dienst vom Krypto-Kern abhängt (das Docker-Build baut nur `-p <dienst>`).
+Für den Krypto-Kern (`crates/client-core`) braucht der Build zusätzlich `protoc` (libsignal kompiliert seine Protobuf-Schemas beim Bauen). Die Einrichtung (`SecureMessenger.cmd` oder `scripts/sm.ps1 -Setup`) installiert es nach `%LOCALAPPDATA%\protoc` und setzt `PROTOC`; die Backend-Dienste bauen auch ohne, weil kein Dienst vom Krypto-Kern abhängt (das Docker-Build baut nur `-p <dienst>`).
 
-Der Web-Client (`clients/web`) baut mit `trunk` nach wasm32 (beides installiert `scripts/setup.ps1`):
+Der Web-Client (`clients/web`) baut mit `trunk` nach wasm32 (beides installiert die Einrichtung, `scripts/sm.ps1 -Setup`):
 
 ```
 cd clients/web

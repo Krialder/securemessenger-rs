@@ -1,17 +1,19 @@
 <#
-  Grafischer Alltags-Start.
+  SecureMessenger: der eine grafische Einstieg (Erstinstallation UND
+  Alltags-Start in einem Fenster).
 
-  Prueft beim Oeffnen, ob die Umgebung stimmt und aktuell ist, und bietet je
-  nach Befund an: fehlen schwere Werkzeuge (winget, Rust, MSVC, WSL, Docker),
-  verweist es auf den Installations-Assistenten; sind nur Kleinigkeiten
-  veraltet (Format-Komponenten, wasm-Target, trunk, protoc, Projekt-Build),
-  bekommen sie eine Haken-Auswahl "aktualisieren"; ist alles gut, startet es
-  einfach. Docker-Daemon und Datenbank werden beim Start ohnehin hochgefahren.
+  Prueft beim Oeffnen die ganze Umgebung (Werkzeuge, Docker, Datenbank,
+  Build) und zeigt je Punkt den Zustand. Was fehlt oder veraltet ist,
+  bekommt eine Haken-Auswahl "einrichten/aktualisieren" (vorausgewaehlt),
+  ganz gleich ob es ein schweres Werkzeug (Rust, MSVC, WSL, Docker) oder eine
+  Kleinigkeit ist; Docker-Daemon und Datenbank werden beim Start ohnehin
+  hochgefahren. Ein Klick auf den Hauptknopf erledigt die Auswahl und startet
+  danach die Dienste und den Web-Client.
 
-  Der eigentliche Start laeuft ueber scripts\demo.ps1 (die eine Startlogik,
-  geteilt mit der Konsolen-Vorfuehrung): im Alltag mit -Solo (ein
-  Messenger-Fenster auf http://localhost:3000), im Vorfuehrmodus zusaetzlich
-  Bob auf 3001.
+  Der eigentliche Start laeuft ueber scripts\sm.ps1 (die eine Konsolen-Logik,
+  geteilt mit der Kommandozeile), die Pruefung und Reparatur ueber
+  lib-checks.ps1 (die geteilte Bibliothek). Im Alltag ein Messenger-Fenster
+  auf http://localhost:3000, im Vorfuehrmodus zusaetzlich Bob auf 3001.
 
   Mit -SelfTest wird nur das Fenster aufgebaut und wieder geschlossen; mit
   -ScanTest laeuft zusaetzlich der Scan ueber die echte Pump-Mechanik durch
@@ -25,10 +27,11 @@ $scriptsDir = $PSScriptRoot
 . (Join-Path $scriptsDir 'lib-checks.ps1')
 Initialize-SmEnv
 
-# Klassen je Komponente: schwere Werkzeuge blockieren und verweisen auf die
-# Installation; Dienste werden beim Start automatisch hochgefahren; alles
-# uebrige ist im Alltag aktualisierbar.
-$script:SmHeavy = @('winget', 'rust', 'msvc', 'wsl', 'docker')
+# Klassen je Komponente: Dienste (Docker-Daemon, Datenbank) werden beim Start
+# automatisch hochgefahren und brauchen keine Auswahl; alles uebrige
+# (Werkzeuge und Build) ist ueber eine Haken-Auswahl einrichtbar, ganz gleich
+# ob schweres Werkzeug (Rust, MSVC, WSL, Docker) oder Kleinigkeit. Ihr Fix
+# liegt jeweils in lib-checks.ps1.
 $script:SmService = @('daemon', 'postgres')
 
 $t = $script:SmTheme
@@ -73,8 +76,6 @@ $xaml = @"
       <CheckBox x:Name="DemoMode" Content="Vorfuehrmodus (Alice und Bob)" VerticalAlignment="Center"
                 Foreground="$($t.Muted)"/>
       <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-        <Button x:Name="InstallerBtn" Content="Installation oeffnen" Visibility="Collapsed" Width="150" Height="36"
-                Margin="0,0,10,0" Background="$($t.Card)" Foreground="$($t.Text)" BorderBrush="$($t.Border)"/>
         <Button x:Name="StopBtn" Content="Beenden" Visibility="Collapsed" Width="110" Height="36"
                 Margin="0,0,10,0" Background="$($t.Card)" Foreground="$($t.Text)" BorderBrush="$($t.Border)"/>
         <Button x:Name="PrimaryBtn" Content="Pruefe..." IsEnabled="False" Width="180" Height="36"
@@ -93,7 +94,6 @@ $ui = @{
     Progress    = $window.FindName('Progress')
     LogBox      = $window.FindName('LogBox')
     Primary     = $window.FindName('PrimaryBtn')
-    InstallerBtn= $window.FindName('InstallerBtn')
     StopBtn     = $window.FindName('StopBtn')
     DemoMode    = $window.FindName('DemoMode')
     Window      = $window
@@ -115,46 +115,36 @@ $queue = New-SmQueue
 
 # Nach dem Scan die Auswahl aufbauen und den Primaerknopf einstellen.
 function Complete-Scan {
-    $blocked = $false
-    $updatable = 0
+    $fixable = 0
     foreach ($key in $ui.Rows.Keys) {
         $state = $ui.States[$key]
         if ($state -eq 'ok') { continue }
-        if ($script:SmHeavy -contains $key) { $blocked = $true; continue }
         if ($script:SmService -contains $key) {
             Set-SmRowState $ui.Rows[$key] $state 'wird beim Start hochgefahren'
             continue
         }
-        # Aktualisierbar: Haken anbieten (vorausgewaehlt).
+        # Einrichtbar: Haken anbieten (vorausgewaehlt). Gilt fuer schwere
+        # Werkzeuge genauso wie fuer Kleinigkeiten; das Label richtet sich
+        # nach dem Zustand (fehlt = installieren, veraltet = aktualisieren).
         $check = New-Object System.Windows.Controls.CheckBox
-        $check.Content = 'aktualisieren'
+        $check.Content = if ($state -eq 'outdated') { 'aktualisieren' } else { 'installieren' }
         $check.IsChecked = $true
         $check.Foreground = (New-SmBrush $script:SmTheme.Accent)
         $ui.Rows[$key].Slot.Content = $check
         $ui.Checks[$key] = $check
-        $updatable++
+        $fixable++
     }
 
     $ui.Progress.Value = 0
-    if ($blocked) {
-        $ui.Phase = 'blocked'
-        $ui.Subtitle.Text = 'Es fehlen Werkzeuge. Bitte zuerst die Installation ausfuehren.'
-        $ui.StatusLine.Text = 'Nicht startbereit.'
-        $ui.InstallerBtn.Visibility = 'Visible'
-        $ui.Primary.Content = 'Starten'
-        $ui.Primary.IsEnabled = $false
-    } elseif ($updatable -gt 0) {
-        $ui.Phase = 'ready'
-        $ui.Subtitle.Text = 'Einige Punkte lassen sich aktualisieren.'
-        $ui.StatusLine.Text = ''
-        $ui.Primary.Content = 'Aktualisieren und starten'
-        $ui.Primary.IsEnabled = $true
+    $ui.Phase = 'ready'
+    $ui.StatusLine.Text = ''
+    $ui.Primary.IsEnabled = $true
+    if ($fixable -gt 0) {
+        $ui.Subtitle.Text = 'Einige Punkte lassen sich einrichten oder aktualisieren.'
+        $ui.Primary.Content = 'Einrichten und starten'
     } else {
-        $ui.Phase = 'ready'
         $ui.Subtitle.Text = 'Alles bereit.'
-        $ui.StatusLine.Text = ''
         $ui.Primary.Content = 'Starten'
-        $ui.Primary.IsEnabled = $true
     }
 }
 
@@ -201,10 +191,10 @@ foreach ($c in (Get-SmComponents)) {
 $Queue.Enqueue(@{ kind = 'scandone' })
 '@
 
-# Start-Codeblock: ausgewaehlte Aktualisierungen erledigen, Docker-Daemon
-# sicherstellen, dann ueber demo.ps1 starten (das kuemmert sich um Datenbank,
+# Start-Codeblock: ausgewaehlte Einrichtungen erledigen, Docker-Daemon
+# sicherstellen, dann ueber sm.ps1 starten (das kuemmert sich um Datenbank,
 # Dienste, Web-Client und Browser). Der Build laeuft nur, wenn ausgewaehlt;
-# demo.ps1 wird mit -NoBuild aufgerufen, damit nichts doppelt gebaut wird.
+# sm.ps1 wird mit -NoBuild aufgerufen, damit nichts doppelt gebaut wird.
 $startWorker = @'
 . (Join-Path $ScriptsDir 'lib-checks.ps1')
 Initialize-SmEnv
@@ -223,19 +213,19 @@ foreach ($key in $Selected) {
     $Queue.Enqueue(@{ kind = 'status'; key = $key; state = $after.State; detail = $after.Detail })
 }
 
-# 2. Docker-Daemon sicherstellen (demo.ps1 setzt ihn voraus).
+# 2. Docker-Daemon sicherstellen (sm.ps1 setzt ihn voraus).
 $daemon = $comps['daemon']
 $Queue.Enqueue(@{ kind = 'phase'; text = 'Stelle den Docker-Daemon sicher...' })
 $Queue.Enqueue(@{ kind = 'status'; key = 'daemon'; state = 'running'; detail = 'starte...' })
 if ((Test-SmComponent $daemon).State -ne 'ok') { try { [void](& $daemon.Fix $log) } catch { & $log "Fehler: $_" } }
 $Queue.Enqueue(@{ kind = 'status'; key = 'daemon'; state = (Test-SmComponent $daemon).State; detail = '' })
 
-# 3. Starten ueber demo.ps1.
+# 3. Starten ueber sm.ps1.
 $Queue.Enqueue(@{ kind = 'phase'; text = 'Starte Dienste und Web-Client...' })
-$demo = Join-Path $ScriptsDir 'demo.ps1'
-$demoArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $demo, '-Hidden', '-NoBuild', '-OpenBrowser')
-if ($Solo) { $demoArgs += '-Solo' }
-& powershell @demoArgs 2>&1 | ForEach-Object { $Queue.Enqueue(@{ kind = 'log'; text = "$_" }) }
+$sm = Join-Path $ScriptsDir 'sm.ps1'
+$smArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $sm, '-Hidden', '-NoBuild', '-OpenBrowser')
+if ($Solo) { $smArgs += '-Solo' }
+& powershell @smArgs 2>&1 | ForEach-Object { $Queue.Enqueue(@{ kind = 'log'; text = "$_" }) }
 $Queue.Enqueue(@{ kind = 'launched'; solo = $Solo })
 '@
 
@@ -252,20 +242,15 @@ $ui.Primary.Add_Click({
     $ui.Job = Start-SmJob $startWorker @{ Queue = $queue; ScriptsDir = $scriptsDir; Selected = $selected; Solo = $solo }
 }.GetNewClosure())
 
-$ui.InstallerBtn.Add_Click({
-    Start-Process powershell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-WindowStyle', 'Hidden', '-File', (Join-Path $scriptsDir 'install-gui.ps1') | Out-Null
-    $ui.Window.Close()
-}.GetNewClosure())
-
 $ui.StopBtn.Add_Click({
-    Start-Process powershell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $scriptsDir 'demo-stop.ps1') -Wait -WindowStyle Hidden | Out-Null
+    Start-Process powershell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $scriptsDir 'sm.ps1'), '-Stop' -Wait -WindowStyle Hidden | Out-Null
     $ui.Window.Close()
 }.GetNewClosure())
 
 $window.Add_Closed({ if ($ui.Job) { Stop-SmJob $ui.Job } }.GetNewClosure())
 
 if ($SelfTest) {
-    Write-Host 'start-gui: Fenster aufgebaut, Selbsttest ok.'
+    Write-Host 'sm-gui: Fenster aufgebaut, Selbsttest ok.'
     $window.Close()
     return
 }
@@ -287,7 +272,7 @@ if ($ScanTest) {
     }.GetNewClosure())
     $stopper.Start()
     [System.Windows.Threading.Dispatcher]::PushFrame($frame)
-    Write-Host ("ScanTest: phase=$($ui.Phase) primary='$($ui.Primary.Content)' enabled=$($ui.Primary.IsEnabled) installerBtn=$($ui.InstallerBtn.Visibility)")
+    Write-Host ("ScanTest: phase=$($ui.Phase) primary='$($ui.Primary.Content)' enabled=$($ui.Primary.IsEnabled)")
     Write-Host ("  build-Zeile: $($ui.Rows['build'].Icon.Text) / states erfasst: $($ui.States.Count)")
     $window.Close()
     return

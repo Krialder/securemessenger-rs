@@ -1,56 +1,116 @@
 <#
-  Startet die komplette Vorfuehr-Umgebung des SecureMessengers mit einem
-  Befehl: vier Dienste (identity 8080, directory 8081, delivery 8082,
-  kt 8083), eigene demo_*-Datenbanken im sm-postgres-Container und zwei
-  Web-Clients (Alice http://localhost:3000, Bob http://localhost:3001).
+  SecureMessenger: ein Konsolen-Einstieg fuer alles.
 
-  Warum eigene demo_*-Datenbanken: die Vorfuehrung soll reproduzierbar
-  bleiben und darf sich nicht mit den Test-Datenbanken (identity, delivery,
-  ...) mischen, in denen cargo test arbeitet. Zuruecksetzen:
-  scripts\demo.ps1 -Reset loescht die demo_*-Datenbanken vorher.
+  Loest die frueher getrennten Skripte setup.ps1 (einrichten), demo.ps1
+  (starten) und demo-stop.ps1 (stoppen) ab. Die eigentliche Pruef- und
+  Reparatur-Logik der Einrichtung liegt weiterhin an einer Stelle
+  (lib-checks.ps1, dieselbe, die auch die grafische Oberflaeche nutzt), damit
+  Konsole und GUI nicht auseinanderdriften.
 
-  Die Schluessel (KT-Signatur, KT-VRF, Discovery-OPRF, Sealed-Sender-Trust-
-  Root) sind DETERMINISTISCHE DEMO-WERTE, damit jeder Neustart zu den in den
-  Clients gepinnten Ankern passt. In jeder echten Umgebung kommen sie aus
-  einem Secret-Store; genau dafuer sind es Umgebungsvariablen.
-
-  Jeder Dienst laeuft in einem eigenen Fenster (Logs sichtbar, gut fuer die
-  Vorfuehrung). scripts\demo-stop.ps1 beendet alles wieder.
-
-  Das Drehbuch der Vorfuehrung steht in DEMO.md im Projekt-Root.
+  Aufrufe:
+    sm.ps1              startet die Umgebung (vier Dienste plus Web-Clients)
+    sm.ps1 -Setup       richtet nur ein und aktualisiert (Werkzeuge, Docker,
+                        Datenbanken, Build), ohne zu starten
+    sm.ps1 -Stop        beendet eine laufende Umgebung
+    sm.ps1 -Reset       loescht die demo_*-Datenbanken vor dem Start
+    sm.ps1 -Solo        nur ein Web-Client (Alice, 3000) statt Alice und Bob
+    sm.ps1 -NoWeb       nur die Dienste, keine Web-Clients
+    sm.ps1 -NoBuild     ueberspringt cargo build (die GUI baut selbst)
+    sm.ps1 -Hidden      Dienst-Fenster versteckt (fuer den GUI-Start)
+    sm.ps1 -OpenBrowser oeffnet nach dem Start den Standardbrowser
 #>
 param(
-    # Loescht die demo_*-Datenbanken vor dem Start (frische Vorfuehrung).
+    [switch]$Setup,
+    [switch]$Stop,
     [switch]$Reset,
-    # Nur Dienste, keine Web-Clients (fuer reine CLI-Vorfuehrungen).
-    [switch]$NoWeb,
-    # Nur ein Web-Client (Alice, 3000) statt Alice und Bob. Das ist der
-    # Alltags-Start: eine Messenger-Instanz statt der Zwei-Personen-Vorfuehrung.
     [switch]$Solo,
-    # Oeffnet nach dem Start den Standardbrowser auf den/die Web-Client(s).
-    [switch]$OpenBrowser,
-    # Startet die Dienst-Fenster versteckt (WindowStyle Hidden). Fuer den
-    # GUI-Start, der die Logs nicht als Konsolenfenster zeigen will; die
-    # Konsolen-Vorfuehrung laesst sie sichtbar.
+    [switch]$NoWeb,
+    [switch]$NoBuild,
     [switch]$Hidden,
-    # Ueberspringt cargo build. Der GUI-Start baut selbst (nur wenn noetig
-    # und vom Nutzer bestaetigt) und ruft demo.ps1 dann mit -NoBuild, damit
-    # nicht doppelt gebaut wird.
-    [switch]$NoBuild
+    [switch]$OpenBrowser
 )
 
 # Kein globales 'Stop': native Programme (docker, psql) schreiben Hinweise
 # auf stderr, und PowerShell 5.1 wuerde daraus einen Abbruch machen. Die
-# Fehlerbehandlung laeuft stattdessen ueber explizite Exit-Code-Pruefungen.
+# Fehlerbehandlung laeuft ueber explizite Exit-Code-Pruefungen.
 $ErrorActionPreference = 'Continue'
-$root = Split-Path $PSScriptRoot -Parent
+$scriptsDir = $PSScriptRoot
+$root = Split-Path $scriptsDir -Parent
 
 function Write-Step($m) { Write-Host "`n==> $m" -ForegroundColor Cyan }
 function Write-Ok($m)   { Write-Host "    [ok] $m" -ForegroundColor Green }
 function Write-Bad($m)  { Write-Host "    [x]  $m" -ForegroundColor Red }
 function Have($name)    { return [bool](Get-Command $name -ErrorAction SilentlyContinue) }
 
-# Werkzeuge aufloesen (wie setup.ps1: PATH-Rueckfaelle fuer frische Sitzungen).
+# ---------------------------------------------------------------------------
+# Stoppen: die frueher eigene demo-stop.ps1. Erst die festgehaltenen
+# Prozess-IDs, dann ein Aufraeumlauf ueber die Fenstertitel (sm-demo-*) und
+# uebrig gebliebene Dienst-/trunk-Prozesse aus diesem Projektbaum.
+# ---------------------------------------------------------------------------
+if ($Stop) {
+    $pidFile = Join-Path $env:TEMP 'sm-demo-pids.txt'
+    $stopped = 0
+    if (Test-Path $pidFile) {
+        foreach ($procId in Get-Content $pidFile) {
+            try { Stop-Process -Id ([int]$procId) -Force -Confirm:$false -ErrorAction Stop; $stopped++ } catch {}
+        }
+        Remove-Item $pidFile -Force -Confirm:$false -ErrorAction SilentlyContinue
+    }
+    foreach ($p in Get-Process powershell -ErrorAction SilentlyContinue) {
+        if ($p.MainWindowTitle -like 'sm-demo-*') {
+            try { Stop-Process -Id $p.Id -Force -Confirm:$false -ErrorAction Stop; $stopped++ } catch {}
+        }
+    }
+    foreach ($name in 'identity', 'directory', 'delivery', 'kt', 'trunk') {
+        foreach ($p in Get-Process $name -ErrorAction SilentlyContinue) {
+            $exePath = try { $p.Path } catch { '' }
+            if ($exePath -like "$root*" -or $name -eq 'trunk') {
+                try { Stop-Process -Id $p.Id -Force -Confirm:$false -ErrorAction Stop; $stopped++ } catch {}
+            }
+        }
+    }
+    Write-Host "Umgebung gestoppt ($stopped Prozess(e) beendet)."
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Einrichten: die frueher eigene setup.ps1. Delegiert an die geteilte
+# Pruef-Bibliothek (lib-checks.ps1), damit Konsole und GUI dieselbe Logik
+# nutzen: je Komponente pruefen und bei Bedarf reparieren/installieren.
+# ---------------------------------------------------------------------------
+if ($Setup) {
+    . (Join-Path $scriptsDir 'lib-checks.ps1')
+    Initialize-SmEnv
+    Write-Step 'Umgebung pruefen und einrichten'
+    $log = { param($t) Write-Host "        $t" -ForegroundColor DarkGray }
+    $allOk = $true
+    foreach ($c in (Get-SmComponents)) {
+        $st = Test-SmComponent $c
+        if ($st.State -eq 'ok') { Write-Ok "$($c.Name): $($st.Detail)"; continue }
+        Write-Host "    ... $($c.Name): $($st.Detail), richte ein" -ForegroundColor Yellow
+        try { [void](& $c.Fix $log) } catch { & $log "Fehler: $_" }
+        $after = Test-SmComponent $c
+        if ($after.State -eq 'ok') { Write-Ok "$($c.Name): $($after.Detail)" }
+        else {
+            if (-not $c.Optional) { $allOk = $false }
+            Write-Bad "$($c.Name): offen ($($after.Detail))"
+        }
+    }
+    if ($allOk) {
+        Write-Host "`nEinrichtung abgeschlossen. Starten mit: scripts\sm.ps1 (oder Doppelklick auf SecureMessenger.cmd)." -ForegroundColor White
+    } else {
+        Write-Host "`nEinige Punkte brauchen noch Aufmerksamkeit (siehe oben)." -ForegroundColor Yellow
+    }
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Starten: die frueher eigene demo.ps1. Vier Dienste (identity 8080,
+# directory 8081, delivery 8082, kt 8083) mit eigenen demo_*-Datenbanken und
+# deterministischen Demo-Schluesseln, dazu die Web-Clients ueber trunk.
+# ---------------------------------------------------------------------------
+
+# Werkzeuge aufloesen (PATH-Rueckfaelle fuer frische Sitzungen).
 $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
 if (-not (Have 'cargo') -and (Test-Path (Join-Path $cargoBin 'cargo.exe'))) { $env:Path = "$cargoBin;$env:Path" }
 $dockerCliDir = Join-Path $env:ProgramFiles 'Docker\Docker\resources\bin'
@@ -60,14 +120,14 @@ if (-not $env:PROTOC -and (Test-Path $protocExe)) { $env:PROTOC = $protocExe }
 $trunkExe = Join-Path $cargoBin 'trunk.exe'
 
 foreach ($tool in 'cargo', 'docker') {
-    if (-not (Have $tool)) { Write-Bad "$tool fehlt; zuerst scripts\setup.ps1 ausfuehren"; exit 1 }
+    if (-not (Have $tool)) { Write-Bad "$tool fehlt; zuerst scripts\sm.ps1 -Setup ausfuehren"; exit 1 }
 }
 try { docker info *> $null } catch {}
-if ($LASTEXITCODE -ne 0) { Write-Bad 'Docker-Daemon nicht erreichbar; zuerst scripts\setup.ps1 ausfuehren'; exit 1 }
+if ($LASTEXITCODE -ne 0) { Write-Bad 'Docker-Daemon nicht erreichbar; zuerst scripts\sm.ps1 -Setup ausfuehren'; exit 1 }
 
 # Deterministische Demo-Schluessel (32 Bytes je Wert, Base64). NUR fuer die
-# Vorfuehrung; siehe Kopfkommentar.
-function DemoKey([byte]$b) { return [Convert]::ToBase64String((,[byte]$b * 32)) }
+# Vorfuehrung; in jeder echten Umgebung kommen sie aus einem Secret-Store.
+function DemoKey([byte]$b) { return [Convert]::ToBase64String((, [byte]$b * 32)) }
 $ktSigningKey  = DemoKey 1
 $ktVrfKey      = DemoKey 2
 $oprfKey       = DemoKey 3
@@ -84,7 +144,7 @@ for ($i = 0; $i -lt 30; $i++) {
     if ($LASTEXITCODE -eq 0) { $ready = $true; break }
     Start-Sleep -Seconds 1
 }
-if (-not $ready) { Write-Bad 'sm-postgres nicht bereit; zuerst scripts\setup.ps1 ausfuehren'; exit 1 }
+if (-not $ready) { Write-Bad 'sm-postgres nicht bereit; zuerst scripts\sm.ps1 -Setup ausfuehren'; exit 1 }
 foreach ($db in $databases) {
     if ($Reset) {
         docker exec sm-postgres psql -U postgres -c "DROP DATABASE IF EXISTS $db" *> $null
@@ -130,8 +190,6 @@ Start-Service 'identity' '127.0.0.1:8080' @{
     KT_URL                   = 'http://127.0.0.1:8083'
     CDS_OPRF_KEY             = $oprfKey
     SEALED_SENDER_TRUST_ROOT = $sealedRoot
-    # Sybil-Bremse klein, damit die Registrierung in der Vorfuehrung nicht
-    # wartet, die Bremse aber sichtbar aktiv ist (256 Hashes im Schnitt).
     POW_DIFFICULTY           = '8'
 }
 Start-Service 'directory' '127.0.0.1:8081' @{
@@ -146,8 +204,6 @@ Start-Service 'kt' '127.0.0.1:8083' @{
     DATABASE_URL     = "$pg/demo_kt"
     KT_SIGNING_KEY   = $ktSigningKey
     KT_VRF_KEY       = $ktVrfKey
-    # Kurze Epochen, damit Verzeichnis-Aenderungen in der Vorfuehrung
-    # binnen Sekunden pruefbar sind.
     KT_EPOCH_SECONDS = '5'
 }
 
@@ -172,7 +228,7 @@ if (-not $NoWeb) {
     $clients = if ($Solo) { @(@{ name = 'alice'; port = 3000 }) } else { @(@{ name = 'alice'; port = 3000 }, @{ name = 'bob'; port = 3001 }) }
     Write-Step ("Starte Web-Client(s): " + (($clients | ForEach-Object { "$($_.name) $($_.port)" }) -join ', '))
     if (-not ((Have 'trunk') -or (Test-Path $trunkExe))) {
-        Write-Bad 'trunk fehlt; zuerst scripts\setup.ps1 ausfuehren (oder -NoWeb nutzen)'
+        Write-Bad 'trunk fehlt; zuerst scripts\sm.ps1 -Setup ausfuehren (oder -NoWeb nutzen)'
     } else {
         $trunk = if (Have 'trunk') { 'trunk' } else { $trunkExe }
         $webDir = Join-Path $root 'clients\web'
@@ -186,12 +242,11 @@ if (-not $NoWeb) {
     }
 }
 
-# PIDs fuer demo-stop.ps1 festhalten.
+# PIDs fuer 'sm.ps1 -Stop' festhalten.
 $pids -join "`n" | Out-File -FilePath (Join-Path $env:TEMP 'sm-demo-pids.txt') -Encoding ascii
 
 # Optional den Browser oeffnen. Der trunk-Server braucht nach dem Start einen
-# Moment, bis er die Seite ausliefert; kurz auf den ersten Port warten, damit
-# der Browser nicht auf eine noch tote Adresse trifft.
+# Moment, bis er die Seite ausliefert; kurz auf den ersten Port warten.
 if ($OpenBrowser -and $startedPorts.Count -gt 0) {
     $first = $startedPorts[0]
     for ($i = 0; $i -lt 60; $i++) {
@@ -207,5 +262,5 @@ Write-Host "`nUmgebung laeuft." -ForegroundColor White
 $webInfo = if ($Solo) { 'http://localhost:3000' } else { 'http://localhost:3000 (Alice)  http://localhost:3001 (Bob)' }
 if (-not $NoWeb) { Write-Host "    Web:     $webInfo" }
 Write-Host "    CLI:     $root\target\debug\sm.exe (im PATH-freien Aufruf: .\target\debug\sm.exe help)"
-Write-Host '    Stoppen: scripts\demo-stop.ps1'
+Write-Host '    Stoppen: scripts\sm.ps1 -Stop'
 Write-Host '    Drehbuch der Vorfuehrung: DEMO.md im Projekt-Root'
