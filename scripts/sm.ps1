@@ -17,6 +17,7 @@
     sm.ps1 -NoWeb       nur die Dienste, keine Web-Clients
     sm.ps1 -NoBuild     ueberspringt cargo build (die GUI baut selbst)
     sm.ps1 -Hidden      Dienst-Fenster versteckt (fuer den GUI-Start)
+    sm.ps1 -Sso         startet zusaetzlich Keycloak (SSO-Provider) mit Realm
     sm.ps1 -OpenBrowser oeffnet nach dem Start den Standardbrowser
 #>
 param(
@@ -27,6 +28,7 @@ param(
     [switch]$NoWeb,
     [switch]$NoBuild,
     [switch]$Hidden,
+    [switch]$Sso,
     [switch]$OpenBrowser
 )
 
@@ -69,7 +71,10 @@ if ($Stop) {
             }
         }
     }
-    Write-Host "Umgebung gestoppt ($stopped Prozess(e) beendet)."
+    # Keycloak laeuft als Container, nicht als Prozess dieses Baums.
+    docker stop sm-keycloak *> $null
+    if ($LASTEXITCODE -eq 0) { $stopped++ }
+    Write-Host "Umgebung gestoppt ($stopped Prozess(e)/Container beendet)."
     exit 0
 }
 
@@ -232,6 +237,44 @@ foreach ($port in $ports) {
     if ($ok) { Write-Ok "Port $port bereit" } else { Write-Bad "Port $port antwortet nicht; Fenster 'sm-demo-*' pruefen" }
 }
 
+# 4b. Optional Keycloak (SSO-Provider) mit importiertem Realm. Bewusst opt-in
+# (-Sso): das Image ist schwer und der Chat-Demo braucht es nicht, aber es
+# gehoert zum Fundament fuer die anderen Projekte (ADR-0011). Der Realm liegt
+# versioniert in deploy/keycloak; -Reset erzwingt einen frischen Import.
+if ($Sso) {
+    Write-Step 'Starte Keycloak (SSO-Provider, Realm securemessenger, Port 8090)'
+    $realmFile = Join-Path $root 'deploy\keycloak\realm-securemessenger.json'
+    $exists = (docker ps -a --filter 'name=^sm-keycloak$' --format '{{.Names}}' 2>$null) -eq 'sm-keycloak'
+    if ($Reset -and $exists) { docker rm -f sm-keycloak *> $null; $exists = $false }
+    if (-not $exists) {
+        # Neu anlegen und den Realm hineinkopieren (Volume-Mounts zicken unter
+        # Windows/Git-Bash-Pfaden), dann starten: --import-realm liest ihn.
+        docker create --name sm-keycloak -p 8090:8080 `
+            -e KC_BOOTSTRAP_ADMIN_USERNAME=admin `
+            -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin-demo-passwort `
+            quay.io/keycloak/keycloak:26.2 start-dev --import-realm *> $null
+        $tmp = Join-Path $env:TEMP 'sm-kc-import'
+        New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+        Copy-Item $realmFile (Join-Path $tmp 'realm-securemessenger.json') -Force
+        docker cp $tmp sm-keycloak:/opt/keycloak/data/import *> $null
+    }
+    docker start sm-keycloak *> $null
+    $kcReady = $false
+    for ($i = 0; $i -lt 60; $i++) {
+        try {
+            $r = Invoke-WebRequest -Uri 'http://localhost:8090/realms/securemessenger/.well-known/openid-configuration' -UseBasicParsing -TimeoutSec 2
+            if ($r.StatusCode -eq 200) { $kcReady = $true; break }
+        } catch { Start-Sleep -Seconds 1 }
+    }
+    if ($kcReady) {
+        Write-Ok 'Keycloak bereit: http://localhost:8090 (admin / admin-demo-passwort)'
+        Write-Ok 'Discovery: http://localhost:8090/realms/securemessenger/.well-known/openid-configuration'
+        Write-Ok "Demo-Login: azubi-demo / azubi-demo-passwort (Clients: azubios, azubios-spa)"
+    } else {
+        Write-Bad 'Keycloak nicht bereit (docker logs sm-keycloak pruefen)'
+    }
+}
+
 # 5. Web-Clients, je ein trunk-Dev-Server mit /api-Proxys. -Solo startet nur
 # Alice (Alltags-Start), sonst Alice und Bob (Zwei-Personen-Vorfuehrung).
 $startedPorts = @()
@@ -283,5 +326,8 @@ if (-not $NoWeb) {
     }
 }
 Write-Host "    CLI:     $root\target\debug\sm.exe (im PATH-freien Aufruf: .\target\debug\sm.exe help)"
+if ($Sso) {
+    Write-Host "    SSO:     http://localhost:8090 (Keycloak, Login azubi-demo / azubi-demo-passwort)"
+}
 Write-Host '    Stoppen: scripts\sm.ps1 -Stop'
 Write-Host '    Drehbuch der Vorfuehrung: DEMO.md im Projekt-Root'

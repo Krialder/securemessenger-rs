@@ -1,0 +1,85 @@
+{
+  "realm": "securemessenger",
+  "displayName": "SecureMessenger SSO",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": true,
+  "rememberMe": true,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "verifyEmail": false,
+  "accessTokenLifespan": 300,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "offlineSessionIdleTimeout": 1209600,
+  "clients": [
+    {
+      "clientId": "azubios",
+      "name": "AzubiOS (Server-Anwendung)",
+      "description": "Vertraulicher OIDC-Client fuer ein serverseitiges Fremdprojekt (Authorization Code Flow mit Client-Secret und PKCE).",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "azubios-dev-secret-nur-fuer-die-vorfuehrung",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "fullScopeAllowed": true,
+      "redirectUris": [
+        "https://azubios.messenger.intern/oidc/callback",
+        "http://localhost:8100/callback",
+        "http://localhost:8100/*"
+      ],
+      "webOrigins": ["+"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "+",
+        "access.token.lifespan": "300"
+      },
+      "defaultClientScopes": ["profile", "email", "roles", "web-origins"],
+      "optionalClientScopes": ["offline_access"]
+    },
+    {
+      "clientId": "azubios-spa",
+      "name": "AzubiOS (Single-Page-App)",
+      "description": "Oeffentlicher OIDC-Client fuer eine Browser-App ohne Secret (Authorization Code Flow mit PKCE, Pflicht).",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "https://azubios.messenger.intern/*",
+        "http://localhost:8100/*"
+      ],
+      "webOrigins": ["+"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "+"
+      },
+      "defaultClientScopes": ["profile", "email", "roles", "web-origins"],
+      "optionalClientScopes": []
+    }
+  ],
+  "users": [
+    {
+      "username": "azubi-demo",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "azubi-demo@messenger.intern",
+      "firstName": "Azubi",
+      "lastName": "Demo",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "azubi-demo-passwort",
+          "temporary": false
+        }
+      ]
+    }
+  ]
+}

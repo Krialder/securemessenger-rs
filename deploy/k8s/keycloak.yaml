@@ -3,11 +3,19 @@
 # bei Sicherheit"). Zwei Repliken, weil SSO der Single Point of Failure
 # für alle angebundenen Projekte ist (NF060: 99,9 Prozent).
 #
-# [ANNAHME: Das ist ein Deployment-Skelett. Realm-Konfiguration, die
-# Anbindung der identity-Konten und die Registrierung der Mandanten als
-# OAuth2-Clients folgen mit der SSO-Etappe; Werte wie Image-Tag und
-# Hostname setzt die GitOps-Pipeline. Keycloak braucht eine eigene
-# Datenbank (Secret keycloak-db), geteilt wird nichts.]
+# Der Realm wird beim Start importiert (--import-realm): er liegt als
+# ConfigMap keycloak-realm vor (erzeugt von kustomize aus dem versionierten
+# Export, siehe kustomization.yaml und deploy/keycloak) und ist unter
+# /opt/keycloak/data/import gemountet. So laufen Cluster und lokaler Lauf
+# gegen denselben, versionierten Realm (ADR-0011). Der Import greift nur auf
+# einer frischen Datenbank (IGNORE_EXISTING); ein nachtraeglich geaenderter
+# Export braucht einen Einmal-Job mit kc.sh import --override (ADR-0011).
+#
+# [ANNAHME: Die im Export enthaltenen Demo-Werte (Client-Secret, Demo-Nutzer)
+# gehoeren nur in den lokalen Lauf; im Cluster ueberschreibt die Pipeline die
+# Client-Secrets aus einem Secret-Store und legt echte Konten an. Werte wie
+# Image-Tag und Hostname setzt die GitOps-Pipeline. Keycloak braucht eine
+# eigene Datenbank (Secret keycloak-db), geteilt wird nichts.]
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -27,10 +35,14 @@ spec:
       containers:
         - name: keycloak
           image: quay.io/keycloak/keycloak:26.2 # Platzhalter, Version pinnt die Pipeline
-          args: ["start"]
+          args: ["start", "--import-realm"]
           ports:
             - containerPort: 8080
             - containerPort: 9000 # Management (Health, Metrics)
+          volumeMounts:
+            - name: realm-import
+              mountPath: /opt/keycloak/data/import
+              readOnly: true
           env:
             - name: KC_DB
               value: "postgres"
@@ -84,6 +96,14 @@ spec:
             limits:
               cpu: "1"
               memory: "1Gi"
+      volumes:
+        # ConfigMap keycloak-realm: erzeugt kustomize beim apply -k
+        # (configMapGenerator in deploy/keycloak). Ohne kustomize von Hand:
+        # kubectl create configmap keycloak-realm \
+        #   --from-file=deploy/keycloak/realm-securemessenger.json
+        - name: realm-import
+          configMap:
+            name: keycloak-realm
 ---
 apiVersion: v1
 kind: Service

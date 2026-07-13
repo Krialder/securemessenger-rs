@@ -1,0 +1,17 @@
+# Erzeugt die ConfigMap keycloak-realm aus dem versionierten Realm-Export.
+# Eigene Kustomization-Basis, damit deploy/k8s sie referenzieren kann, ohne
+# eine Datei oberhalb seines Verzeichnisses zu laden (kustomize verbietet das
+# aus Sicherheitsgruenden). deploy/k8s/keycloak.yaml mountet die ConfigMap
+# unter /opt/keycloak/data/import und laedt sie per --import-realm (ADR-0011).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+configMapGenerator:
+  - name: keycloak-realm
+    files:
+      - realm-securemessenger.json
+
+# Stabiler Name (keycloak.yaml referenziert die ConfigMap namentlich), kein
+# Inhalts-Hash-Suffix.
+generatorOptions:
+  disableNameSuffixHash: true

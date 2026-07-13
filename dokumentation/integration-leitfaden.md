@@ -6,7 +6,7 @@ Dieser Leitfaden richtet sich an ein anderes Ausbildungsprojekt (etwa AzubiOS), 
 
 - **Benachrichtigungen (notify):** ein markierter Maschinen-Hinweis an einen Nutzer, mit minimalem Inhalt (Mandant und Titel). Das ist ausdruecklich KEIN Ende-zu-Ende-Chat: der Absender ist ein Server, die Details holt der Nutzer im Fremdprojekt.
 - **Praesenz (presence):** ob ein Nutzer gerade online ist (ein Bit, keine Geraete-Aufloesung).
-- **Single Sign-on (OIDC):** geplant ueber Keycloak, aber noch nicht scharf. Siehe Abschnitt "SSO/OIDC" unten, damit niemand einen fertigen Login-Fluss erwartet, den es noch nicht gibt.
+- **Single Sign-on (OIDC):** deine Nutzer melden sich am SecureMessenger an und sind damit im Fremdprojekt angemeldet. Der Provider ist Keycloak mit einem versionierten, importierbaren Realm (lokal verifiziert); der volle Fluss steht im Abschnitt "SSO/OIDC" unten.
 - **Nicht angeboten:** Lesezugriff auf Chat-Inhalte. Nachrichten sind Ende-zu-Ende verschluesselt, der Server (und damit ein Fremdprojekt) sieht nur Chiffretext. Das ist Absicht und aendert sich nicht.
 
 ## Basis-URL
@@ -109,9 +109,17 @@ Bei `429` warte die im `Retry-After` genannte Zeit ab, statt sofort erneut zu se
 - **Oeffentlich (stabiler Vertrag):** `POST /integrations/token`, `POST /integrations/{tenant}/notify`, `GET /integrations/{tenant}/presence/{handle}`. Nur diese drei sind fuer Fremdprojekte gedacht und im Ingress erreichbar.
 - **Betriebsintern (nicht fuer Integratoren):** `POST /internal/tenants` (Mandanten-Anlage) und alle uebrigen `/internal/*`-Routen der Dienste. Sie sind nur im Cluster-Netz erreichbar, per Shared Secret, und tauchen im Ingress bewusst nicht auf.
 
-## SSO/OIDC (Stand ehrlich)
+## SSO/OIDC (Nutzer-Login delegieren)
 
-Der Zielentwurf ist Single Sign-on ueber OpenID Connect (Discovery plus Authorization-Code-Flow): das Fremdprojekt delegiert die Anmeldung, bekommt die Anmelde-Identitaet, aber nie private Schluessel oder Lesezugriff auf Inhalte. **Aktuell ist das noch nicht nutzbar.** Keycloak liegt nur als Deployment-Skelett vor (deploy/k8s/keycloak.yaml, Host `sso.messenger.intern`): es gibt keinen exportierten Realm, keinen registrierten Client, keine `redirect_uri`, keine veroeffentlichte Discovery-URL, und kein Dienst konsumiert OIDC-Tokens. Wichtig zur Abgrenzung: der oben beschriebene `POST /integrations/token` ist ein Maschine-zu-Maschine-Fluss (Client Credentials) fuer den Server-zu-Server-Zugriff deines Projekts, NICHT der Nutzer-Login. Ein echter OIDC-Fluss (Realm-Export, Client-Registrierung, redirect_uri, ein Beispiel) ist eine eigene, noch offene Etappe.
+Neben dem Maschine-zu-Maschine-Zugriff kannst du die **Anmeldung deiner Nutzer** an den SecureMessenger delegieren (Single Sign-on ueber OpenID Connect): ein Nutzer meldet sich einmal an und nutzt mehrere Werkzeuge, statt in jedem ein eigenes Konto zu fuehren. Das Fremdprojekt bekommt die Anmelde-Identitaet (wer ist der Mensch), aber nie private Schluessel oder Lesezugriff auf Chat-Inhalte. Wichtig zur Abgrenzung: der oben beschriebene `POST /integrations/token` ist ein Maschine-zu-Maschine-Fluss (Client Credentials) fuer den Server-zu-Server-Zugriff deines Projekts, NICHT der Nutzer-Login.
+
+Der OIDC-Provider ist Keycloak mit einem versionierten Realm `securemessenger` (Entwurf und Begruendung in [ADR-0011](entscheidungen/0011-sso-keycloak-realm.md), Realm-Export und lokaler Start in [deploy/keycloak/](../deploy/keycloak/README.md)). So bindest du an:
+
+1. **Discovery lesen.** Deine OIDC-Bibliothek konfiguriert sich aus `{keycloak}/realms/securemessenger/.well-known/openid-configuration` (Authorization-, Token- und JWKS-Endpunkt). Lokal ist `{keycloak}` = `http://localhost:8090`.
+2. **Client waehlen.** Fuer ein serverseitiges Projekt der vertrauliche Client `azubios` (Authorization Code Flow mit Client-Secret und PKCE); fuer eine Browser-App der oeffentliche Client `azubios-spa` (Authorization Code Flow mit PKCE, ohne Secret). Der Betrieb vergibt dir die echten `redirect_uri`-Werte und (fuer den vertraulichen Client) das Secret.
+3. **Anmelden.** Deine Bibliothek schickt den Nutzer zum `authorization_endpoint`, Keycloak zeigt die Anmeldeseite, und nach dem Login kommt dein `redirect_uri` mit einem `code` zurueck, den du am `token_endpoint` gegen ein `id_token` (die Anmelde-Identitaet) und ein `access_token` tauschst.
+
+Das ist derselbe standardkonforme OIDC-Fluss, den jede Bibliothek (Python `authlib`, PHP, JS `oidc-client`) spricht, du baust nichts selbst. **Ehrlich abgegrenzt:** der Realm-Export enthaelt fuer die lokale Vorfuehrung ein Demo-Secret und einen Demo-Nutzer (`azubi-demo`); in einer echten Umgebung kommen Secrets und Konten aus einem Secret-Store bzw. der Nutzerverwaltung. Wie ein per SSO angemeldeter Nutzer sein Messenger-Geraet koppelt (die Verbindung von Anmelde- und kryptografischer Identitaet), ist bewusst getrennt und ein eigener Entwurf.
 
 ## Webhooks (noch nicht verfuegbar)
 

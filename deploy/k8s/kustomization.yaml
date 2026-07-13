@@ -20,3 +20,9 @@ resources:
   - kt.yaml
   - keycloak.yaml
   - ingress.yaml
+  # Erzeugt die ConfigMap keycloak-realm aus dem versionierten Realm-Export
+  # (ADR-0011). Als eigene Kustomization-Basis, weil configMapGenerator aus
+  # Sicherheitsgruenden keine Dateien oberhalb des eigenen Verzeichnisses
+  # laden darf; so bleibt der Export in deploy/keycloak, wo auch der lokale
+  # Lauf ihn nutzt.
+  - ../keycloak

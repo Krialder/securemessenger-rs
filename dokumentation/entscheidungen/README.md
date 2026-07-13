@@ -10,3 +10,6 @@ Kurze Records zu den Festlegungen, die später teuer rückgängig zu machen wär
 - [0006 Key-Transparency-Modell](0006-key-transparency-modell.md)
 - [0007 Binary Transparency](0007-binary-transparency.md)
 - [0008 Krypto-Umsetzung vor dem externen Spec-Review](0008-krypto-vor-externem-review.md)
+- [0009 Eine Geräte-Identität](0009-eine-geraete-identitaet.md)
+- [0010 Rotation des Konto-Wurzelschlüssels](0010-wurzelschluessel-rotation.md)
+- [0011 SSO über einen Keycloak-Realm](0011-sso-keycloak-realm.md)

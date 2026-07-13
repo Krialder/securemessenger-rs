@@ -132,6 +132,21 @@ try {
 
 Der Chat-Inhalt bleibt dabei tabu: die API bietet Benachrichtigung und Präsenz, aber nie Lesezugriff auf Nachrichten (die sind Ende-zu-Ende verschlüsselt). Der ausführliche konsumentenseitige Weg samt Beispielen in Python, JavaScript und PHP steht in [dokumentation/integration-leitfaden.md](dokumentation/integration-leitfaden.md) und [dokumentation/integration-beispiele.md](dokumentation/integration-beispiele.md).
 
+## 9. SSO: ein Fremdprojekt delegiert die Anmeldung (Keycloak)
+
+Zeigt den zweiten Weg, auf dem ein Fremdprojekt anbindet: nicht Maschine-zu-Maschine, sondern der Nutzer-Login. Ein Nutzer meldet sich einmal am SecureMessenger-SSO an und ist damit im Fremdprojekt angemeldet (Single Sign-on ueber OpenID Connect). Keycloak ist bewusst opt-in (schweres Image), deshalb mit eigenem Schalter starten:
+
+```powershell
+scripts\sm.ps1 -Sso     # startet den Stack plus Keycloak mit dem Realm 'securemessenger'
+```
+
+Am Ende nennt das Skript die SSO-URL. Zwei Handgriffe zeigen die Anbindung:
+
+1. **Discovery** (hier liest jede OIDC-Bibliothek ihre Endpunkte): öffne `http://localhost:8090/realms/securemessenger/.well-known/openid-configuration`. Kein handgepflegter Endpunkt, die Bibliothek konfiguriert sich selbst.
+2. **Login-Fluss:** ein Fremdprojekt (Client `azubios` serverseitig oder `azubios-spa` im Browser) schickt den Nutzer zum `authorization_endpoint`; die SecureMessenger-Anmeldeseite erscheint, Login mit `azubi-demo` / `azubi-demo-passwort`, und das Projekt bekommt über den `code` am `token_endpoint` ein `id_token` mit der Anmelde-Identität (`preferred_username: azubi-demo`), aber nie private Schlüssel oder Chat-Inhalte.
+
+Der Realm ist versioniert (`deploy/keycloak/realm-securemessenger.json`, importiert per `--import-realm`), der Entwurf steht in [ADR-0011](dokumentation/entscheidungen/0011-sso-keycloak-realm.md). Diese Anmelde-Identität ist bewusst getrennt von der kryptografischen Identität (den Geräteschlüsseln): Keycloak weiss, WER sich anmeldet, sieht aber nie, WAS verschlüsselt wird.
+
 ## Was die Vorführung nicht zeigt
 
 Gruppen (MLS) sind gebaut und sowohl im CLI (`sm group-create`, `groups`, `group-send`, Einladungen annehmen, Entfernen und Verlassen) als auch im Web-Client bedienbar; diese Vorführung konzentriert sich auf den 1:1-Weg und geht nicht eigens durch den Gruppen-Ablauf (der Drei-Parteien-Test `cargo test -p client-app --test group_e2e` belegt ihn). Offen markiert bleiben die Punkte aus [live-dokument.md](dokumentation/live-dokument.md) Abschnitt 9a, allen voran das externe Audit (ADR-0008): diese Vorführung zeigt Funktionsfähigkeit, keine geprüfte Produktionsreife.

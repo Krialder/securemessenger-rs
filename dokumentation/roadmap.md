@@ -29,7 +29,7 @@ Sortiert nach Abhängigkeiten, ohne Termine. Zwei Dinge sind bewusst eingebaut: 
 
 Baut auf Identität und Auth auf, macht den Kern zum Fundament für die übrigen Ausbildungsprojekte.
 
-- [ ] OIDC-Provider für Single Sign-on, ein Konto für alle Abteilungs-Werkzeuge (Keycloak liegt als Deployment-Skelett vor, der Nutzer-Login-Fluss ist noch nicht scharf)
+- [x] OIDC-Provider für Single Sign-on, ein Konto für alle Abteilungs-Werkzeuge: Keycloak-Realm `securemessenger` versioniert und per `--import-realm` geladen (ADR-0011), mit einem vertraulichen und einem öffentlichen OIDC-Client (Authorization Code Flow plus PKCE); der Login-Fluss ist live gegen ein laufendes Keycloak bewiesen (Anmeldung als `azubi-demo`, gültiges id_token). Produktionshärtung (Brute-Force-Schutz, MFA, echte Nutzer-Föderation) bleibt Betriebssache und ist im ADR als offen markiert
 - [x] Benachrichtigungs-Gateway für Fremdprojekte (markierte Maschinen-Hinweise, getrennt vom E2E-Chat): `integrations`-Dienst, `POST /integrations/notify`
 - [x] Präsenz-Abruf über eine mandantenfähige REST-Schnittstelle (`integrations`-Dienst, `GET /integrations/presence`)
 - [x] Mandantenfähigkeit mit eigenem Token und Rate-Limit je Projekt (`integrations`-Dienst: Mandanten, `POST /integrations/token` als standardkonformer OAuth2-Client-Credentials-Grant nach RFC 6749, Rate-Limit je Mandant)
