@@ -9,6 +9,15 @@ clients/web/dist/
 .env
 *.env.local
 
+# Lokaler Laufzeit-Zustand des CLI-Clients: das Profil und der verschluesselte
+# Keystore-Blob (SM_PROFILE/SM_STATE, Vorgabe im Arbeitsverzeichnis). Enthaelt
+# Geraete-Schluessel, gehoert nie ins Repo.
+sm-profile.json
+sm-state.json
+
+# trunk-Zwischencache des Web-Clients.
+clients/web/.trunk/
+
 # Editor- und OS-Kram
 .DS_Store
 .idea/

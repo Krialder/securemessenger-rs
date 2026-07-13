@@ -179,6 +179,50 @@ function notify(string $handle, string $title): array {
 }
 ```
 
+## Webhook empfangen und die Signatur pruefen (Node)
+
+Wer statt zu pollen einen Webhook registriert (siehe Leitfaden, Abschnitt Webhooks), bekommt bei jeder Praesenz-Aenderung einen signierten `POST`. Der Empfaenger holt den oeffentlichen Schluessel einmal von `GET $BASE/integrations/webhook-key`, cacht ihn und prueft damit die Ed25519-Signatur ueber die kanonische Nachricht `{timestamp}.{body}`.
+
+```javascript
+const http = require("http");
+const crypto = require("crypto");
+
+// Einmal holen und cachen: { alg: "Ed25519", public_key: "<base64>" }.
+const PUBLIC_KEY_B64 = process.env.SM_WEBHOOK_PUBLIC_KEY;
+const raw = Buffer.from(PUBLIC_KEY_B64, "base64"); // 32 Byte
+const der = Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), raw]);
+const key = crypto.createPublicKey({ key: der, format: "der", type: "spki" });
+
+http
+  .createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks);
+      const ts = req.headers["x-securemessenger-timestamp"] || "";
+      const sig = Buffer.from(
+        (req.headers["x-securemessenger-signature"] || "").replace(/^ed25519=/, ""),
+        "base64"
+      );
+      const message = Buffer.concat([Buffer.from(ts + "."), body]);
+      const valid = crypto.verify(null, message, key, sig);
+      // Zu alten (wiedereingespielten) Aufruf abweisen.
+      const fresh = Math.abs(Date.now() / 1000 - Number(ts)) < 300;
+      if (!valid || !fresh) {
+        res.writeHead(400);
+        return res.end("bad signature");
+      }
+      const event = JSON.parse(body.toString());
+      // event.data.handle ist online/offline gegangen. Idempotent bleiben:
+      // gleiche event.id kann mehrfach kommen (Best-effort-Zustellung).
+      console.log(event.type, event.data.handle, event.data.online);
+      res.writeHead(200);
+      res.end("ok");
+    });
+  })
+  .listen(8100);
+```
+
 ## Typisierten Client generieren (jede Sprache)
 
 Wer keinen Handschnipsel will, erzeugt aus der OpenAPI-Spezifikation einen fertigen, typisierten Client. Mit `openapi-generator` (viele Zielsprachen: Python, TypeScript, Java, Go, C#, PHP):

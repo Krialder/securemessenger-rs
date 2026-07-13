@@ -140,6 +140,7 @@ $ktSigningKey  = DemoKey 1
 $ktVrfKey      = DemoKey 2
 $oprfKey       = DemoKey 3
 $sealedRoot    = DemoKey 4
+$webhookKey    = DemoKey 5
 $internalToken = 'demo-internes-secret'
 
 # 1. Datenbanken
@@ -205,8 +206,10 @@ Start-Service 'directory' '127.0.0.1:8081' @{
     IDENTITY_URL = 'http://127.0.0.1:8080'
 }
 Start-Service 'delivery' '127.0.0.1:8082' @{
-    DATABASE_URL = "$pg/demo_delivery"
-    IDENTITY_URL = 'http://127.0.0.1:8080'
+    DATABASE_URL     = "$pg/demo_delivery"
+    IDENTITY_URL     = 'http://127.0.0.1:8080'
+    # Praesenz-Aenderungen an integrations melden (Praesenz-Webhooks).
+    INTEGRATIONS_URL = 'http://127.0.0.1:8085'
 }
 Start-Service 'kt' '127.0.0.1:8083' @{
     DATABASE_URL     = "$pg/demo_kt"
@@ -218,9 +221,12 @@ Start-Service 'kt' '127.0.0.1:8083' @{
 # delivery (Events, Praesenz) sowie dasselbe INTERNAL_TOKEN, das Start-Service
 # ohnehin setzt (schaltet die interne Mandanten-Anlage-Route frei).
 Start-Service 'integrations' '127.0.0.1:8085' @{
-    DATABASE_URL = "$pg/demo_integrations"
-    IDENTITY_URL = 'http://127.0.0.1:8080'
-    DELIVERY_URL = 'http://127.0.0.1:8082'
+    DATABASE_URL                     = "$pg/demo_integrations"
+    IDENTITY_URL                     = 'http://127.0.0.1:8080'
+    DELIVERY_URL                     = 'http://127.0.0.1:8082'
+    # Deterministischer Webhook-Signierschluessel: der oeffentliche Teil
+    # bleibt ueber Neustarts stabil, ein Empfaenger kann ihn cachen.
+    INTEGRATIONS_WEBHOOK_SIGNING_KEY = $webhookKey
 }
 
 # 4. Auf Bereitschaft warten

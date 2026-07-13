@@ -121,6 +121,34 @@ Der OIDC-Provider ist Keycloak mit einem versionierten Realm `securemessenger` (
 
 Das ist derselbe standardkonforme OIDC-Fluss, den jede Bibliothek (Python `authlib`, PHP, JS `oidc-client`) spricht, du baust nichts selbst. **Ehrlich abgegrenzt:** der Realm-Export enthaelt fuer die lokale Vorfuehrung ein Demo-Secret und einen Demo-Nutzer (`azubi-demo`); in einer echten Umgebung kommen Secrets und Konten aus einem Secret-Store bzw. der Nutzerverwaltung. Wie ein per SSO angemeldeter Nutzer sein Messenger-Geraet koppelt (die Verbindung von Anmelde- und kryptografischer Identitaet), ist bewusst getrennt und ein eigener Entwurf.
 
-## Webhooks (noch nicht verfuegbar)
+## Webhooks: Praesenz-Aenderungen zugestellt bekommen (Push statt Poll)
 
-Rueckmeldungen an das Fremdprojekt per Webhook-Callback (etwa Zustell-Status) sind vorgesehen, aber noch nicht gebaut. Bis dahin ist die notify-Antwort (`devices`/`connected`) die einzige Rueckmeldung.
+Statt Praesenz zu pollen (Schritt 4), kannst du dir eine Aenderung zustellen lassen: du registrierst einen Callback, und sobald ein Nutzer online oder offline geht, schickt der Dienst einen signierten Envelope an deine URL. Das braucht denselben Scope wie die Abfrage (`presence`), ist also nicht durchlaessiger; abonniert wird je Handle, den du ausdruecklich nennst.
+
+**Endpunkt registrieren** (Bearer-Token, wie die uebrigen Aufrufe):
+
+```bash
+curl -sS -X POST "$BASE/integrations/azubios/webhooks" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://azubios.intern/hooks/presence","events":["presence.changed"],"handles":["alice","bob"]}'
+```
+
+Antwort (201): `{ "id": "...", "url": "...", "events": ["presence.changed"], "handles": ["alice","bob"], "created_at": 1700000000 }`. Deine Endpunkte listest du mit `GET /integrations/azubios/webhooks`, entfernst einen mit `DELETE /integrations/azubios/webhooks/{id}` (204; ein fremder oder unbekannter ist 404).
+
+Die `url` muss oeffentlich erreichbar sein: Ziele im internen Netz, auf `localhost` oder auf Cloud-Metadaten weist der Dienst ab (`400 invalid_url`, SSRF-Schutz).
+
+**Was ankommt.** Bei einer Aenderung bekommt deine URL ein `POST` mit diesem Body:
+
+```json
+{ "id": "<zustell-uuid>", "type": "presence.changed", "tenant": "azubios",
+  "created_at": 1700000000, "data": { "handle": "alice", "online": true, "seq": 42 } }
+```
+
+und diesen Headern: `X-SecureMessenger-Event: presence.changed`, `X-SecureMessenger-Delivery: <uuid>` (zum Deduplizieren), `X-SecureMessenger-Timestamp: <unix>`, `X-SecureMessenger-Signature: ed25519=<base64>`.
+
+`data.seq` ist eine je Nutzer fortlaufende Nummer des Uebergangs. Die Zustellung ist Best effort und NICHT geordnet (zwei schnelle Wechsel koennen in anderer Reihenfolge ankommen); ordne online/offline deshalb nach `seq` und ignoriere eine niedrigere als die zuletzt gesehene, dann bleibst du nie im falschen Zustand haengen.
+
+**Signatur pruefen.** Hol den oeffentlichen Schluessel einmal von `GET $BASE/integrations/webhook-key` (`{ "alg": "Ed25519", "public_key": "<base64>" }`, du kannst ihn cachen). Die Signatur ist Ed25519 ueber die kanonische Nachricht `{timestamp}.{body}` (der rohe Body, dem der Zeitstempel und ein Punkt vorangestellt sind). So verifizierst du, dass der Envelope wirklich vom Messenger kommt und nicht veraendert wurde; ueber den Zeitstempel weist du einen zu alten (wiedereingespielten) Aufruf ab. Antworte mit `2xx`, sonst gilt die Zustellung als fehlgeschlagen.
+
+**Ehrlich abgegrenzt:** die Zustellung ist Best effort (ein nicht erreichbarer Empfaenger haelt weder den Chat noch andere Webhooks auf); einen dauerhaften Wiederhol-Speicher (Outbox mit Retry) gibt es in dieser Etappe noch nicht. Wird dein Mandant gesperrt oder verlierst du den `presence`-Scope, hoert die Zustellung auf (die Berechtigung wird bei jeder Zustellung erneut geprueft). Heute ist `presence.changed` das einzige Ereignis; das Envelope-Format ist versioniert genug (`type`, `id`, `seq`), dass weitere Ereignisse alte Empfaenger nicht brechen.

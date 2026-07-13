@@ -195,6 +195,140 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiError'
+  /integrations/webhook-key:
+    get:
+      summary: Oeffentlicher Ed25519-Schluessel zum Pruefen der Webhook-Signatur
+      description: >
+        Der oeffentliche Schluessel, mit dem ein Empfaenger die Signatur
+        eingehender Webhooks prueft. Oeffentlich und ohne Auth; darf gecacht
+        werden. Signiert wird die kanonische Nachricht timestamp || '.' || body.
+      operationId: webhookKey
+      security:
+        - {}
+      responses:
+        '200':
+          description: Der aktuelle oeffentliche Schluessel.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookKey'
+  /integrations/{tenant}/webhooks:
+    post:
+      summary: Webhook-Endpunkt registrieren (Push statt Poll)
+      description: >
+        Der Mandant registriert selbst einen Callback fuer Ereignisse
+        (heute presence.changed) und die Handles, die ihn interessieren.
+        Jedes Ereignis braucht den Scope, den es aufdeckt (presence.changed
+        braucht presence).
+      operationId: createWebhook
+      security:
+        - tenantToken: []
+      parameters:
+        - name: tenant
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Muss zum Mandanten des Tokens passen, sonst 403 tenant_mismatch.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookRequest'
+      responses:
+        '201':
+          description: Endpunkt angelegt.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookResponse'
+        '400':
+          description: >
+            Ungueltige url (code invalid_url), unbekanntes Ereignis
+            (invalid_events) oder ungueltige Handle-Liste (invalid_handles).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '401':
+          description: Token fehlt, ungueltig oder abgelaufen (code invalid_token).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: >
+            Fremder Mandant (code tenant_mismatch) oder das Token darf ein
+            Ereignis nicht abonnieren (code missing_scope).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '409':
+          description: Zu viele Endpunkte je Mandant (code too_many_webhooks).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+    get:
+      summary: Eigene Webhook-Endpunkte auflisten
+      operationId: listWebhooks
+      security:
+        - tenantToken: []
+      parameters:
+        - name: tenant
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Liste der Endpunkte des Mandanten.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/WebhookResponse'
+        '401':
+          description: Token fehlt, ungueltig oder abgelaufen (code invalid_token).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /integrations/{tenant}/webhooks/{id}:
+    delete:
+      summary: Einen eigenen Webhook-Endpunkt entfernen
+      operationId: deleteWebhook
+      security:
+        - tenantToken: []
+      parameters:
+        - name: tenant
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Entfernt.
+        '401':
+          description: Token fehlt, ungueltig oder abgelaufen (code invalid_token).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '404':
+          description: Kein solcher Endpunkt bei diesem Mandanten (code unknown_webhook).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
 components:
   securitySchemes:
     tenantToken:
@@ -289,6 +423,92 @@ components:
           type: string
         online:
           type: boolean
+    WebhookKey:
+      type: object
+      required: [alg, public_key]
+      properties:
+        alg:
+          type: string
+          enum: [Ed25519]
+        public_key:
+          type: string
+          description: Base64-kodierter oeffentlicher Ed25519-Schluessel.
+        signature_scheme:
+          type: string
+          description: Beschreibung der signierten Nachricht (timestamp . body).
+    WebhookRequest:
+      type: object
+      required: [url, events, handles]
+      properties:
+        url:
+          type: string
+          maxLength: 2000
+          description: >
+            Oeffentlich erreichbares http(s)-Ziel. Interne/Loopback-Ziele
+            (localhost, RFC1918, Link-lokal, Cloud-Metadaten) werden abgewiesen
+            (400 invalid_url, SSRF-Schutz).
+        events:
+          type: array
+          items:
+            type: string
+            enum: [presence.changed]
+          description: Abonnierte Ereignisse; jedes braucht den passenden Scope.
+        handles:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+          description: Nutzer-Handles, fuer die Ereignisse zugestellt werden.
+    WebhookResponse:
+      type: object
+      required: [id, url, events, handles, created_at]
+      properties:
+        id:
+          type: string
+        url:
+          type: string
+        events:
+          type: array
+          items:
+            type: string
+        handles:
+          type: array
+          items:
+            type: string
+        created_at:
+          type: integer
+          description: Anlage-Zeitpunkt (Unix-Sekunden).
+    WebhookEnvelope:
+      type: object
+      description: >
+        Der signierte Body, den der Empfaenger bekommt (nicht ueber diese
+        API abgerufen, sondern per POST zugestellt; hier zur Referenz). Header:
+        X-SecureMessenger-Event, -Delivery, -Timestamp, -Signature (ed25519=...).
+      required: [id, type, tenant, created_at, data]
+      properties:
+        id:
+          type: string
+          description: Zustell-UUID (zum Deduplizieren).
+        type:
+          type: string
+          enum: [presence.changed]
+        tenant:
+          type: string
+        created_at:
+          type: integer
+        data:
+          type: object
+          required: [handle, online, seq]
+          properties:
+            handle:
+              type: string
+            online:
+              type: boolean
+            seq:
+              type: integer
+              description: >
+                Je Nutzer fortlaufende Uebergangs-Nummer. Zustellung ist Best
+                effort und ungeordnet; nach seq ordnen, niedrigere ignorieren.
     ApiError:
       type: object
       required: [code, message]
