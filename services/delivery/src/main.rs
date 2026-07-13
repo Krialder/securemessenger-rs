@@ -5,6 +5,7 @@ use std::sync::Arc;
 use common::identity_client::HttpIdentityGateway;
 use common::{config::ServiceConfig, telemetry};
 use delivery::api::{app, AppState};
+use delivery::integrations_client::HttpIntegrationsGateway;
 use delivery::pg;
 use delivery::store::InMemoryMessageStore;
 
@@ -44,6 +45,16 @@ async fn main() {
     // damit bei identity aus und schaltet seine eigenen /internal-Routen
     // (Events, Präsenz) für integrations frei.
     .with_internal_token(internal_token);
+
+    // Optional: Präsenz-Änderungen an integrations melden (Webhooks). Ohne
+    // INTEGRATIONS_URL bleibt es beim Noop, der Chat-Kern hängt nicht daran.
+    let state = match cfg.integrations_url.as_deref() {
+        Some(url) => {
+            tracing::info!(%url, "Präsenz-Webhooks an integrations aktiv");
+            state.with_integrations(Arc::new(HttpIntegrationsGateway::new(url, internal_token)))
+        }
+        None => state,
+    };
 
     let router = app(state);
 

@@ -22,6 +22,9 @@ sha2.workspace = true
 # Message-Franking-Commitment: Verifikation gemeldeter Nachrichten
 # (specs/sealed-sender-und-abuse.md), geteilt mit dem Client.
 franking.workspace = true
+# Ausgehender Aufruf an integrations: delivery meldet Präsenz-Änderungen
+# für die Webhooks (best effort, optional per INTEGRATIONS_URL).
+reqwest.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

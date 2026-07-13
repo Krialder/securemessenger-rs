@@ -37,6 +37,7 @@ use sha2::{Digest, Sha256};
 use crate::domain::NewMessage;
 use crate::groups::{GroupError, GroupStore, InMemoryGroupStore};
 use crate::hub::{HubEvent, RealtimeHub};
+use crate::integrations_client::{IntegrationsGateway, NoopIntegrationsGateway};
 use crate::store::MessageStore;
 use common::identity_client::{CallerIdentity, IdentityGateway};
 
@@ -66,6 +67,48 @@ const SEALED_RATE_LIMIT: u32 = 60;
 /// Reconnect). Prozesslokal wie die Nabe; Grundlage der Präsenz (F080).
 type PresenceRegistry = Arc<Mutex<HashMap<String, u32>>>;
 
+/// Präsenz je HANDLE (nicht je Gerät): zählt die verbundenen Geräte eines
+/// Kontos, damit der Übergang online/offline nur beim ERSTEN bzw. LETZTEN
+/// Gerät feuert. So bekommt integrations je Nutzer ein Ereignis, nicht je
+/// Gerät (ein Konto mit zwei Geräten geht nicht zweimal online).
+#[derive(Clone, Default)]
+struct HandlePresence {
+    counts: Arc<Mutex<HashMap<String, u32>>>,
+}
+
+impl HandlePresence {
+    /// Ein Gerät des Handles kommt; `true`, wenn der Handle dadurch online wird.
+    fn arrive(&self, handle: &str) -> bool {
+        let mut map = self
+            .counts
+            .lock()
+            .expect("Handle-Presence-Lock nicht vergiftet");
+        let count = map.entry(handle.to_string()).or_insert(0);
+        *count += 1;
+        *count == 1
+    }
+
+    /// Ein Gerät des Handles geht; `true`, wenn der Handle dadurch offline wird.
+    fn leave(&self, handle: &str) -> bool {
+        let mut map = self
+            .counts
+            .lock()
+            .expect("Handle-Presence-Lock nicht vergiftet");
+        match map.get_mut(handle) {
+            Some(count) => {
+                *count -= 1;
+                if *count == 0 {
+                    map.remove(handle);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        }
+    }
+}
+
 /// Geteilter Zustand: Ablage, identity-Anbindung, Echtzeit-Nabe,
 /// Präsenz-Registry und der Guard der /internal-Routen.
 #[derive(Clone)]
@@ -75,6 +118,11 @@ pub struct AppState {
     identity: Arc<dyn IdentityGateway>,
     hub: RealtimeHub,
     presence: PresenceRegistry,
+    /// Präsenz je Handle (für die Online/Offline-Übergänge an integrations).
+    handle_presence: HandlePresence,
+    /// Anbindung an integrations für Präsenz-Webhooks; Noop, wenn keine
+    /// INTEGRATIONS_URL gesetzt ist.
+    integrations: Arc<dyn IntegrationsGateway>,
     /// SHA-256-Digest des Shared Secrets; None = interne Routen aus.
     internal_token_hash: Option<String>,
     /// Rate-Limits der anonymen Pfade (Sealed-Sender-Annahme).
@@ -92,6 +140,8 @@ impl AppState {
             identity,
             hub: RealtimeHub::new(),
             presence: Arc::new(Mutex::new(HashMap::new())),
+            handle_presence: HandlePresence::default(),
+            integrations: Arc::new(NoopIntegrationsGateway),
             internal_token_hash: None,
             limiter: Arc::new(common::rate::RateLimiter::default()),
         }
@@ -100,6 +150,12 @@ impl AppState {
     /// Setzt die persistente Gruppen-Ablage (PG-Betrieb).
     pub fn with_group_store(mut self, groups: Arc<dyn GroupStore>) -> Self {
         self.groups = groups;
+        self
+    }
+
+    /// Setzt die Anbindung an integrations für Präsenz-Webhooks.
+    pub fn with_integrations(mut self, integrations: Arc<dyn IntegrationsGateway>) -> Self {
+        self.integrations = integrations;
         self
     }
 
@@ -1208,33 +1264,63 @@ async fn internal_presence(
 }
 
 /// RAII-Anmeldung in der Präsenz-Registry: der Eintrag verschwindet mit
-/// dem Guard, egal auf welchem Weg die Socket-Schleife endet.
+/// dem Guard, egal auf welchem Weg die Socket-Schleife endet. Der Guard
+/// führt zusätzlich die Handle-Präsenz und meldet integrations, wenn ein
+/// Handle online (erstes Gerät) oder offline (letztes Gerät) geht.
 struct PresenceGuard {
     registry: PresenceRegistry,
+    handle_presence: HandlePresence,
+    integrations: Arc<dyn IntegrationsGateway>,
     device_id: String,
+    handle: String,
 }
 
 impl PresenceGuard {
-    fn register(registry: PresenceRegistry, device_id: &str) -> Self {
+    fn register(
+        registry: PresenceRegistry,
+        handle_presence: HandlePresence,
+        integrations: Arc<dyn IntegrationsGateway>,
+        device_id: &str,
+        handle: &str,
+    ) -> Self {
         {
             let mut map = registry.lock().expect("Presence-Lock nicht vergiftet");
             *map.entry(device_id.to_string()).or_insert(0) += 1;
         }
+        // Nur der Übergang 0->1 des Handles ist "kommt online".
+        if handle_presence.arrive(handle) {
+            let gateway = integrations.clone();
+            let handle = handle.to_string();
+            tokio::spawn(async move { gateway.presence_changed(&handle, true).await });
+        }
         Self {
             registry,
+            handle_presence,
+            integrations,
             device_id: device_id.to_string(),
+            handle: handle.to_string(),
         }
     }
 }
 
 impl Drop for PresenceGuard {
     fn drop(&mut self) {
-        let mut map = self.registry.lock().expect("Presence-Lock nicht vergiftet");
-        if let Some(count) = map.get_mut(&self.device_id) {
-            *count -= 1;
-            if *count == 0 {
-                map.remove(&self.device_id);
+        {
+            let mut map = self.registry.lock().expect("Presence-Lock nicht vergiftet");
+            if let Some(count) = map.get_mut(&self.device_id) {
+                *count -= 1;
+                if *count == 0 {
+                    map.remove(&self.device_id);
+                }
             }
+        }
+        // Nur der Übergang 1->0 des Handles ist "geht offline". Der Aufruf
+        // läuft best effort in einer eigenen Task (Drop ist synchron); ein
+        // Fehler bleibt beim integrations-Gateway (best effort).
+        if self.handle_presence.leave(&self.handle) {
+            let gateway = self.integrations.clone();
+            let handle = self.handle.clone();
+            tokio::spawn(async move { gateway.presence_changed(&handle, false).await });
         }
     }
 }
@@ -1268,8 +1354,8 @@ async fn drive_socket(st: AppState, mut socket: WebSocket) {
             return;
         }
     };
-    let device_id = match st.identity.introspect(&token).await {
-        Ok(Some(who)) => who.device_id,
+    let (device_id, handle) = match st.identity.introspect(&token).await {
+        Ok(Some(who)) => (who.device_id, who.handle),
         Ok(None) => {
             let _ = socket
                 .send(Message::Close(Some(CloseFrame {
@@ -1294,8 +1380,15 @@ async fn drive_socket(st: AppState, mut socket: WebSocket) {
     };
 
     // Ab jetzt ist das Gerät "online" (F080); der Guard räumt den
-    // Eintrag auf jedem Rückweg wieder ab.
-    let _presence = PresenceGuard::register(st.presence.clone(), &device_id);
+    // Eintrag auf jedem Rückweg wieder ab und meldet integrations den
+    // Handle-Übergang (erstes/letztes Gerät).
+    let _presence = PresenceGuard::register(
+        st.presence.clone(),
+        st.handle_presence.clone(),
+        st.integrations.clone(),
+        &device_id,
+        &handle,
+    );
 
     // Abonnieren, bevor der Bestand geprüft wird: was zwischen Prüfung
     // und Abo einträfe, ginge sonst verloren.
@@ -1338,5 +1431,29 @@ async fn drive_socket(st: AppState, mut socket: WebSocket) {
                 Some(Ok(_)) => {}
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HandlePresence;
+
+    #[test]
+    fn handle_presence_transitions_on_first_and_last_device() {
+        let presence = HandlePresence::default();
+        // Erstes Gerät: Handle kommt online.
+        assert!(presence.arrive("alice"));
+        // Zweites Gerät desselben Kontos: kein neuer Übergang.
+        assert!(!presence.arrive("alice"));
+        // Ein anderes Konto ist unabhängig.
+        assert!(presence.arrive("bob"));
+        // Ein Gerät von alice geht: noch ist eines da, kein Übergang.
+        assert!(!presence.leave("alice"));
+        // Das letzte Gerät von alice geht: Handle geht offline.
+        assert!(presence.leave("alice"));
+        // Ein weiteres leave auf einem schon offline-Handle feuert nicht.
+        assert!(!presence.leave("alice"));
+        // bob ist davon unberührt und geht mit seinem einzigen Gerät offline.
+        assert!(presence.leave("bob"));
     }
 }

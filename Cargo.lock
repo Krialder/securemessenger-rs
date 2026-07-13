@@ -937,6 +937,7 @@ dependencies = [
  "franking",
  "futures-util",
  "http-body-util",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",

@@ -54,6 +54,10 @@ pub mod config {
         /// Basis-URL des delivery-Dienstes (`DELIVERY_URL`) für Dienste,
         /// die Echtzeit-Events auslösen oder Präsenz abfragen (integrations).
         pub delivery_url: Option<String>,
+        /// Basis-URL des integrations-Dienstes (`INTEGRATIONS_URL`); delivery
+        /// meldet dorthin Präsenz-Änderungen für die Webhooks. Optional: ohne
+        /// Wert läuft delivery ohne die Webhook-Anbindung.
+        pub integrations_url: Option<String>,
     }
 
     impl ServiceConfig {
@@ -74,6 +78,7 @@ pub mod config {
                 internal_token: non_empty("INTERNAL_TOKEN"),
                 identity_url: non_empty("IDENTITY_URL"),
                 delivery_url: non_empty("DELIVERY_URL"),
+                integrations_url: non_empty("INTEGRATIONS_URL"),
             }
         }
     }

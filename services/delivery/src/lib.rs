@@ -12,5 +12,6 @@ pub mod api;
 pub mod domain;
 pub mod groups;
 pub mod hub;
+pub mod integrations_client;
 pub mod pg;
 pub mod store;
