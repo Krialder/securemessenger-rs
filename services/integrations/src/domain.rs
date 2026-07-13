@@ -9,6 +9,25 @@ pub const SCOPE_PRESENCE: &str = "presence";
 /// damit Tippfehler nicht als "nie greifendes Recht" durchrutschen.
 pub const KNOWN_SCOPES: [&str; 2] = [SCOPE_NOTIFY, SCOPE_PRESENCE];
 
+/// Webhook-Ereignis: die Praesenz eines Nutzers hat sich geaendert
+/// (online/offline). Push statt Poll: das Fremdprojekt bekommt die
+/// Aenderung zugestellt, statt `presence` abzufragen.
+pub const EVENT_PRESENCE_CHANGED: &str = "presence.changed";
+
+/// Alle bekannten Webhook-Ereignisse; die Anlage weist alles andere ab.
+pub const KNOWN_WEBHOOK_EVENTS: [&str; 1] = [EVENT_PRESENCE_CHANGED];
+
+/// Welchen Scope ein Ereignis voraussetzt: ein Webhook auf
+/// `presence.changed` deckt dieselben Daten auf wie die presence-Abfrage,
+/// braucht also denselben Scope. So ist der Push nicht durchlaessiger als
+/// der Poll.
+pub fn event_required_scope(event: &str) -> Option<&'static str> {
+    match event {
+        EVENT_PRESENCE_CHANGED => Some(SCOPE_PRESENCE),
+        _ => None,
+    }
+}
+
 /// Ein Fremdprojekt als Mandant. Das Client-Secret taucht hier nie auf,
 /// es existiert nur als Argon2id-Hash in der Ablage.
 #[derive(Debug, Clone)]
@@ -35,5 +54,36 @@ pub struct Tenant {
 impl Tenant {
     pub fn has_scope(&self, scope: &str) -> bool {
         self.scopes.iter().any(|s| s == scope)
+    }
+}
+
+/// Ein registrierter Webhook-Endpunkt eines Mandanten: wohin gepusht wird
+/// (`url`), auf welche Ereignisse (`events`) und fuer welche Nutzer-Handles
+/// (`handles`). Das Abo je Handle bindet die Datenschutz-Flaeche genauso eng
+/// wie die presence-Abfrage: ein Mandant bekommt Praesenz nur fuer die
+/// Handles, die er ausdruecklich nennt.
+#[derive(Debug, Clone)]
+pub struct WebhookEndpoint {
+    /// Server-erzeugte UUID.
+    pub id: String,
+    /// Mandant, dem der Endpunkt gehoert (UUID).
+    pub tenant_id: String,
+    /// Mandanten-Name, denormalisiert fuer die Envelope (Name ist
+    /// unveraenderlich, siehe Anlage-Route).
+    pub tenant_name: String,
+    /// Ziel-URL, an die der signierte Envelope per POST geht.
+    pub url: String,
+    /// Abonnierte Ereignisse, Teilmenge von KNOWN_WEBHOOK_EVENTS.
+    pub events: Vec<String>,
+    /// Nutzer-Handles, fuer die Ereignisse zugestellt werden.
+    pub handles: Vec<String>,
+    /// Anlage-Zeitpunkt (Unix-Sekunden).
+    pub created_at: u64,
+}
+
+impl WebhookEndpoint {
+    /// Passt dieser Endpunkt auf ein Ereignis fuer einen Handle?
+    pub fn matches(&self, event: &str, handle: &str) -> bool {
+        self.events.iter().any(|e| e == event) && self.handles.iter().any(|h| h == handle)
     }
 }

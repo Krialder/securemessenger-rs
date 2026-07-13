@@ -5,6 +5,7 @@
 //! übersprungen. Die Tests räumen nicht auf, sondern nutzen eindeutige
 //! Namen pro Lauf.
 
+use integrations::domain::WebhookEndpoint;
 use integrations::pg::{connect_and_migrate, PgTenantStore};
 use integrations::store::{NewTenant, StoreError, TenantStore};
 use uuid::Uuid;
@@ -96,4 +97,74 @@ async fn tenant_and_token_roundtrip() {
         .await
         .unwrap();
     assert!(store.find_token(&valid_hash).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn webhook_store_roundtrip() {
+    let Some(store) = store().await else {
+        return;
+    };
+    let name = format!("wh-{}", Uuid::new_v4().simple());
+    let tenant = new_tenant(&name);
+    let tenant_id = tenant.id.clone();
+    store.create(tenant).await.unwrap();
+
+    // find_webhook_subscribers ist absichtlich MANDANTEN-UEBERGREIFEND (der
+    // presence-Event faechert an alle Abonnenten eines Handles auf). Die
+    // Test-Datenbank raeumt nicht auf, also je Lauf eindeutige Handles, damit
+    // fremde Laeufe die globale Suche nicht verfaelschen.
+    let kai_h = format!("kai-{}", Uuid::new_v4().simple());
+    let lea_h = format!("lea-{}", Uuid::new_v4().simple());
+    let make = |handles: Vec<String>| WebhookEndpoint {
+        id: Uuid::new_v4().to_string(),
+        tenant_id: tenant_id.clone(),
+        tenant_name: name.clone(),
+        url: "https://example.test/hook".to_string(),
+        events: vec!["presence.changed".to_string()],
+        handles,
+        created_at: now_epoch(),
+    };
+    let both = make(vec![kai_h.clone(), lea_h.clone()]);
+    let only_kai = make(vec![kai_h.clone()]);
+    let both_id = both.id.clone();
+    store.create_webhook(both).await.unwrap();
+    store.create_webhook(only_kai).await.unwrap();
+
+    // Liste je Mandant.
+    let list = store.list_webhooks(&tenant_id).await.unwrap();
+    assert_eq!(list.len(), 2);
+    // Arrays und Zeitstempel kommen sauber zurueck.
+    assert!(list.iter().all(|w| w.events == vec!["presence.changed"]));
+    assert!(list
+        .iter()
+        .all(|w| w.created_at > 0 && w.tenant_name == name));
+
+    // Zustell-Suche: kai trifft beide, lea nur einen, falsches Ereignis keinen.
+    let kai = store
+        .find_webhook_subscribers(&kai_h, "presence.changed")
+        .await
+        .unwrap();
+    assert_eq!(kai.len(), 2);
+    let lea = store
+        .find_webhook_subscribers(&lea_h, "presence.changed")
+        .await
+        .unwrap();
+    assert_eq!(lea.len(), 1);
+    let none = store
+        .find_webhook_subscribers(&kai_h, "gibt.es.nicht")
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+
+    // Loeschen nur durch den Eigentuemer; fremder Mandant und Nicht-UUID = false.
+    assert!(!store
+        .delete_webhook(&Uuid::new_v4().to_string(), &both_id)
+        .await
+        .unwrap());
+    assert!(!store
+        .delete_webhook(&tenant_id, "keine-uuid")
+        .await
+        .unwrap());
+    assert!(store.delete_webhook(&tenant_id, &both_id).await.unwrap());
+    assert_eq!(store.list_webhooks(&tenant_id).await.unwrap().len(), 1);
 }

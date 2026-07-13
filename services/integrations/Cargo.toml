@@ -16,7 +16,12 @@ serde_json.workspace = true
 # Ablage (pflichtenheft.md 7, NF040), Tokens nur als SHA-256-Digest.
 argon2.workspace = true
 sha2.workspace = true
-# Fuer die HTTP-Basic-Zugangsdaten des OAuth2-Token-Endpunkts (RFC 6749).
+# Ed25519 fuer die Webhook-Signatur: ein Dienst-Signierpaar, oeffentlicher
+# Schluessel veroeffentlicht, kein rueckholbares Geheimnis in der Ablage
+# (gleiches Muster wie crates/btlog).
+ed25519-dalek.workspace = true
+# Fuer die HTTP-Basic-Zugangsdaten des OAuth2-Token-Endpunkts (RFC 6749)
+# und die Base64-Kodierung von Webhook-Signatur und -Schluessel.
 base64.workspace = true
 sqlx.workspace = true
 async-trait.workspace = true

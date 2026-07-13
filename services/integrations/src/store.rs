@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 
-use crate::domain::Tenant;
+use crate::domain::{Tenant, WebhookEndpoint};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -71,6 +71,24 @@ pub trait TenantStore: Send + Sync {
     /// die *Token*-Scopes (nicht zwingend die vollen Mandanten-Scopes),
     /// damit die Autorisierung transparent das enge Token durchsetzt.
     async fn find_token(&self, token_hash: &str) -> Result<Option<Tenant>, StoreError>;
+
+    /// Legt einen Webhook-Endpunkt an.
+    async fn create_webhook(&self, endpoint: WebhookEndpoint) -> Result<(), StoreError>;
+
+    /// Alle Webhook-Endpunkte eines Mandanten (fuer die Selbstverwaltung).
+    async fn list_webhooks(&self, tenant_id: &str) -> Result<Vec<WebhookEndpoint>, StoreError>;
+
+    /// Loescht einen Endpunkt des Mandanten; `false` = es gab keinen mit
+    /// dieser ID bei diesem Mandanten (fuer 404, ohne fremde IDs zu verraten).
+    async fn delete_webhook(&self, tenant_id: &str, id: &str) -> Result<bool, StoreError>;
+
+    /// Alle Endpunkte (ueber alle Mandanten), die ein Ereignis fuer einen
+    /// Handle abonniert haben. Grundlage der Zustellung.
+    async fn find_webhook_subscribers(
+        &self,
+        handle: &str,
+        event: &str,
+    ) -> Result<Vec<WebhookEndpoint>, StoreError>;
 }
 
 fn now_epoch() -> u64 {
@@ -94,6 +112,8 @@ struct Inner {
     tenants: HashMap<String, (Tenant, String)>,
     /// token_hash -> TokenRecord
     tokens: HashMap<String, TokenRecord>,
+    /// webhook-id -> Endpunkt
+    webhooks: HashMap<String, WebhookEndpoint>,
 }
 
 /// Prozesslokale Umsetzung für Entwicklung und Tests.
@@ -181,6 +201,50 @@ impl TenantStore for InMemoryTenantStore {
                 ..t
             });
         Ok(tenant)
+    }
+
+    async fn create_webhook(&self, endpoint: WebhookEndpoint) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().expect("Lock nicht vergiftet");
+        inner.webhooks.insert(endpoint.id.clone(), endpoint);
+        Ok(())
+    }
+
+    async fn list_webhooks(&self, tenant_id: &str) -> Result<Vec<WebhookEndpoint>, StoreError> {
+        let inner = self.inner.lock().expect("Lock nicht vergiftet");
+        Ok(inner
+            .webhooks
+            .values()
+            .filter(|e| e.tenant_id == tenant_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn delete_webhook(&self, tenant_id: &str, id: &str) -> Result<bool, StoreError> {
+        let mut inner = self.inner.lock().expect("Lock nicht vergiftet");
+        // Nur loeschen, wenn ID UND Mandant passen: ein Mandant darf keinen
+        // fremden Endpunkt entfernen.
+        let owned = inner
+            .webhooks
+            .get(id)
+            .is_some_and(|e| e.tenant_id == tenant_id);
+        if owned {
+            inner.webhooks.remove(id);
+        }
+        Ok(owned)
+    }
+
+    async fn find_webhook_subscribers(
+        &self,
+        handle: &str,
+        event: &str,
+    ) -> Result<Vec<WebhookEndpoint>, StoreError> {
+        let inner = self.inner.lock().expect("Lock nicht vergiftet");
+        Ok(inner
+            .webhooks
+            .values()
+            .filter(|e| e.matches(event, handle))
+            .cloned()
+            .collect())
     }
 }
 

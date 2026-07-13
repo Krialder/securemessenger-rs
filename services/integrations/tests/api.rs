@@ -18,6 +18,7 @@ use http_body_util::BodyExt;
 use integrations::api::{app, AppState};
 use integrations::realtime_client::RealtimeGateway;
 use integrations::store::InMemoryTenantStore;
+use integrations::webhook::{Delivery, WebhookSender};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -79,6 +80,21 @@ impl RealtimeGateway for FakeRealtime {
     }
 }
 
+/// Fake-Zustellung: merkt sich jede signierte Webhook-Lieferung, statt sie
+/// per HTTP zu schicken.
+#[derive(Default)]
+struct FakeWebhookSender {
+    sent: Mutex<Vec<Delivery>>,
+}
+
+#[async_trait]
+impl WebhookSender for FakeWebhookSender {
+    async fn deliver(&self, delivery: Delivery) -> Result<(), String> {
+        self.sent.lock().unwrap().push(delivery);
+        Ok(())
+    }
+}
+
 fn fake_identity() -> FakeIdentity {
     let mut accounts = HashMap::new();
     accounts.insert(
@@ -113,6 +129,19 @@ fn test_app() -> (Router, Arc<FakeRealtime>) {
     )
     .with_internal_token("dienst-geheim");
     (app(state), realtime)
+}
+
+/// Wie test_app, aber mit einem Fake-Webhook-Sender, den der Test einsieht.
+fn test_app_with_webhooks() -> (Router, Arc<FakeWebhookSender>) {
+    let sender = Arc::new(FakeWebhookSender::default());
+    let state = AppState::new(
+        Arc::new(InMemoryTenantStore::default()),
+        Arc::new(fake_identity()),
+        Arc::new(FakeRealtime::default()),
+    )
+    .with_internal_token("dienst-geheim")
+    .with_webhook_sender(sender.clone());
+    (app(state), sender)
 }
 
 async fn send(
@@ -637,6 +666,198 @@ async fn tenant_creation_is_guarded_and_validated() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["code"], "name_taken");
+}
+
+#[tokio::test]
+async fn webhook_registration_and_presence_fanout() {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    use ed25519_dalek::{Verifier, VerifyingKey};
+
+    let (app, sender) = test_app_with_webhooks();
+    let (_, _, token) = provision_tenant(&app, "azubi-os", json!(["notify", "presence"])).await;
+
+    // Der oeffentliche Schluessel ist ohne Auth abrufbar.
+    let (status, key) = send(&app, "GET", "/integrations/webhook-key", None, None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(key["alg"], "Ed25519");
+    let pubkey = key["public_key"].as_str().unwrap().to_string();
+
+    // Endpunkt fuer den Handle "kai" registrieren.
+    let (status, wh) = send(
+        &app,
+        "POST",
+        "/integrations/azubi-os/webhooks",
+        Some(json!({
+            "url": "https://azubios.example/hook",
+            "events": ["presence.changed"],
+            "handles": ["kai"]
+        })),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{wh}");
+    let wh_id = wh["id"].as_str().unwrap().to_string();
+
+    // Die Liste zeigt genau ihn.
+    let (status, list) = send(
+        &app,
+        "GET",
+        "/integrations/azubi-os/webhooks",
+        None,
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list.as_array().unwrap().len(), 1);
+
+    // Praesenz-Ereignis fuer kai -> genau eine Zustellung.
+    let (status, res) = send(
+        &app,
+        "POST",
+        "/internal/presence-event",
+        Some(json!({ "handle": "kai", "online": true })),
+        None,
+        Some("dienst-geheim"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{res}");
+    assert_eq!(res["matched"], 1);
+    assert_eq!(res["delivered"], 1);
+
+    {
+        let deliveries = sender.sent.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        let d = &deliveries[0];
+        assert_eq!(d.url, "https://azubios.example/hook");
+        assert_eq!(d.event, "presence.changed");
+        let env: Value = serde_json::from_slice(&d.body).unwrap();
+        assert_eq!(env["type"], "presence.changed");
+        assert_eq!(env["tenant"], "azubi-os");
+        assert_eq!(env["data"]["handle"], "kai");
+        assert_eq!(env["data"]["online"], true);
+
+        // Die Signatur prueft mit dem veroeffentlichten Schluessel ueber
+        // die kanonische Nachricht {timestamp}.{body}.
+        let pub_bytes: [u8; 32] = B64.decode(&pubkey).unwrap().try_into().unwrap();
+        let vk = VerifyingKey::from_bytes(&pub_bytes).unwrap();
+        let sig_bytes: [u8; 64] = B64.decode(&d.signature).unwrap().try_into().unwrap();
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        let mut msg = format!("{}.", d.timestamp).into_bytes();
+        msg.extend_from_slice(&d.body);
+        assert!(vk.verify(&msg, &sig).is_ok(), "Signatur muss pruefen");
+    }
+
+    // Ein nicht abonnierter Handle: keine Zustellung (Abo je Handle).
+    let (_, res) = send(
+        &app,
+        "POST",
+        "/internal/presence-event",
+        Some(json!({ "handle": "niemand", "online": true })),
+        None,
+        Some("dienst-geheim"),
+    )
+    .await;
+    assert_eq!(res["matched"], 0);
+    assert_eq!(sender.sent.lock().unwrap().len(), 1);
+
+    // Loeschen -> 204, danach kein Treffer mehr.
+    let (status, _) = send(
+        &app,
+        "DELETE",
+        &format!("/integrations/azubi-os/webhooks/{wh_id}"),
+        None,
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, res) = send(
+        &app,
+        "POST",
+        "/internal/presence-event",
+        Some(json!({ "handle": "kai", "online": false })),
+        None,
+        Some("dienst-geheim"),
+    )
+    .await;
+    assert_eq!(res["matched"], 0);
+}
+
+#[tokio::test]
+async fn webhook_requires_scope_and_isolates_tenants() {
+    let (app, _sender) = test_app_with_webhooks();
+    let (_, _, notify_only) = provision_tenant(&app, "nur-notify", json!(["notify"])).await;
+    let (_, _, other) = provision_tenant(&app, "anderes", json!(["notify", "presence"])).await;
+
+    // presence.changed ohne presence-Scope: 403 missing_scope.
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/integrations/nur-notify/webhooks",
+        Some(json!({ "url": "https://x/h", "events": ["presence.changed"], "handles": ["kai"] })),
+        Some(&notify_only),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "missing_scope");
+
+    // Fremder Mandantenpfad: 403 tenant_mismatch.
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/integrations/nur-notify/webhooks",
+        Some(json!({ "url": "https://x/h", "events": ["presence.changed"], "handles": ["kai"] })),
+        Some(&other),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "tenant_mismatch");
+
+    // Validierung: URL, Ereignis, Handles.
+    for (payload, code) in [
+        (
+            json!({ "url": "ftp://x", "events": ["presence.changed"], "handles": ["kai"] }),
+            "invalid_url",
+        ),
+        (
+            json!({ "url": "https://x/h", "events": ["unbekannt"], "handles": ["kai"] }),
+            "invalid_events",
+        ),
+        (
+            json!({ "url": "https://x/h", "events": ["presence.changed"], "handles": [] }),
+            "invalid_handles",
+        ),
+    ] {
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/integrations/anderes/webhooks",
+            Some(payload),
+            Some(&other),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], code);
+    }
+
+    // Unbekannten Endpunkt loeschen: 404.
+    let (status, body) = send(
+        &app,
+        "DELETE",
+        "/integrations/anderes/webhooks/gibt-es-nicht",
+        None,
+        Some(&other),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "unknown_webhook");
 }
 
 #[tokio::test]

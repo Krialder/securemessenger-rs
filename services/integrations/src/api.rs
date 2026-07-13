@@ -29,9 +29,13 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::auth;
-use crate::domain::{Tenant, KNOWN_SCOPES, SCOPE_NOTIFY, SCOPE_PRESENCE};
+use crate::domain::{
+    event_required_scope, Tenant, WebhookEndpoint, EVENT_PRESENCE_CHANGED, KNOWN_SCOPES,
+    KNOWN_WEBHOOK_EVENTS, SCOPE_NOTIFY, SCOPE_PRESENCE,
+};
 use crate::realtime_client::RealtimeGateway;
 use crate::store::{NewTenant, StoreError, TenantStore};
+use crate::webhook::{Delivery, HttpWebhookSender, WebhookSender, WebhookSigner};
 use common::identity_client::IdentityGateway;
 use common::rate::RateLimiter;
 
@@ -42,6 +46,13 @@ const TOKEN_TTL_SECS: u64 = 3600;
 /// Obergrenze für den Titel einer Benachrichtigung: minimaler Inhalt ist
 /// Absicht, kein Platz für ganze Berichte.
 const MAX_TITLE_CHARS: usize = 200;
+/// Höchstzahl Webhook-Endpunkte je Mandant: bremst unbegrenztes Anlegen
+/// (gleiches Muster wie die anderen Deckel im Projekt).
+const MAX_WEBHOOKS_PER_TENANT: usize = 32;
+/// Höchstzahl abonnierter Handles je Endpunkt.
+const MAX_WEBHOOK_HANDLES: usize = 100;
+/// Obergrenze der Ziel-URL-Länge.
+const MAX_WEBHOOK_URL_LEN: usize = 2000;
 
 /// Geteilter Zustand: Mandanten-Ablage, identity- und delivery-Anbindung,
 /// Rate-Limiter und der Guard der internen Anlage-Route.
@@ -53,6 +64,10 @@ pub struct AppState {
     limiter: Arc<RateLimiter>,
     /// SHA-256-Digest des Shared Secrets; None = interne Route aus.
     internal_token_hash: Option<String>,
+    /// Signierpaar der Webhooks (Ed25519), oeffentlicher Teil veroeffentlicht.
+    webhook_signer: Arc<WebhookSigner>,
+    /// Zustellung der Webhooks; im Test ein Fake, sonst reqwest.
+    webhook_sender: Arc<dyn WebhookSender>,
 }
 
 impl AppState {
@@ -67,12 +82,28 @@ impl AppState {
             realtime,
             limiter: Arc::new(RateLimiter::default()),
             internal_token_hash: None,
+            // Ohne gesetzten Seed ein ephemeres Paar: der lokale Lauf
+            // funktioniert, ueber einen Neustart aendert sich der Schluessel.
+            webhook_signer: Arc::new(WebhookSigner::ephemeral()),
+            webhook_sender: Arc::new(HttpWebhookSender::default()),
         }
     }
 
     /// Schaltet die interne Mandanten-Anlage frei (Shared Secret).
     pub fn with_internal_token(mut self, secret: &str) -> Self {
         self.internal_token_hash = Some(sha256_hex(secret));
+        self
+    }
+
+    /// Setzt das Webhook-Signierpaar (aus einem Betriebs-Seed).
+    pub fn with_webhook_signer(mut self, signer: Arc<WebhookSigner>) -> Self {
+        self.webhook_signer = signer;
+        self
+    }
+
+    /// Ersetzt die Webhook-Zustellung (Tests stecken hier einen Fake).
+    pub fn with_webhook_sender(mut self, sender: Arc<dyn WebhookSender>) -> Self {
+        self.webhook_sender = sender;
         self
     }
 }
@@ -94,12 +125,23 @@ pub fn app(state: AppState) -> Router {
             get(|| async { "SecureMessenger integrations service" }),
         )
         .route("/integrations/token", post(token))
+        .route("/integrations/webhook-key", get(webhook_key))
         .route("/integrations/{tenant}/notify", post(notify))
-        .route("/integrations/{tenant}/presence/{handle}", get(presence));
-    // Ohne konfiguriertes Secret existiert die Anlage-Route nicht
+        .route("/integrations/{tenant}/presence/{handle}", get(presence))
+        .route(
+            "/integrations/{tenant}/webhooks",
+            post(create_webhook).get(list_webhooks),
+        )
+        .route(
+            "/integrations/{tenant}/webhooks/{id}",
+            axum::routing::delete(delete_webhook),
+        );
+    // Ohne konfiguriertes Secret existieren die internen Routen nicht
     // (gleiches Muster wie die /internal-Routen von identity/delivery).
     if state.internal_token_hash.is_some() {
-        router = router.route("/internal/tenants", post(create_tenant));
+        router = router
+            .route("/internal/tenants", post(create_tenant))
+            .route("/internal/presence-event", post(presence_event));
     }
     router
         .layer(axum::middleware::from_fn(common::metrics::track))
@@ -499,6 +541,264 @@ async fn presence(
         }
     };
     (StatusCode::OK, Json(PresenceResponse { handle, online })).into_response()
+}
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("Systemzeit nach 1970")
+        .as_secs()
+}
+
+/// `GET /integrations/webhook-key`: der oeffentliche Ed25519-Schluessel, mit
+/// dem ein Fremdprojekt die Signatur eingehender Webhooks prueft. Oeffentlich
+/// und ohne Auth (ein oeffentlicher Schluessel ist zum Teilen da).
+async fn webhook_key(State(st): State<AppState>) -> Response {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "alg": "Ed25519",
+            "public_key": st.webhook_signer.public_key_b64(),
+            "signature_scheme": "base64(sign( timestamp || '.' || body ))",
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct CreateWebhookRequest {
+    url: String,
+    events: Vec<String>,
+    handles: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct WebhookResponse {
+    id: String,
+    url: String,
+    events: Vec<String>,
+    handles: Vec<String>,
+    created_at: u64,
+}
+
+impl From<WebhookEndpoint> for WebhookResponse {
+    fn from(e: WebhookEndpoint) -> Self {
+        Self {
+            id: e.id,
+            url: e.url,
+            events: e.events,
+            handles: e.handles,
+            created_at: e.created_at,
+        }
+    }
+}
+
+/// `POST /integrations/{tenant}/webhooks`: der Mandant registriert selbst
+/// einen Endpunkt. Jedes abonnierte Ereignis braucht den Scope, den es
+/// aufdeckt (presence.changed braucht presence): der Push ist damit nicht
+/// durchlaessiger als der Poll.
+async fn create_webhook(
+    State(st): State<AppState>,
+    Path(path_tenant): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<CreateWebhookRequest>,
+) -> Response {
+    let tenant = match authenticate_tenant(&st, &headers, &path_tenant).await {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
+
+    let url = req.url.trim();
+    if url.is_empty()
+        || url.len() > MAX_WEBHOOK_URL_LEN
+        || !(url.starts_with("http://") || url.starts_with("https://"))
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_url",
+            "url muss eine http(s)-URL sein (bis 2000 Zeichen)",
+        );
+    }
+    if req.events.is_empty()
+        || !req
+            .events
+            .iter()
+            .all(|e| KNOWN_WEBHOOK_EVENTS.contains(&e.as_str()))
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_events",
+            format!("events: nicht leer, erlaubt sind {KNOWN_WEBHOOK_EVENTS:?}"),
+        );
+    }
+    // Scope-Prüfung je Ereignis gegen die TOKEN-Scopes (Least Privilege).
+    for event in &req.events {
+        match event_required_scope(event) {
+            Some(scope) if tenant.has_scope(scope) => {}
+            _ => {
+                return api_error(
+                    StatusCode::FORBIDDEN,
+                    "missing_scope",
+                    format!("Das Token darf '{event}' nicht abonnieren"),
+                )
+            }
+        }
+    }
+    if req.handles.is_empty()
+        || req.handles.len() > MAX_WEBHOOK_HANDLES
+        || req.handles.iter().any(|h| h.trim().is_empty())
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_handles",
+            format!("handles: 1 bis {MAX_WEBHOOK_HANDLES} nicht-leere Einträge"),
+        );
+    }
+
+    // Deckel je Mandant.
+    match st.store.list_webhooks(&tenant.id).await {
+        Ok(existing) if existing.len() >= MAX_WEBHOOKS_PER_TENANT => {
+            return api_error(
+                StatusCode::CONFLICT,
+                "too_many_webhooks",
+                format!("Höchstens {MAX_WEBHOOKS_PER_TENANT} Endpunkte je Mandant"),
+            )
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(%error, "Webhook-Liste nicht lesbar");
+            return internal();
+        }
+    }
+
+    let endpoint = WebhookEndpoint {
+        id: uuid::Uuid::new_v4().to_string(),
+        tenant_id: tenant.id.clone(),
+        tenant_name: tenant.name.clone(),
+        url: url.to_string(),
+        events: req.events,
+        handles: req.handles,
+        created_at: now_epoch(),
+    };
+    match st.store.create_webhook(endpoint.clone()).await {
+        Ok(()) => (StatusCode::CREATED, Json(WebhookResponse::from(endpoint))).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "Webhook-Anlage fehlgeschlagen");
+            internal()
+        }
+    }
+}
+
+/// `GET /integrations/{tenant}/webhooks`: die eigenen Endpunkte.
+async fn list_webhooks(
+    State(st): State<AppState>,
+    Path(path_tenant): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let tenant = match authenticate_tenant(&st, &headers, &path_tenant).await {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
+    match st.store.list_webhooks(&tenant.id).await {
+        Ok(list) => {
+            let out: Vec<WebhookResponse> = list.into_iter().map(WebhookResponse::from).collect();
+            (StatusCode::OK, Json(out)).into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "Webhook-Liste nicht lesbar");
+            internal()
+        }
+    }
+}
+
+/// `DELETE /integrations/{tenant}/webhooks/{id}`: einen eigenen Endpunkt
+/// entfernen. Ein fremder oder unbekannter Endpunkt ist 404 (verrät keine
+/// fremden IDs).
+async fn delete_webhook(
+    State(st): State<AppState>,
+    Path((path_tenant, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let tenant = match authenticate_tenant(&st, &headers, &path_tenant).await {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
+    match st.store.delete_webhook(&tenant.id, &id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => api_error(
+            StatusCode::NOT_FOUND,
+            "unknown_webhook",
+            "Kein solcher Endpunkt",
+        ),
+        Err(error) => {
+            tracing::error!(%error, "Webhook-Loeschung fehlgeschlagen");
+            internal()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct PresenceEventRequest {
+    handle: String,
+    online: bool,
+}
+
+/// `POST /internal/presence-event`: delivery meldet eine Praesenz-Aenderung
+/// eines Handles (online/offline). Der Dienst sucht die Abonnenten und
+/// stellt jedem einen signierten Envelope zu (interne Route, Shared Secret).
+async fn presence_event(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<PresenceEventRequest>,
+) -> Response {
+    if let Some(denied) = internal_denied(&st, &headers) {
+        return denied;
+    }
+    let subscribers = match st
+        .store
+        .find_webhook_subscribers(&req.handle, EVENT_PRESENCE_CHANGED)
+        .await
+    {
+        Ok(subs) => subs,
+        Err(error) => {
+            tracing::error!(%error, "Abonnenten-Suche fehlgeschlagen");
+            return internal();
+        }
+    };
+    let matched = subscribers.len();
+    let now = now_epoch();
+    let mut delivered = 0u32;
+    for endpoint in subscribers {
+        let delivery_id = uuid::Uuid::new_v4().to_string();
+        let envelope = json!({
+            "id": delivery_id,
+            "type": EVENT_PRESENCE_CHANGED,
+            "tenant": endpoint.tenant_name,
+            "created_at": now,
+            "data": { "handle": req.handle, "online": req.online },
+        });
+        let body = serde_json::to_vec(&envelope).unwrap_or_default();
+        let signature = st.webhook_signer.sign(now, &body);
+        let delivery = Delivery {
+            url: endpoint.url,
+            event: EVENT_PRESENCE_CHANGED.to_string(),
+            delivery_id,
+            timestamp: now,
+            signature,
+            body,
+        };
+        match st.webhook_sender.deliver(delivery).await {
+            Ok(()) => delivered += 1,
+            // Best effort: ein nicht erreichbarer Empfaenger haelt die
+            // anderen nicht auf (kein Retry in dieser Etappe, siehe ADR).
+            Err(error) => tracing::warn!(%error, "Webhook-Zustellung fehlgeschlagen"),
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(json!({ "matched": matched, "delivered": delivered })),
+    )
+        .into_response()
 }
 
 /// Guard der internen Anlage-Route (Digest-Vergleich wie überall).

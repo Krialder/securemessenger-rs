@@ -32,6 +32,23 @@ async fn main() {
     let identity = Arc::new(HttpIdentityGateway::new(identity_url, internal_token));
     let realtime = Arc::new(HttpRealtimeGateway::new(delivery_url, internal_token));
 
+    // Webhook-Signierpaar: aus dem Betriebs-Seed, sonst ephemer (dann
+    // aendert sich der oeffentliche Schluessel ueber Neustarts, Empfaenger
+    // muessten ihn neu holen). Ein kaputter Seed bricht den Start ab, statt
+    // still ephemer zu werden.
+    let webhook_signer = match std::env::var("INTEGRATIONS_WEBHOOK_SIGNING_KEY") {
+        Ok(seed) if !seed.is_empty() => Arc::new(
+            integrations::webhook::WebhookSigner::from_seed_b64(&seed)
+                .expect("INTEGRATIONS_WEBHOOK_SIGNING_KEY ist ein gueltiger Base64-32-Byte-Seed"),
+        ),
+        _ => {
+            tracing::warn!(
+                "INTEGRATIONS_WEBHOOK_SIGNING_KEY nicht gesetzt, ephemerer Webhook-Schluessel"
+            );
+            Arc::new(integrations::webhook::WebhookSigner::ephemeral())
+        }
+    };
+
     let state = match &cfg.database_url {
         Some(url) => {
             let pool = pg::connect_and_migrate(url)
@@ -48,7 +65,8 @@ async fn main() {
     // Dasselbe Shared Secret in beide Richtungen: integrations weist
     // sich bei identity/delivery aus und schaltet seine eigene
     // Mandanten-Anlage-Route frei.
-    .with_internal_token(internal_token);
+    .with_internal_token(internal_token)
+    .with_webhook_signer(webhook_signer);
 
     let router = app(state);
 

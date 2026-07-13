@@ -2114,6 +2114,7 @@ dependencies = [
  "axum",
  "base64",
  "common",
+ "ed25519-dalek",
  "http-body-util",
  "reqwest",
  "serde",
