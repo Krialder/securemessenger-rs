@@ -20,6 +20,7 @@
 //! Fehlerformat wie überall: JSON mit `code` und `message`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -74,22 +75,32 @@ type PresenceRegistry = Arc<Mutex<HashMap<String, u32>>>;
 #[derive(Clone, Default)]
 struct HandlePresence {
     counts: Arc<Mutex<HashMap<String, u32>>>,
+    /// Fortlaufende Nummer je Übergang. Unter der counts-Sperre vergeben,
+    /// damit die Nummern der Übergangs-Reihenfolge folgen; sie reist in den
+    /// Webhook, damit ein Empfänger online/offline eindeutig ordnen kann
+    /// (die Zustellung selbst ist Best effort und nicht geordnet).
+    seq: Arc<AtomicU64>,
 }
 
 impl HandlePresence {
-    /// Ein Gerät des Handles kommt; `true`, wenn der Handle dadurch online wird.
-    fn arrive(&self, handle: &str) -> bool {
+    /// Ein Gerät des Handles kommt; `Some(seq)`, wenn er dadurch online wird.
+    fn arrive(&self, handle: &str) -> Option<u64> {
         let mut map = self
             .counts
             .lock()
             .expect("Handle-Presence-Lock nicht vergiftet");
         let count = map.entry(handle.to_string()).or_insert(0);
         *count += 1;
-        *count == 1
+        // next_seq unter der Sperre: die Nummern folgen der Übergangsordnung.
+        if *count == 1 {
+            Some(self.seq.fetch_add(1, Ordering::Relaxed))
+        } else {
+            None
+        }
     }
 
-    /// Ein Gerät des Handles geht; `true`, wenn der Handle dadurch offline wird.
-    fn leave(&self, handle: &str) -> bool {
+    /// Ein Gerät des Handles geht; `Some(seq)`, wenn er dadurch offline wird.
+    fn leave(&self, handle: &str) -> Option<u64> {
         let mut map = self
             .counts
             .lock()
@@ -99,12 +110,12 @@ impl HandlePresence {
                 *count -= 1;
                 if *count == 0 {
                     map.remove(handle);
-                    true
+                    Some(self.seq.fetch_add(1, Ordering::Relaxed))
                 } else {
-                    false
+                    None
                 }
             }
-            None => false,
+            None => None,
         }
     }
 }
@@ -1288,10 +1299,10 @@ impl PresenceGuard {
             *map.entry(device_id.to_string()).or_insert(0) += 1;
         }
         // Nur der Übergang 0->1 des Handles ist "kommt online".
-        if handle_presence.arrive(handle) {
+        if let Some(seq) = handle_presence.arrive(handle) {
             let gateway = integrations.clone();
             let handle = handle.to_string();
-            tokio::spawn(async move { gateway.presence_changed(&handle, true).await });
+            tokio::spawn(async move { gateway.presence_changed(&handle, true, seq).await });
         }
         Self {
             registry,
@@ -1317,10 +1328,10 @@ impl Drop for PresenceGuard {
         // Nur der Übergang 1->0 des Handles ist "geht offline". Der Aufruf
         // läuft best effort in einer eigenen Task (Drop ist synchron); ein
         // Fehler bleibt beim integrations-Gateway (best effort).
-        if self.handle_presence.leave(&self.handle) {
+        if let Some(seq) = self.handle_presence.leave(&self.handle) {
             let gateway = self.integrations.clone();
             let handle = self.handle.clone();
-            tokio::spawn(async move { gateway.presence_changed(&handle, false).await });
+            tokio::spawn(async move { gateway.presence_changed(&handle, false, seq).await });
         }
     }
 }
@@ -1441,19 +1452,23 @@ mod tests {
     #[test]
     fn handle_presence_transitions_on_first_and_last_device() {
         let presence = HandlePresence::default();
-        // Erstes Gerät: Handle kommt online.
-        assert!(presence.arrive("alice"));
+        // Erstes Gerät: Handle kommt online (mit einer Übergangs-Nummer).
+        let online = presence.arrive("alice");
+        assert!(online.is_some());
         // Zweites Gerät desselben Kontos: kein neuer Übergang.
-        assert!(!presence.arrive("alice"));
+        assert!(presence.arrive("alice").is_none());
         // Ein anderes Konto ist unabhängig.
-        assert!(presence.arrive("bob"));
+        assert!(presence.arrive("bob").is_some());
         // Ein Gerät von alice geht: noch ist eines da, kein Übergang.
-        assert!(!presence.leave("alice"));
+        assert!(presence.leave("alice").is_none());
         // Das letzte Gerät von alice geht: Handle geht offline.
-        assert!(presence.leave("alice"));
+        let offline = presence.leave("alice");
+        assert!(offline.is_some());
+        // Die Nummern folgen der Reihenfolge: offline nach online.
+        assert!(offline.unwrap() > online.unwrap());
         // Ein weiteres leave auf einem schon offline-Handle feuert nicht.
-        assert!(!presence.leave("alice"));
+        assert!(presence.leave("alice").is_none());
         // bob ist davon unberührt und geht mit seinem einzigen Gerät offline.
-        assert!(presence.leave("bob"));
+        assert!(presence.leave("bob").is_some());
     }
 }

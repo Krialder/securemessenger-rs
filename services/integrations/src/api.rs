@@ -15,6 +15,7 @@
 //! POST /internal/tenants an (Shared Secret wie überall); eine
 //! Admin-Oberfläche ist nicht Teil dieser Etappe. Token-Laufzeit 1 Stunde.]
 
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -68,6 +69,10 @@ pub struct AppState {
     webhook_signer: Arc<WebhookSigner>,
     /// Zustellung der Webhooks; im Test ein Fake, sonst reqwest.
     webhook_sender: Arc<dyn WebhookSender>,
+    /// Ob Webhook-URLs auf interne/Loopback-Ziele zeigen duerfen. Vorgabe
+    /// aus (SSRF-Schutz); nur der lokale Lauf schaltet es fuer den Empfaenger
+    /// auf localhost frei.
+    allow_private_webhooks: bool,
 }
 
 impl AppState {
@@ -86,7 +91,14 @@ impl AppState {
             // funktioniert, ueber einen Neustart aendert sich der Schluessel.
             webhook_signer: Arc::new(WebhookSigner::ephemeral()),
             webhook_sender: Arc::new(HttpWebhookSender::default()),
+            allow_private_webhooks: false,
         }
+    }
+
+    /// Erlaubt Webhook-URLs auf interne/Loopback-Ziele (nur lokaler Lauf).
+    pub fn allow_private_webhooks(mut self, allow: bool) -> Self {
+        self.allow_private_webhooks = allow;
+        self
     }
 
     /// Schaltet die interne Mandanten-Anlage frei (Shared Secret).
@@ -550,6 +562,77 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
+/// Den Host aus einer http(s)-URL ziehen (ohne den `url`-Crate): alles nach
+/// `://` bis zum ersten `/?#`, ohne Userinfo und Port, IPv6 in Klammern.
+fn webhook_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit('@').next()?; // Userinfo weg
+    if let Some(v6) = authority.strip_prefix('[') {
+        return v6.split(']').next().map(str::to_string);
+    }
+    authority
+        .split(':')
+        .next()
+        .map(str::to_string)
+        .filter(|host| !host.is_empty())
+}
+
+/// Zeigt die URL auf ein internes/gefaehrliches Ziel (SSRF)? Loopback,
+/// private/Link-lokale/ULA-Bereiche, Multicast, unspezifiziert, `localhost`
+/// und Cloud-Metadaten-Namen. Ein DNS-Name, der erst intern aufloest
+/// (DNS-Rebinding), faellt hier durch; dagegen schuetzt die Egress-Policy
+/// des Netzes (deploy/k8s, siehe ADR-Folgepunkt).
+fn is_blocked_webhook_host(url: &str) -> bool {
+    let Some(host) = webhook_host(url) else {
+        return true; // unparsebar: lieber blocken
+    };
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") {
+        return true;
+    }
+    if lower == "metadata" || lower.ends_with(".internal") {
+        return true;
+    }
+    if let Ok(ip) = lower.parse::<IpAddr>() {
+        return is_internal_ip(ip);
+    }
+    false
+}
+
+fn is_internal_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.octets()[0] == 0 // 0.0.0.0/8
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || is_ipv6_link_local(v6)
+                || is_ipv6_unique_local(v6)
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|m| is_internal_ip(IpAddr::V4(m)))
+        }
+    }
+}
+
+fn is_ipv6_link_local(v6: Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xffc0) == 0xfe80
+}
+
+fn is_ipv6_unique_local(v6: Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xfe00) == 0xfc00
+}
+
 /// `GET /integrations/webhook-key`: der oeffentliche Ed25519-Schluessel, mit
 /// dem ein Fremdprojekt die Signatur eingehender Webhooks prueft. Oeffentlich
 /// und ohne Auth (ein oeffentlicher Schluessel ist zum Teilen da).
@@ -619,6 +702,16 @@ async fn create_webhook(
             "url muss eine http(s)-URL sein (bis 2000 Zeichen)",
         );
     }
+    // SSRF-Schutz: die URL darf nicht auf ein internes/Loopback-Ziel zeigen
+    // (der Dienst wuerde sonst im internen Netz oder auf die Cloud-Metadaten
+    // POSTen). Nur der lokale Lauf schaltet das fuer localhost frei.
+    if !st.allow_private_webhooks && is_blocked_webhook_host(url) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_url",
+            "url darf nicht auf ein internes oder Loopback-Ziel zeigen",
+        );
+    }
     if req.events.is_empty()
         || !req
             .events
@@ -655,22 +748,6 @@ async fn create_webhook(
         );
     }
 
-    // Deckel je Mandant.
-    match st.store.list_webhooks(&tenant.id).await {
-        Ok(existing) if existing.len() >= MAX_WEBHOOKS_PER_TENANT => {
-            return api_error(
-                StatusCode::CONFLICT,
-                "too_many_webhooks",
-                format!("Höchstens {MAX_WEBHOOKS_PER_TENANT} Endpunkte je Mandant"),
-            )
-        }
-        Ok(_) => {}
-        Err(error) => {
-            tracing::error!(%error, "Webhook-Liste nicht lesbar");
-            return internal();
-        }
-    }
-
     let endpoint = WebhookEndpoint {
         id: uuid::Uuid::new_v4().to_string(),
         tenant_id: tenant.id.clone(),
@@ -680,8 +757,19 @@ async fn create_webhook(
         handles: req.handles,
         created_at: now_epoch(),
     };
-    match st.store.create_webhook(endpoint.clone()).await {
-        Ok(()) => (StatusCode::CREATED, Json(WebhookResponse::from(endpoint))).into_response(),
+    // Der Deckel je Mandant wird in der Ablage atomar durchgesetzt (kein
+    // Check-then-act): false = der Deckel ist erreicht.
+    match st
+        .store
+        .create_webhook(endpoint.clone(), MAX_WEBHOOKS_PER_TENANT)
+        .await
+    {
+        Ok(true) => (StatusCode::CREATED, Json(WebhookResponse::from(endpoint))).into_response(),
+        Ok(false) => api_error(
+            StatusCode::CONFLICT,
+            "too_many_webhooks",
+            format!("Höchstens {MAX_WEBHOOKS_PER_TENANT} Endpunkte je Mandant"),
+        ),
         Err(error) => {
             tracing::error!(%error, "Webhook-Anlage fehlgeschlagen");
             internal()
@@ -723,7 +811,17 @@ async fn delete_webhook(
         Ok(tenant) => tenant,
         Err(response) => return response,
     };
-    match st.store.delete_webhook(&tenant.id, &id).await {
+    // ID auf die kanonische UUID-Form bringen, damit In-Memory und
+    // PostgreSQL gleich vergleichen (sonst faengt PG Gross-/Kleinschreibung
+    // ab, In-Memory nicht). Keine UUID = es gibt keinen solchen Endpunkt.
+    let Ok(canonical) = uuid::Uuid::try_parse(&id).map(|u| u.to_string()) else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "unknown_webhook",
+            "Kein solcher Endpunkt",
+        );
+    };
+    match st.store.delete_webhook(&tenant.id, &canonical).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => api_error(
             StatusCode::NOT_FOUND,
@@ -741,6 +839,12 @@ async fn delete_webhook(
 struct PresenceEventRequest {
     handle: String,
     online: bool,
+    /// Fortlaufende Nummer des Uebergangs (von delivery unter der Zaehl-
+    /// Sperre vergeben). Sie reist in den Envelope, damit ein Empfaenger die
+    /// Reihenfolge herstellen kann: die Zustellung ist Best effort und nicht
+    /// geordnet, aber `seq` ordnet online/offline eindeutig.
+    #[serde(default)]
+    seq: u64,
 }
 
 /// `POST /internal/presence-event`: delivery meldet eine Praesenz-Aenderung
@@ -767,7 +871,9 @@ async fn presence_event(
     };
     let matched = subscribers.len();
     let now = now_epoch();
-    let mut delivered = 0u32;
+    // Nebenlaeufig zustellen: ein langsamer oder haengender Empfaenger haelt
+    // die anderen nicht auf (der Timeout des Senders deckelt jede Zustellung).
+    let mut set = tokio::task::JoinSet::new();
     for endpoint in subscribers {
         let delivery_id = uuid::Uuid::new_v4().to_string();
         let envelope = json!({
@@ -775,7 +881,7 @@ async fn presence_event(
             "type": EVENT_PRESENCE_CHANGED,
             "tenant": endpoint.tenant_name,
             "created_at": now,
-            "data": { "handle": req.handle, "online": req.online },
+            "data": { "handle": &req.handle, "online": req.online, "seq": req.seq },
         });
         let body = serde_json::to_vec(&envelope).unwrap_or_default();
         let signature = st.webhook_signer.sign(now, &body);
@@ -787,11 +893,17 @@ async fn presence_event(
             signature,
             body,
         };
-        match st.webhook_sender.deliver(delivery).await {
-            Ok(()) => delivered += 1,
-            // Best effort: ein nicht erreichbarer Empfaenger haelt die
-            // anderen nicht auf (kein Retry in dieser Etappe, siehe ADR).
-            Err(error) => tracing::warn!(%error, "Webhook-Zustellung fehlgeschlagen"),
+        let sender = st.webhook_sender.clone();
+        set.spawn(async move { sender.deliver(delivery).await });
+    }
+    let mut delivered = 0u32;
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Ok(())) => delivered += 1,
+            // Best effort: ein nicht erreichbarer Empfaenger haelt die anderen
+            // nicht auf (kein Retry in dieser Etappe, siehe ADR-Folgepunkt).
+            Ok(Err(error)) => tracing::warn!(%error, "Webhook-Zustellung fehlgeschlagen"),
+            Err(join_error) => tracing::warn!(%join_error, "Webhook-Task abgebrochen"),
         }
     }
     (

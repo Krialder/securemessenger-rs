@@ -713,12 +713,12 @@ async fn webhook_registration_and_presence_fanout() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(list.as_array().unwrap().len(), 1);
 
-    // Praesenz-Ereignis fuer kai -> genau eine Zustellung.
+    // Praesenz-Ereignis fuer kai (mit Uebergangs-Nummer) -> eine Zustellung.
     let (status, res) = send(
         &app,
         "POST",
         "/internal/presence-event",
-        Some(json!({ "handle": "kai", "online": true })),
+        Some(json!({ "handle": "kai", "online": true, "seq": 7 })),
         None,
         Some("dienst-geheim"),
     )
@@ -738,6 +738,8 @@ async fn webhook_registration_and_presence_fanout() {
         assert_eq!(env["tenant"], "azubi-os");
         assert_eq!(env["data"]["handle"], "kai");
         assert_eq!(env["data"]["online"], true);
+        // Die Uebergangs-Nummer reist mit (der Empfaenger ordnet danach).
+        assert_eq!(env["data"]["seq"], 7);
 
         // Die Signatur prueft mit dem veroeffentlichten Schluessel ueber
         // die kanonische Nachricht {timestamp}.{body}.
@@ -787,6 +789,34 @@ async fn webhook_registration_and_presence_fanout() {
 }
 
 #[tokio::test]
+async fn webhook_allows_local_target_only_with_flag() {
+    // Mit gesetzter Freigabe (lokaler Lauf) ist ein Loopback-Ziel erlaubt,
+    // das die Vorgabe (SSRF-Schutz) sonst abweist.
+    let sender = Arc::new(FakeWebhookSender::default());
+    let state = AppState::new(
+        Arc::new(InMemoryTenantStore::default()),
+        Arc::new(fake_identity()),
+        Arc::new(FakeRealtime::default()),
+    )
+    .with_internal_token("dienst-geheim")
+    .with_webhook_sender(sender)
+    .allow_private_webhooks(true);
+    let app = app(state);
+    let (_, _, token) = provision_tenant(&app, "lokal", json!(["presence"])).await;
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/integrations/lokal/webhooks",
+        Some(json!({ "url": "http://127.0.0.1:9099/hook", "events": ["presence.changed"], "handles": ["kai"] })),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
 async fn webhook_requires_scope_and_isolates_tenants() {
     let (app, _sender) = test_app_with_webhooks();
     let (_, _, notify_only) = provision_tenant(&app, "nur-notify", json!(["notify"])).await;
@@ -818,10 +848,23 @@ async fn webhook_requires_scope_and_isolates_tenants() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["code"], "tenant_mismatch");
 
-    // Validierung: URL, Ereignis, Handles.
+    // Validierung: URL, Ereignis, Handles, SSRF-Ziel.
     for (payload, code) in [
         (
             json!({ "url": "ftp://x", "events": ["presence.changed"], "handles": ["kai"] }),
+            "invalid_url",
+        ),
+        // SSRF: interne/Loopback-Ziele sind ohne Freigabe verboten.
+        (
+            json!({ "url": "http://127.0.0.1:9000/x", "events": ["presence.changed"], "handles": ["kai"] }),
+            "invalid_url",
+        ),
+        (
+            json!({ "url": "http://169.254.169.254/latest/meta-data", "events": ["presence.changed"], "handles": ["kai"] }),
+            "invalid_url",
+        ),
+        (
+            json!({ "url": "http://localhost/x", "events": ["presence.changed"], "handles": ["kai"] }),
             "invalid_url",
         ),
         (

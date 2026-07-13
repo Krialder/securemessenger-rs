@@ -96,6 +96,10 @@ impl Default for HttpWebhookSender {
     fn default() -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
+            // Keine Weiterleitungen folgen: sonst umginge ein Ziel eine
+            // spaetere Ziel-Pruefung ueber ein 302 auf ein internes Ziel
+            // (SSRF-Haertung, zusammen mit der Host-Pruefung bei der Anlage).
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest-Client baubar");
         Self { client }

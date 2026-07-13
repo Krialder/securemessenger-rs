@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 
-use crate::domain::{Tenant, WebhookEndpoint};
+use crate::domain::{event_required_scope, Tenant, WebhookEndpoint};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -72,18 +72,29 @@ pub trait TenantStore: Send + Sync {
     /// damit die Autorisierung transparent das enge Token durchsetzt.
     async fn find_token(&self, token_hash: &str) -> Result<Option<Tenant>, StoreError>;
 
-    /// Legt einen Webhook-Endpunkt an.
-    async fn create_webhook(&self, endpoint: WebhookEndpoint) -> Result<(), StoreError>;
+    /// Legt einen Webhook-Endpunkt an, aber nur, wenn der Mandant noch unter
+    /// `max_per_tenant` Endpunkten liegt. `false` = der Deckel ist erreicht.
+    /// Zaehlen und Einfuegen laufen atomar (eine Sperre bzw. eine Anweisung),
+    /// damit gleichzeitige Anlagen den Deckel nicht ueberrennen.
+    async fn create_webhook(
+        &self,
+        endpoint: WebhookEndpoint,
+        max_per_tenant: usize,
+    ) -> Result<bool, StoreError>;
 
-    /// Alle Webhook-Endpunkte eines Mandanten (fuer die Selbstverwaltung).
+    /// Alle Webhook-Endpunkte eines Mandanten (fuer die Selbstverwaltung),
+    /// stabil nach (created_at, id) sortiert (beide Ablagen gleich).
     async fn list_webhooks(&self, tenant_id: &str) -> Result<Vec<WebhookEndpoint>, StoreError>;
 
     /// Loescht einen Endpunkt des Mandanten; `false` = es gab keinen mit
     /// dieser ID bei diesem Mandanten (fuer 404, ohne fremde IDs zu verraten).
+    /// Die ID ist eine kanonische UUID (der Aufrufer normalisiert sie).
     async fn delete_webhook(&self, tenant_id: &str, id: &str) -> Result<bool, StoreError>;
 
     /// Alle Endpunkte (ueber alle Mandanten), die ein Ereignis fuer einen
-    /// Handle abonniert haben. Grundlage der Zustellung.
+    /// Handle abonniert haben UND deren Mandant nicht gesperrt ist und den
+    /// noetigen Scope noch hat. Grundlage der Zustellung: die Berechtigung
+    /// wird hier zur Zustellzeit erneut geprueft, nicht nur bei der Anlage.
     async fn find_webhook_subscribers(
         &self,
         handle: &str,
@@ -203,20 +214,37 @@ impl TenantStore for InMemoryTenantStore {
         Ok(tenant)
     }
 
-    async fn create_webhook(&self, endpoint: WebhookEndpoint) -> Result<(), StoreError> {
+    async fn create_webhook(
+        &self,
+        endpoint: WebhookEndpoint,
+        max_per_tenant: usize,
+    ) -> Result<bool, StoreError> {
         let mut inner = self.inner.lock().expect("Lock nicht vergiftet");
+        // Zaehlen und Einfuegen unter DERSELBEN Sperre: kein Check-then-act,
+        // das den Deckel unter gleichzeitigen Anlagen ueberrennen koennte.
+        let count = inner
+            .webhooks
+            .values()
+            .filter(|e| e.tenant_id == endpoint.tenant_id)
+            .count();
+        if count >= max_per_tenant {
+            return Ok(false);
+        }
         inner.webhooks.insert(endpoint.id.clone(), endpoint);
-        Ok(())
+        Ok(true)
     }
 
     async fn list_webhooks(&self, tenant_id: &str) -> Result<Vec<WebhookEndpoint>, StoreError> {
         let inner = self.inner.lock().expect("Lock nicht vergiftet");
-        Ok(inner
+        let mut out: Vec<WebhookEndpoint> = inner
             .webhooks
             .values()
             .filter(|e| e.tenant_id == tenant_id)
             .cloned()
-            .collect())
+            .collect();
+        // Stabile Reihenfolge wie PostgreSQL (created_at, id).
+        out.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        Ok(out)
     }
 
     async fn delete_webhook(&self, tenant_id: &str, id: &str) -> Result<bool, StoreError> {
@@ -239,10 +267,23 @@ impl TenantStore for InMemoryTenantStore {
         event: &str,
     ) -> Result<Vec<WebhookEndpoint>, StoreError> {
         let inner = self.inner.lock().expect("Lock nicht vergiftet");
+        // Berechtigung zur Zustellzeit erneut pruefen: der Mandant darf nicht
+        // gesperrt sein und muss den vom Ereignis geforderten Scope noch haben
+        // (ein gesperrter oder entrechteter Mandant bekommt nichts mehr).
+        let required = event_required_scope(event);
         Ok(inner
             .webhooks
             .values()
             .filter(|e| e.matches(event, handle))
+            .filter(|e| {
+                inner
+                    .tenants
+                    .values()
+                    .find(|(t, _)| t.id == e.tenant_id)
+                    .is_some_and(|(t, _)| {
+                        !t.disabled && required.is_some_and(|scope| t.has_scope(scope))
+                    })
+            })
             .cloned()
             .collect())
     }

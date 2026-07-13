@@ -66,7 +66,14 @@ async fn main() {
     // sich bei identity/delivery aus und schaltet seine eigene
     // Mandanten-Anlage-Route frei.
     .with_internal_token(internal_token)
-    .with_webhook_signer(webhook_signer);
+    .with_webhook_signer(webhook_signer)
+    // SSRF-Schutz standardmaessig an; nur der lokale Lauf erlaubt
+    // Webhook-Ziele auf localhost (INTEGRATIONS_ALLOW_PRIVATE_WEBHOOKS=1).
+    .allow_private_webhooks(
+        std::env::var("INTEGRATIONS_ALLOW_PRIVATE_WEBHOOKS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+    );
 
     let router = app(state);
 

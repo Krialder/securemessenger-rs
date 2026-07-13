@@ -127,8 +127,13 @@ async fn webhook_store_roundtrip() {
     let both = make(vec![kai_h.clone(), lea_h.clone()]);
     let only_kai = make(vec![kai_h.clone()]);
     let both_id = both.id.clone();
-    store.create_webhook(both).await.unwrap();
-    store.create_webhook(only_kai).await.unwrap();
+    assert!(store.create_webhook(both, 32).await.unwrap());
+    assert!(store.create_webhook(only_kai, 32).await.unwrap());
+    // Deckel greift atomar: ein dritter bei max=2 wird abgelehnt.
+    assert!(!store
+        .create_webhook(make(vec![kai_h.clone()]), 2)
+        .await
+        .unwrap());
 
     // Liste je Mandant.
     let list = store.list_webhooks(&tenant_id).await.unwrap();

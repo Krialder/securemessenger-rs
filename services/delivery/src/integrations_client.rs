@@ -13,7 +13,9 @@ use serde_json::json;
 #[async_trait]
 pub trait IntegrationsGateway: Send + Sync {
     /// Meldet, dass ein Handle online (true) oder offline (false) ging.
-    async fn presence_changed(&self, handle: &str, online: bool);
+    /// `seq` ist die fortlaufende Uebergangs-Nummer (delivery vergibt sie
+    /// unter der Praesenz-Sperre), damit der Empfaenger ordnen kann.
+    async fn presence_changed(&self, handle: &str, online: bool, seq: u64);
 }
 
 /// Tut nichts: ohne gesetzte INTEGRATIONS_URL laeuft delivery ohne die
@@ -22,7 +24,7 @@ pub struct NoopIntegrationsGateway;
 
 #[async_trait]
 impl IntegrationsGateway for NoopIntegrationsGateway {
-    async fn presence_changed(&self, _handle: &str, _online: bool) {}
+    async fn presence_changed(&self, _handle: &str, _online: bool, _seq: u64) {}
 }
 
 /// HTTP-Umsetzung gegen die interne Route von integrations, ausgewiesen per
@@ -49,12 +51,12 @@ impl HttpIntegrationsGateway {
 
 #[async_trait]
 impl IntegrationsGateway for HttpIntegrationsGateway {
-    async fn presence_changed(&self, handle: &str, online: bool) {
+    async fn presence_changed(&self, handle: &str, online: bool, seq: u64) {
         let result = self
             .client
             .post(format!("{}/internal/presence-event", self.base_url))
             .header("x-internal-token", &self.internal_token)
-            .json(&json!({ "handle": handle, "online": online }))
+            .json(&json!({ "handle": handle, "online": online, "seq": seq }))
             .send()
             .await;
         match result {

@@ -4,7 +4,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
-use crate::domain::{Tenant, WebhookEndpoint};
+use crate::domain::{event_required_scope, Tenant, WebhookEndpoint};
 use crate::store::{NewTenant, StoreError, TenantStore};
 
 use async_trait::async_trait;
@@ -164,13 +164,21 @@ impl TenantStore for PgTenantStore {
         Ok(row.map(|row| row_to_tenant(&row)))
     }
 
-    async fn create_webhook(&self, endpoint: WebhookEndpoint) -> Result<(), StoreError> {
+    async fn create_webhook(
+        &self,
+        endpoint: WebhookEndpoint,
+        max_per_tenant: usize,
+    ) -> Result<bool, StoreError> {
         let id = parse_uuid(&endpoint.id, "Webhook-ID")?;
         let tenant_id = parse_uuid(&endpoint.tenant_id, "Mandanten-ID")?;
-        sqlx::query(
+        // Deckel in EINER Anweisung: nur einfuegen, wenn der Mandant noch
+        // unter der Grenze liegt (INSERT ... SELECT WHERE count < max), statt
+        // eines Check-then-act, das gleichzeitige Anlagen ueberrennen koennte.
+        let result = sqlx::query(
             "INSERT INTO integration_webhooks \
                  (id, tenant_id, tenant_name, url, events, handles, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7))",
+             SELECT $1, $2, $3, $4, $5, $6, to_timestamp($7) \
+             WHERE (SELECT count(*) FROM integration_webhooks WHERE tenant_id = $2) < $8",
         )
         .bind(id)
         .bind(tenant_id)
@@ -179,10 +187,11 @@ impl TenantStore for PgTenantStore {
         .bind(&endpoint.events)
         .bind(&endpoint.handles)
         .bind(endpoint.created_at as f64)
+        .bind(max_per_tenant as i64)
         .execute(&self.pool)
         .await
         .map_err(backend)?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     async fn list_webhooks(&self, tenant_id: &str) -> Result<Vec<WebhookEndpoint>, StoreError> {
@@ -190,7 +199,7 @@ impl TenantStore for PgTenantStore {
         let rows = sqlx::query(
             "SELECT id, tenant_id, tenant_name, url, events, handles, \
                     EXTRACT(EPOCH FROM created_at)::float8 AS created_at \
-             FROM integration_webhooks WHERE tenant_id = $1 ORDER BY created_at",
+             FROM integration_webhooks WHERE tenant_id = $1 ORDER BY created_at, id",
         )
         .bind(tenant)
         .fetch_all(&self.pool)
@@ -220,13 +229,24 @@ impl TenantStore for PgTenantStore {
         handle: &str,
         event: &str,
     ) -> Result<Vec<WebhookEndpoint>, StoreError> {
+        // Unbekanntes Ereignis hat keinen Scope und damit keine Abonnenten.
+        let Some(required) = event_required_scope(event) else {
+            return Ok(Vec::new());
+        };
+        // Berechtigung zur Zustellzeit: der Mandant darf nicht gesperrt sein
+        // (disabled_at IS NULL) und muss den vom Ereignis geforderten Scope
+        // noch haben. So bekommt ein gesperrter Mandant keine Webhooks mehr.
         let rows = sqlx::query(
-            "SELECT id, tenant_id, tenant_name, url, events, handles, \
-                    EXTRACT(EPOCH FROM created_at)::float8 AS created_at \
-             FROM integration_webhooks WHERE $1 = ANY(handles) AND $2 = ANY(events)",
+            "SELECT w.id, w.tenant_id, w.tenant_name, w.url, w.events, w.handles, \
+                    EXTRACT(EPOCH FROM w.created_at)::float8 AS created_at \
+             FROM integration_webhooks w \
+             JOIN integration_tenants t ON t.id = w.tenant_id \
+             WHERE $1 = ANY(w.handles) AND $2 = ANY(w.events) \
+               AND t.disabled_at IS NULL AND $3 = ANY(t.scopes)",
         )
         .bind(handle)
         .bind(event)
+        .bind(required)
         .fetch_all(&self.pool)
         .await
         .map_err(backend)?;
