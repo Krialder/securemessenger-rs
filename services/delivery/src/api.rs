@@ -199,6 +199,12 @@ pub fn app(state: AppState) -> Router {
         .route("/groups", post(create_group))
         .route("/groups/{group_id}/commit", post(group_commit))
         .route("/groups/{group_id}/messages", post(group_messages))
+        // Verwaltung (Rollen, Übergabe, Name/Einstellungen). Name und
+        // Rollen liest jeder Mitglied über /meta.
+        .route("/groups/{group_id}/meta", get(group_meta))
+        .route("/groups/{group_id}/roles", post(group_set_role))
+        .route("/groups/{group_id}/transfer", post(group_transfer))
+        .route("/groups/{group_id}/info", post(group_update_info))
         .route("/ws", get(websocket));
     // Wie bei identity: ohne konfiguriertes Secret existieren die
     // internen Routen nicht (echtes 404 statt 401-Raterei).
@@ -806,6 +812,11 @@ fn validate_group_envelope(e: &GroupEnvelopeJson) -> Result<(), String> {
 #[derive(Deserialize)]
 struct CreateGroupRequest {
     group_id: String,
+    /// Anzeigename der Gruppe (server-sichtbares Metadatum, damit die
+    /// Einladung ihn zeigen kann). Leer erlaubt (Clients zeigen dann die
+    /// Mitglieder).
+    #[serde(default)]
+    name: String,
     /// Handles der Mitglieder; der Dienst löst sie über identity zu den
     /// Zielgeräten auf (wie beim 1:1-Fan-out).
     members: Vec<String>,
@@ -815,6 +826,49 @@ struct CreateGroupRequest {
 struct GroupStateResponse {
     epoch: u64,
     devices: usize,
+}
+
+/// Gruppen-Name auf 1..=128 Zeichen begrenzen (getrimmt); leer ist erlaubt
+/// (Rückfall auf die Mitglieder-Anzeige im Client). Keine Steuerzeichen.
+fn valid_group_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    trimmed.chars().count() <= 128 && !trimmed.chars().any(|c| c.is_control())
+}
+
+/// Übersetzt Gruppen-Ablagefehler in HTTP-Antworten. Forbidden/NotMember
+/// werden 403 mit der begründenden Meldung (die Regel ist kein Geheimnis).
+fn group_error_response(error: GroupError) -> Response {
+    match error {
+        GroupError::UnknownGroup => api_error(
+            StatusCode::NOT_FOUND,
+            "unknown_group",
+            "Gruppe ist unbekannt",
+        ),
+        GroupError::NotMember => api_error(
+            StatusCode::FORBIDDEN,
+            "not_member",
+            "Kein Mitglied dieser Gruppe",
+        ),
+        GroupError::Forbidden(reason) => api_error(StatusCode::FORBIDDEN, "forbidden", reason),
+        GroupError::StaleEpoch { current } => (
+            StatusCode::CONFLICT,
+            Json(StaleEpochResponse {
+                code: "stale_epoch",
+                message: format!("Commit veraltet, aktuelle Epoche {current}"),
+                current_epoch: current,
+            }),
+        )
+            .into_response(),
+        GroupError::GroupExists => api_error(
+            StatusCode::CONFLICT,
+            "group_exists",
+            "Eine Gruppe mit dieser ID existiert bereits",
+        ),
+        error => {
+            tracing::error!(%error, "Gruppen-Ablagefehler");
+            internal()
+        }
+    }
 }
 
 /// Löst eine Handle-Liste zu den gültigen Geräte-IDs auf (ein
@@ -897,16 +951,25 @@ async fn create_group(
     headers: HeaderMap,
     Json(req): Json<CreateGroupRequest>,
 ) -> Response {
-    match authenticate(&st, &headers).await {
-        Ok(Some(_)) => {}
+    // Der Ersteller wird Owner der Gruppe; sein Handle kommt aus der
+    // Introspektion (wurde bisher verworfen).
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(identity)) => identity,
         Ok(None) => return invalid_token(),
         Err(()) => return internal(),
-    }
+    };
     if !canonical_uuid(&req.group_id) {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_group",
             "group_id muss eine UUID in kanonischer Form sein",
+        );
+    }
+    if !valid_group_name(&req.name) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_name",
+            "Gruppenname: höchstens 128 Zeichen, keine Steuerzeichen",
         );
     }
     if req.members.is_empty() {
@@ -916,11 +979,31 @@ async fn create_group(
             "Eine Gruppe braucht mindestens ein Mitglied",
         );
     }
+    // Der Ersteller muss selbst in der Mitgliederliste stehen (er wird Owner).
+    if !req.members.iter().any(|m| m == &who.handle) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "creator_not_member",
+            "Der Ersteller muss selbst Mitglied der Gruppe sein",
+        );
+    }
     let devices = match resolve_member_devices(&st, &req.members).await {
         Ok(devices) => devices,
         Err(response) => return response,
     };
-    match st.groups.create_group(&req.group_id, &devices).await {
+    match st
+        .groups
+        .create_group(
+            &req.group_id,
+            crate::groups::NewGroup {
+                name: req.name.trim(),
+                creator: &who.handle,
+                member_handles: &req.members,
+                devices: &devices,
+            },
+        )
+        .await
+    {
         Ok(()) => (
             StatusCode::CREATED,
             Json(GroupStateResponse {
@@ -929,15 +1012,7 @@ async fn create_group(
             }),
         )
             .into_response(),
-        Err(GroupError::GroupExists) => api_error(
-            StatusCode::CONFLICT,
-            "group_exists",
-            "Eine Gruppe mit dieser ID existiert bereits",
-        ),
-        Err(error) => {
-            tracing::error!(%error, "Gruppe anlegen fehlgeschlagen");
-            internal()
-        }
+        Err(error) => group_error_response(error),
     }
 }
 
@@ -976,11 +1051,11 @@ async fn group_commit(
     headers: HeaderMap,
     Json(req): Json<CommitRequest>,
 ) -> Response {
-    match authenticate(&st, &headers).await {
-        Ok(Some(_)) => {}
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(identity)) => identity,
         Ok(None) => return invalid_token(),
         Err(()) => return internal(),
-    }
+    };
     if !canonical_uuid(&group_id) {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -1011,7 +1086,21 @@ async fn group_commit(
         Ok(devices) => devices,
         Err(response) => return response,
     };
-    match st.groups.commit(&group_id, req.from_epoch, &devices).await {
+    // Der Commit setzt die Rechte-Matrix durch (wer darf wen hinzufügen/
+    // entfernen); der Aufrufer-Handle kommt aus der Introspektion.
+    match st
+        .groups
+        .commit(
+            &group_id,
+            crate::groups::CommitContext {
+                actor: &who.handle,
+                expected_epoch: req.from_epoch,
+                new_member_handles: &req.members,
+                new_devices: &devices,
+            },
+        )
+        .await
+    {
         Ok(epoch) => {
             // Erst nach dem erfolgreichen Epochenwechsel verteilen: der
             // Commit ist damit die serialisierende Instanz.
@@ -1028,24 +1117,7 @@ async fn group_commit(
                 Err(response) => response,
             }
         }
-        Err(GroupError::StaleEpoch { current }) => (
-            StatusCode::CONFLICT,
-            Json(StaleEpochResponse {
-                code: "stale_epoch",
-                message: format!("Commit veraltet, aktuelle Epoche {current}"),
-                current_epoch: current,
-            }),
-        )
-            .into_response(),
-        Err(GroupError::UnknownGroup) => api_error(
-            StatusCode::NOT_FOUND,
-            "unknown_group",
-            "Gruppe ist unbekannt",
-        ),
-        Err(error) => {
-            tracing::error!(%error, "Gruppen-Commit fehlgeschlagen");
-            internal()
-        }
+        Err(error) => group_error_response(error),
     }
 }
 
@@ -1063,11 +1135,11 @@ async fn group_messages(
     headers: HeaderMap,
     Json(req): Json<GroupMessagesRequest>,
 ) -> Response {
-    match authenticate(&st, &headers).await {
-        Ok(Some(_)) => {}
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(identity)) => identity,
         Ok(None) => return invalid_token(),
         Err(()) => return internal(),
-    }
+    };
     if !canonical_uuid(&group_id) {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -1092,6 +1164,32 @@ async fn group_messages(
     for envelope in &req.envelopes {
         if let Err(reason) = validate_group_envelope(envelope) {
             return api_error(StatusCode::BAD_REQUEST, "invalid_envelope", reason);
+        }
+    }
+    // Der Absender muss Mitglied sein; im Announcement-Modus zusätzlich Staff.
+    // meta() prüft die Mitgliedschaft (NotMember sonst) und liefert die Rolle.
+    let meta = match st.groups.meta(&group_id, &who.handle).await {
+        Ok(meta) => meta,
+        Err(error) => return group_error_response(error),
+    };
+    if meta.settings.announcement {
+        let is_staff = meta
+            .members
+            .iter()
+            .find(|m| m.handle == who.handle)
+            .map(|m| {
+                matches!(
+                    m.role,
+                    crate::groups::Role::Owner | crate::groups::Role::Admin
+                )
+            })
+            .unwrap_or(false);
+        if !is_staff {
+            return api_error(
+                StatusCode::FORBIDDEN,
+                "announcement_only",
+                "In dieser Gruppe dürfen nur Admins senden",
+            );
         }
     }
     let state = match st.groups.state(&group_id).await {
@@ -1128,6 +1226,153 @@ async fn group_messages(
         )
             .into_response(),
         Err(response) => response,
+    }
+}
+
+/// `GET /groups/{id}/meta`: Name, Einstellungen und Rollen. Nur Mitglieder
+/// (der Server kennt den Aufrufer aus der Introspektion).
+async fn group_meta(
+    State(st): State<AppState>,
+    axum::extract::Path(group_id): axum::extract::Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return invalid_token(),
+        Err(()) => return internal(),
+    };
+    if !canonical_uuid(&group_id) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_group",
+            "group_id muss eine UUID in kanonischer Form sein",
+        );
+    }
+    match st.groups.meta(&group_id, &who.handle).await {
+        Ok(meta) => (StatusCode::OK, Json(meta)).into_response(),
+        Err(error) => group_error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetRoleRequest {
+    target: String,
+    role: crate::groups::Role,
+}
+
+/// `POST /groups/{id}/roles`: befördert/degradiert ein Mitglied (Rechte-Matrix
+/// in groups.rs). Liefert die aktualisierte Verwaltungssicht.
+async fn group_set_role(
+    State(st): State<AppState>,
+    axum::extract::Path(group_id): axum::extract::Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<SetRoleRequest>,
+) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return invalid_token(),
+        Err(()) => return internal(),
+    };
+    if !canonical_uuid(&group_id) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_group",
+            "group_id muss eine UUID in kanonischer Form sein",
+        );
+    }
+    match st
+        .groups
+        .set_role(&group_id, &who.handle, &req.target, req.role)
+        .await
+    {
+        Ok(meta) => (StatusCode::OK, Json(meta)).into_response(),
+        Err(error) => group_error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct TransferRequest {
+    target: String,
+}
+
+/// `POST /groups/{id}/transfer`: übergibt die Owner-Rolle. Nur der Owner.
+async fn group_transfer(
+    State(st): State<AppState>,
+    axum::extract::Path(group_id): axum::extract::Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<TransferRequest>,
+) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return invalid_token(),
+        Err(()) => return internal(),
+    };
+    if !canonical_uuid(&group_id) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_group",
+            "group_id muss eine UUID in kanonischer Form sein",
+        );
+    }
+    match st
+        .groups
+        .transfer_ownership(&group_id, &who.handle, &req.target)
+        .await
+    {
+        Ok(meta) => (StatusCode::OK, Json(meta)).into_response(),
+        Err(error) => group_error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateInfoRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    settings: Option<crate::groups::GroupSettings>,
+}
+
+/// `POST /groups/{id}/info`: ändert Name und/oder Einstellungen (nach
+/// info_policy, Standard nur Staff).
+async fn group_update_info(
+    State(st): State<AppState>,
+    axum::extract::Path(group_id): axum::extract::Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<UpdateInfoRequest>,
+) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return invalid_token(),
+        Err(()) => return internal(),
+    };
+    if !canonical_uuid(&group_id) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_group",
+            "group_id muss eine UUID in kanonischer Form sein",
+        );
+    }
+    if let Some(name) = &req.name {
+        if !valid_group_name(name) {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_name",
+                "Gruppenname: höchstens 128 Zeichen, keine Steuerzeichen",
+            );
+        }
+    }
+    match st
+        .groups
+        .update_info(
+            &group_id,
+            &who.handle,
+            req.name.as_deref().map(str::trim),
+            req.settings,
+        )
+        .await
+    {
+        Ok(meta) => (StatusCode::OK, Json(meta)).into_response(),
+        Err(error) => group_error_response(error),
     }
 }
 

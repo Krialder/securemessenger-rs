@@ -937,6 +937,107 @@ async fn commit_serializes_and_rejects_stale_epoch() {
 }
 
 #[tokio::test]
+async fn group_roles_name_and_announcement_enforced() {
+    let app = test_app();
+    // alice legt die Gruppe mit Namen an; sie wird Owner, bob Member.
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/groups",
+        Some(json!({ "group_id": GROUP_1, "name": "Team Alpha", "members": ["alice", "bob"] })),
+        Some("token-alice"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // /meta zeigt Name und Rollen; jeder Mitglied darf lesen.
+    let (status, meta) = send(
+        &app,
+        "GET",
+        &format!("/groups/{GROUP_1}/meta"),
+        None,
+        Some("token-bob"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{meta}");
+    assert_eq!(meta["name"], "Team Alpha");
+    let alice = meta["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["handle"] == "alice")
+        .unwrap();
+    assert_eq!(alice["role"], "owner");
+    let bob = meta["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["handle"] == "bob")
+        .unwrap();
+    assert_eq!(bob["role"], "member");
+
+    // Member bob darf niemanden befördern; Owner alice schon.
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/groups/{GROUP_1}/roles"),
+        Some(json!({ "target": "alice", "role": "member" })),
+        Some("token-bob"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "Member darf den Owner nicht degradieren"
+    );
+
+    // Announcement-Modus an: nur Staff darf senden. bob (Member) wird abgewiesen.
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/groups/{GROUP_1}/info"),
+        Some(json!({ "settings": { "invite_policy": "all", "announcement": true, "info_policy": "admins" } })),
+        Some("token-alice"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/groups/{GROUP_1}/messages"),
+        Some(json!({ "envelopes": [group_envelope(ENV_1, DEV_BOB)] })),
+        Some("token-bob"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "announcement_only");
+
+    // Owner befördert bob zu Admin; jetzt darf bob senden.
+    let (status, meta) = send(
+        &app,
+        "POST",
+        &format!("/groups/{GROUP_1}/roles"),
+        Some(json!({ "target": "bob", "role": "admin" })),
+        Some("token-alice"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{meta}");
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/groups/{GROUP_1}/messages"),
+        Some(json!({ "envelopes": [group_envelope(ENV_1, DEV_BOB)] })),
+        Some("token-bob"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "Admin darf im Announcement-Modus senden"
+    );
+}
+
+#[tokio::test]
 async fn group_routes_require_authentication() {
     let app = test_app();
     let (status, _) = send(

@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use delivery::domain::NewMessage;
-use delivery::groups::{GroupError, GroupStore};
+use delivery::groups::{CommitContext, GroupError, GroupStore, NewGroup};
 use delivery::pg::{connect_and_migrate, PgGroupStore, PgMessageStore};
 use delivery::store::MessageStore;
 use uuid::Uuid;
@@ -229,20 +229,41 @@ async fn concurrent_commits_serialize_over_postgres() {
     let group = Uuid::new_v4().to_string();
     let a = Uuid::new_v4().to_string();
     let b = Uuid::new_v4().to_string();
+    // a und b sind hier zugleich Handles (Rollen) und Geräte-IDs (Fan-out).
     store
-        .create_group(&group, &[a.clone(), b.clone()])
+        .create_group(
+            &group,
+            NewGroup {
+                name: "Team",
+                creator: &a,
+                member_handles: &[a.clone(), b.clone()],
+                devices: &[a.clone(), b.clone()],
+            },
+        )
         .await
         .unwrap();
 
-    // Vier Mitglieder committen gleichzeitig gegen Epoche 0.
+    // Vier Mitglieder committen gleichzeitig gegen Epoche 0; der Owner a
+    // fügt je einen Neuling hinzu (invite_policy Standard = alle dürfen).
     let mut tasks = Vec::new();
     for _ in 0..4 {
         let store = store.clone();
         let group = group.clone();
+        let a = a.clone();
         let newcomer = Uuid::new_v4().to_string();
         let members = vec![a.clone(), b.clone(), newcomer];
         tasks.push(tokio::spawn(async move {
-            store.commit(&group, 0, &members).await
+            store
+                .commit(
+                    &group,
+                    CommitContext {
+                        actor: &a,
+                        expected_epoch: 0,
+                        new_member_handles: &members,
+                        new_devices: &members,
+                    },
+                )
+                .await
         }));
     }
     let mut winners = 0;

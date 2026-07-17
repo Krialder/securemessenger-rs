@@ -18,7 +18,10 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::domain::{NewMessage, StoreOutcome, WaitingMessage};
-use crate::groups::{GroupError, GroupState, GroupStore};
+use crate::groups::{
+    apply_set_role, apply_transfer, apply_update_info, authorize_commit, dedup, CommitContext,
+    GroupError, GroupMeta, GroupRecord, GroupSettings, GroupState, GroupStore, NewGroup, Role,
+};
 use crate::store::{MessageStore, StoreError};
 
 /// Verbindet und führt die eingebetteten Migrationen aus. Scheitert das,
@@ -354,38 +357,126 @@ fn parse_group_uuid(value: &str) -> Result<Uuid, GroupError> {
     Uuid::try_parse(value).map_err(|e| GroupError::Backend(format!("keine UUID: {e}")))
 }
 
+/// Lädt den Vollzustand einer Gruppe innerhalb einer Transaktion mit
+/// Zeilensperre (`FOR UPDATE`), damit die Regel-Funktionen aus groups.rs
+/// darauf arbeiten und konkurrierende Änderungen serialisiert werden.
+async fn load_record(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    gid: Uuid,
+) -> Result<GroupRecord, GroupError> {
+    let row = sqlx::query("SELECT epoch, name, settings FROM groups WHERE id = $1 FOR UPDATE")
+        .bind(gid)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(group_backend)?;
+    let Some(row) = row else {
+        return Err(GroupError::UnknownGroup);
+    };
+    let epoch: i64 = row.get("epoch");
+    let name: String = row.get("name");
+    let settings_json: String = row.get("settings");
+    let settings: GroupSettings = serde_json::from_str(&settings_json).unwrap_or_default();
+    let devices: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT device_id FROM group_devices WHERE group_id = $1 ORDER BY device_id",
+    )
+    .bind(gid)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(group_backend)?;
+    let role_rows = sqlx::query("SELECT handle, role FROM group_roles WHERE group_id = $1")
+        .bind(gid)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(group_backend)?;
+    let mut roles = std::collections::HashMap::new();
+    for r in role_rows {
+        let handle: String = r.get("handle");
+        let role: String = r.get("role");
+        roles.insert(handle, Role::parse(&role).unwrap_or(Role::Member));
+    }
+    Ok(GroupRecord {
+        epoch: u64::try_from(epoch).unwrap_or(0),
+        devices: devices.into_iter().map(|d| d.to_string()).collect(),
+        name,
+        settings,
+        roles,
+    })
+}
+
+/// Schreibt die Rollen einer Gruppe vollständig neu (kleine Mengen). Muss zu
+/// den Handles der geänderten Mitgliedschaft passen.
+async fn persist_roles(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    gid: Uuid,
+    roles: &std::collections::HashMap<String, Role>,
+) -> Result<(), GroupError> {
+    sqlx::query("DELETE FROM group_roles WHERE group_id = $1")
+        .bind(gid)
+        .execute(&mut **tx)
+        .await
+        .map_err(group_backend)?;
+    for (handle, role) in roles {
+        sqlx::query("INSERT INTO group_roles (group_id, handle, role) VALUES ($1, $2, $3)")
+            .bind(gid)
+            .bind(handle)
+            .bind(role.as_str())
+            .execute(&mut **tx)
+            .await
+            .map_err(group_backend)?;
+    }
+    Ok(())
+}
+
+async fn persist_devices(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    gid: Uuid,
+    devices: &[String],
+) -> Result<(), GroupError> {
+    sqlx::query("DELETE FROM group_devices WHERE group_id = $1")
+        .bind(gid)
+        .execute(&mut **tx)
+        .await
+        .map_err(group_backend)?;
+    for device in devices {
+        let did = parse_group_uuid(device)?;
+        sqlx::query("INSERT INTO group_devices (group_id, device_id) VALUES ($1, $2)")
+            .bind(gid)
+            .bind(did)
+            .execute(&mut **tx)
+            .await
+            .map_err(group_backend)?;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl GroupStore for PgGroupStore {
-    async fn create_group(&self, group_id: &str, devices: &[String]) -> Result<(), GroupError> {
+    async fn create_group(&self, group_id: &str, new: NewGroup<'_>) -> Result<(), GroupError> {
         let gid = parse_group_uuid(group_id)?;
-        let mut device_uuids = Vec::with_capacity(devices.len());
-        for d in devices {
-            device_uuids.push(parse_group_uuid(d)?);
-        }
+        let settings_json = serde_json::to_string(&GroupSettings::default())
+            .map_err(|e| GroupError::Backend(e.to_string()))?;
         let mut tx = self.pool.begin().await.map_err(group_backend)?;
         let inserted = sqlx::query(
-            "INSERT INTO groups (id, epoch) VALUES ($1, 0) ON CONFLICT (id) DO NOTHING",
+            "INSERT INTO groups (id, epoch, name, settings) VALUES ($1, 0, $2, $3) \
+             ON CONFLICT (id) DO NOTHING",
         )
         .bind(gid)
+        .bind(new.name)
+        .bind(&settings_json)
         .execute(&mut *tx)
         .await
         .map_err(group_backend)?;
         if inserted.rows_affected() == 0 {
             return Err(GroupError::GroupExists);
         }
-        // Duplikate in der Eingabe fängt der Primärschlüssel; explizit
-        // deduplizieren erspart den ON-CONFLICT-Lärm.
-        let mut seen = std::collections::HashSet::new();
-        for device in device_uuids {
-            if seen.insert(device) {
-                sqlx::query("INSERT INTO group_devices (group_id, device_id) VALUES ($1, $2)")
-                    .bind(gid)
-                    .bind(device)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(group_backend)?;
-            }
+        persist_devices(&mut tx, gid, &dedup(new.devices)).await?;
+        // Rollen: Ersteller Owner, restliche Mitglieder Member.
+        let mut roles = std::collections::HashMap::new();
+        for handle in new.member_handles {
+            roles.insert(handle.clone(), Role::Member);
         }
+        roles.insert(new.creator.to_string(), Role::Owner);
+        persist_roles(&mut tx, gid, &roles).await?;
         tx.commit().await.map_err(group_backend)?;
         Ok(())
     }
@@ -413,57 +504,99 @@ impl GroupStore for PgGroupStore {
         })
     }
 
-    async fn commit(
-        &self,
-        group_id: &str,
-        expected_epoch: u64,
-        new_devices: &[String],
-    ) -> Result<u64, GroupError> {
+    async fn meta(&self, group_id: &str, reader: &str) -> Result<GroupMeta, GroupError> {
         let gid = parse_group_uuid(group_id)?;
-        let mut device_uuids = Vec::with_capacity(new_devices.len());
-        for d in new_devices {
-            device_uuids.push(parse_group_uuid(d)?);
+        let mut tx = self.pool.begin().await.map_err(group_backend)?;
+        let record = load_record(&mut tx, gid).await?;
+        record.require_member(reader)?;
+        Ok(record.meta())
+    }
+
+    async fn commit(&self, group_id: &str, ctx: CommitContext<'_>) -> Result<u64, GroupError> {
+        let gid = parse_group_uuid(group_id)?;
+        // Geräte-IDs früh validieren, bevor Zustand geändert wird.
+        for d in ctx.new_devices {
+            parse_group_uuid(d)?;
         }
         let mut tx = self.pool.begin().await.map_err(group_backend)?;
-        // Zeilensperre: konkurrierende Commits derselben Gruppe werden
-        // serialisiert, der zweite sieht die schon erhöhte Epoche.
-        let current: Option<i64> =
-            sqlx::query_scalar("SELECT epoch FROM groups WHERE id = $1 FOR UPDATE")
-                .bind(gid)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(group_backend)?;
-        let Some(current) = current else {
-            return Err(GroupError::UnknownGroup);
-        };
-        let current = u64::try_from(current).unwrap_or(0);
-        if current != expected_epoch {
-            return Err(GroupError::StaleEpoch { current });
+        let mut record = load_record(&mut tx, gid).await?;
+        if record.epoch != ctx.expected_epoch {
+            return Err(GroupError::StaleEpoch {
+                current: record.epoch,
+            });
         }
-        let next = current + 1;
+        let new_handles: std::collections::HashSet<String> =
+            ctx.new_member_handles.iter().cloned().collect();
+        authorize_commit(&record, ctx.actor, &new_handles)?;
+        record.roles.retain(|h, _| new_handles.contains(h));
+        for handle in &new_handles {
+            record.roles.entry(handle.clone()).or_insert(Role::Member);
+        }
+        record.epoch += 1;
         sqlx::query("UPDATE groups SET epoch = $2 WHERE id = $1")
             .bind(gid)
-            .bind(i64::try_from(next).unwrap_or(i64::MAX))
+            .bind(i64::try_from(record.epoch).unwrap_or(i64::MAX))
             .execute(&mut *tx)
             .await
             .map_err(group_backend)?;
-        sqlx::query("DELETE FROM group_devices WHERE group_id = $1")
-            .bind(gid)
-            .execute(&mut *tx)
-            .await
-            .map_err(group_backend)?;
-        let mut seen = std::collections::HashSet::new();
-        for device in device_uuids {
-            if seen.insert(device) {
-                sqlx::query("INSERT INTO group_devices (group_id, device_id) VALUES ($1, $2)")
-                    .bind(gid)
-                    .bind(device)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(group_backend)?;
-            }
-        }
+        persist_devices(&mut tx, gid, &dedup(ctx.new_devices)).await?;
+        persist_roles(&mut tx, gid, &record.roles).await?;
         tx.commit().await.map_err(group_backend)?;
-        Ok(next)
+        Ok(record.epoch)
+    }
+
+    async fn set_role(
+        &self,
+        group_id: &str,
+        actor: &str,
+        target: &str,
+        role: Role,
+    ) -> Result<GroupMeta, GroupError> {
+        let gid = parse_group_uuid(group_id)?;
+        let mut tx = self.pool.begin().await.map_err(group_backend)?;
+        let mut record = load_record(&mut tx, gid).await?;
+        apply_set_role(&mut record, actor, target, role)?;
+        persist_roles(&mut tx, gid, &record.roles).await?;
+        tx.commit().await.map_err(group_backend)?;
+        Ok(record.meta())
+    }
+
+    async fn transfer_ownership(
+        &self,
+        group_id: &str,
+        actor: &str,
+        target: &str,
+    ) -> Result<GroupMeta, GroupError> {
+        let gid = parse_group_uuid(group_id)?;
+        let mut tx = self.pool.begin().await.map_err(group_backend)?;
+        let mut record = load_record(&mut tx, gid).await?;
+        apply_transfer(&mut record, actor, target)?;
+        persist_roles(&mut tx, gid, &record.roles).await?;
+        tx.commit().await.map_err(group_backend)?;
+        Ok(record.meta())
+    }
+
+    async fn update_info(
+        &self,
+        group_id: &str,
+        actor: &str,
+        name: Option<&str>,
+        settings: Option<GroupSettings>,
+    ) -> Result<GroupMeta, GroupError> {
+        let gid = parse_group_uuid(group_id)?;
+        let mut tx = self.pool.begin().await.map_err(group_backend)?;
+        let mut record = load_record(&mut tx, gid).await?;
+        apply_update_info(&mut record, actor, name, settings)?;
+        let settings_json = serde_json::to_string(&record.settings)
+            .map_err(|e| GroupError::Backend(e.to_string()))?;
+        sqlx::query("UPDATE groups SET name = $2, settings = $3 WHERE id = $1")
+            .bind(gid)
+            .bind(&record.name)
+            .bind(&settings_json)
+            .execute(&mut *tx)
+            .await
+            .map_err(group_backend)?;
+        tx.commit().await.map_err(group_backend)?;
+        Ok(record.meta())
     }
 }
