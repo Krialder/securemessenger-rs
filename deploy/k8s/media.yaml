@@ -30,6 +30,8 @@ spec:
               value: "0.0.0.0:8080"
             - name: SERVICE_NAME
               value: "media"
+            - name: SM_ENV
+              value: "production"
             - name: RUST_LOG
               value: "info"
             - name: IDENTITY_URL

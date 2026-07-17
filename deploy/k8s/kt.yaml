@@ -35,6 +35,8 @@ spec:
               value: "0.0.0.0:8080"
             - name: SERVICE_NAME
               value: "kt"
+            - name: SM_ENV
+              value: "production"
             - name: RUST_LOG
               value: "info"
             - name: DATABASE_URL

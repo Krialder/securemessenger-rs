@@ -27,6 +27,8 @@ spec:
               value: "0.0.0.0:8080"
             - name: SERVICE_NAME
               value: "identity"
+            - name: SM_ENV
+              value: "production"
             - name: RUST_LOG
               value: "info"
             - name: DATABASE_URL
@@ -46,6 +48,22 @@ spec:
             # (F120); ohne INTERNAL_TOKEN bleiben die Meldungen aus.
             - name: KT_URL
               value: "http://kt"
+            # Reife Features, die ohne Konfiguration STILL aus sind:
+            # Sealed Sender (Trust-Root der Absender-Zertifikate), Contact
+            # Discovery (OPRF-Schluessel) und die Sybil-Bremse (PoW-Haerte).
+            - name: SEALED_SENDER_TRUST_ROOT
+              valueFrom:
+                secretKeyRef:
+                  name: identity-keys
+                  key: sealed-sender-trust-root
+            - name: CDS_OPRF_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: identity-keys
+                  key: cds-oprf-key
+            # PoW-Haerte: Tuning-Wert, kein Secret. Hoeher als der Demo-Wert 8.
+            - name: POW_DIFFICULTY
+              value: "12"
           livenessProbe:
             httpGet:
               path: /live

@@ -31,10 +31,17 @@ spec:
               value: "0.0.0.0:8080"
             - name: SERVICE_NAME
               value: "delivery"
+            - name: SM_ENV
+              value: "production"
             - name: RUST_LOG
               value: "info"
             - name: IDENTITY_URL
               value: "http://identity"
+            # Praesenz-Aenderungen an integrations melden (Webhooks). OHNE
+            # diesen Wert laeuft der Webhook-Pfad still als Noop, das Feature
+            # ist im Cluster faktisch abgeschaltet.
+            - name: INTEGRATIONS_URL
+              value: "http://integrations"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

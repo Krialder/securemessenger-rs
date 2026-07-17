@@ -28,6 +28,10 @@ spec:
               value: "0.0.0.0:8080"
             - name: SERVICE_NAME
               value: "integrations"
+            # Produktionsbetrieb: fehlende Pflicht-Secrets brechen den Start ab
+            # (kein stilles In-Memory/ephemer), und der Shutdown drainiert.
+            - name: SM_ENV
+              value: "production"
             - name: RUST_LOG
               value: "info"
             - name: IDENTITY_URL
@@ -44,6 +48,14 @@ spec:
                 secretKeyRef:
                   name: internal-token
                   key: token
+            # Ed25519-Signierschluessel der Webhooks. OHNE diesen Wert
+            # signierte jede Replik mit einem eigenen ephemeren Schluessel,
+            # und Empfaenger koennten die Signatur nicht stabil pruefen.
+            - name: INTEGRATIONS_WEBHOOK_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: integrations-webhook
+                  key: signing-key
           livenessProbe:
             httpGet:
               path: /live

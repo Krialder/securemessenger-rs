@@ -20,9 +20,39 @@ resources:
   - kt.yaml
   - keycloak.yaml
   - ingress.yaml
+  - pdb.yaml
   # Erzeugt die ConfigMap keycloak-realm aus dem versionierten Realm-Export
   # (ADR-0011). Als eigene Kustomization-Basis, weil configMapGenerator aus
   # Sicherheitsgruenden keine Dateien oberhalb des eigenen Verzeichnisses
   # laden darf; so bleibt der Export in deploy/keycloak, wo auch der lokale
   # Lauf ihn nutzt.
   - ../keycloak
+
+# Restriktiver securityContext fuer die eigenen Dienste (Pod Security
+# Standards "restricted"): als Nicht-Root, mit nur-lesbarem Wurzeldateisystem
+# (die Rust-Dienste schreiben nichts auf Platte, ihr Zustand liegt in
+# PostgreSQL/S3), ohne Privileg-Eskalation und ohne Linux-Capabilities. Als
+# ein Patch ueber alle sechs Dienste (containers/0 ist namensunabhaengig);
+# keycloak ist per Namensauswahl ausgenommen, weil sein Image ein
+# beschreibbares Dateisystem braucht.
+patches:
+  - target:
+      kind: Deployment
+      name: "identity|directory|delivery|integrations|media|kt"
+    patch: |-
+      - op: add
+        path: /spec/template/spec/securityContext
+        value:
+          runAsNonRoot: true
+          runAsUser: 65532
+          fsGroup: 65532
+          seccompProfile:
+            type: RuntimeDefault
+      - op: add
+        path: /spec/template/spec/containers/0/securityContext
+        value:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+              - ALL

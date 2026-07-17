@@ -1,0 +1,64 @@
+# PodDisruptionBudgets fuer die zwei-Replik-Dienste, die das 99,9%-Ziel
+# tragen (NF060). minAvailable: 1 heisst: eine freiwillige Stoerung (etwa
+# Node-Drain beim Cluster-Update) darf hoechstens eine Replik gleichzeitig
+# treffen, die zweite bleibt erreichbar. kt laeuft bewusst mit einer Replik
+# (Einzel-Schreiber des Epochen-Publishers) und bekommt daher kein PDB.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: identity
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: identity
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: directory
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: directory
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: delivery
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: delivery
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: integrations
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: integrations
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: media
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: media
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: keycloak
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: keycloak

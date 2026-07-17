@@ -4,19 +4,29 @@
 # führt der Weg ausschließlich über den Ingress, und der kennt die
 # /internal-Pfade nicht.
 #
+# Der Egress-Teil ist zugleich Defense-in-Depth gegen SSRF ueber die
+# Webhook-Ziel-URL von integrations: der App-Schicht-Schutz dort deckt
+# literale interne Ziele und folgt keinen Weiterleitungen, die Egress-Policy
+# deckt zusaetzlich den DNS-Rebinding-Fall (ein Name, der erst intern
+# aufloest), indem sie ausgehenden Verkehr in private Bereiche verbietet.
+#
 # [ANNAHME: der Ingress-Controller läuft im Namespace "ingress-nginx"
 # (Standard-Label des NGINX-Charts); die GitOps-Pipeline passt den
 # Selektor an die echte Installation an. mTLS je Aufrufer bleibt das
-# Ziel für die Service-Mesh-Etappe.]
+# Ziel für die Service-Mesh-Etappe. Laeuft PostgreSQL als externer
+# Operator auf einer PRIVATEN Adresse ausserhalb des Namespace, muss die
+# Pipeline dessen CIDR zur egress-Allow-Liste ergaenzen, sonst blockiert
+# die private-Bereich-Sperre die DB-Verbindung.]
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: services-ingress-only
+  name: services-network
 spec:
   # Gilt für alle Dienst-Pods im Namespace.
   podSelector: {}
   policyTypes:
     - Ingress
+    - Egress
   ingress:
     # Untereinander: identity <- directory/delivery/integrations/media,
     # delivery <- integrations, Keycloak <- alle.
@@ -27,3 +37,32 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: ingress-nginx
+  egress:
+    # DNS-Aufloesung (kube-dns), sonst loest kein Dienstname auf.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Untereinander im Namespace (Dienst-zu-Dienst; und die Datenbank,
+    # falls sie im Namespace laeuft).
+    - to:
+        - podSelector: {}
+    # Ausgehend ins Internet (Webhook-Ziele, OIDC-Discovery), ABER NICHT in
+    # interne/private Bereiche (SSRF-Defense-in-Depth gegen DNS-Rebinding).
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 127.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
