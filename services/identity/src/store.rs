@@ -514,7 +514,10 @@ mod tests {
     async fn revoke_marks_device_and_is_not_repeatable() {
         let store = InMemoryStore::default();
         store.create(account("alice"), device("d1")).await.unwrap();
-        store.add_device("alice", device("d2"), "key").await.unwrap();
+        store
+            .add_device("alice", device("d2"), "key")
+            .await
+            .unwrap();
         assert!(store.revoke_device("alice", "d2").await.is_ok());
         assert!(
             store
@@ -583,7 +586,10 @@ mod tests {
     async fn rotate_identity_replaces_key_and_credentials() {
         let store = InMemoryStore::default();
         store.create(account("frida"), device("d1")).await.unwrap();
-        store.add_device("frida", device("d2"), "key").await.unwrap();
+        store
+            .add_device("frida", device("d2"), "key")
+            .await
+            .unwrap();
 
         store
             .rotate_identity(
@@ -614,9 +620,7 @@ mod tests {
         );
 
         assert_eq!(
-            store
-                .rotate_identity("gibt-es-nicht", "x", "y", &[])
-                .await,
+            store.rotate_identity("gibt-es-nicht", "x", "y", &[]).await,
             Err(StoreError::AccountMissing)
         );
     }
@@ -654,7 +658,10 @@ mod tests {
     async fn rotate_identity_rejects_uncovered_device() {
         let store = InMemoryStore::default();
         store.create(account("frida"), device("d1")).await.unwrap();
-        store.add_device("frida", device("d2"), "key").await.unwrap();
+        store
+            .add_device("frida", device("d2"), "key")
+            .await
+            .unwrap();
         // d2 fehlt in der Liste.
         assert_eq!(
             store
@@ -679,7 +686,10 @@ mod tests {
     async fn rotate_identity_ignores_revoked_devices() {
         let store = InMemoryStore::default();
         store.create(account("frida"), device("d1")).await.unwrap();
-        store.add_device("frida", device("d2"), "key").await.unwrap();
+        store
+            .add_device("frida", device("d2"), "key")
+            .await
+            .unwrap();
         store.revoke_device("frida", "d2").await.unwrap();
         store
             .rotate_identity(

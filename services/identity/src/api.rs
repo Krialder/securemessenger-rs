@@ -1263,11 +1263,8 @@ async fn rotate_identity(
         Ok(devices) => devices.into_iter().filter(|d| !d.revoked).collect(),
         Err(error) => return store_failure(error),
     };
-    let provided: std::collections::HashMap<&str, &RotateDeviceCredential> = req
-        .devices
-        .iter()
-        .map(|d| (d.id.as_str(), d))
-        .collect();
+    let provided: std::collections::HashMap<&str, &RotateDeviceCredential> =
+        req.devices.iter().map(|d| (d.id.as_str(), d)).collect();
     let now = now_unix();
     for device in &current {
         let Some(entry) = provided.get(device.id.as_str()) else {

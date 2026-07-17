@@ -105,7 +105,10 @@ async fn deletion_schedule_cancel_and_purge() {
     let handle = unique_handle("pg-loeschen");
     let first = device(30);
     store.create(account(&handle), first.clone()).await.unwrap();
-    store.add_device(&handle, device(31), &b64(1)).await.unwrap();
+    store
+        .add_device(&handle, device(31), &b64(1))
+        .await
+        .unwrap();
 
     // Vormerken: die Frist kommt als Unix-Sekunden zurück (TIMESTAMPTZ ->
     // Epoche), das Konto bleibt.
@@ -175,7 +178,10 @@ async fn device_lifecycle() {
 
     let second = device(21);
     // Server vergibt die Protokollnummer: erstes Gerät 1, zweites 2.
-    assert_eq!(store.add_device(&handle, second.clone(), &b64(1)).await, Ok(2));
+    assert_eq!(
+        store.add_device(&handle, second.clone(), &b64(1)).await,
+        Ok(2)
+    );
     let after_add = store.devices(&handle).await.unwrap();
     assert_eq!(after_add[0].protocol_device_id, 1);
     assert_eq!(after_add[1].protocol_device_id, 2);
@@ -206,7 +212,10 @@ async fn device_lifecycle() {
     // Replay-Schutz: die ID bleibt auch nach Revocation vergeben.
     let mut replay = device(23);
     replay.id = second.id.clone();
-    let err = store.add_device(&handle, replay, &b64(1)).await.unwrap_err();
+    let err = store
+        .add_device(&handle, replay, &b64(1))
+        .await
+        .unwrap_err();
     assert_eq!(err, StoreError::DeviceIdTaken);
 
     // Keine UUID: kann nicht existieren, aber kein Fehler.
@@ -244,7 +253,10 @@ async fn rotate_identity_over_postgres() {
             .await,
         Err(StoreError::ConcurrentUpdate)
     );
-    assert_eq!(store.get(&handle).await.unwrap().unwrap().identity_key, b64(1));
+    assert_eq!(
+        store.get(&handle).await.unwrap().unwrap().identity_key,
+        b64(1)
+    );
 
     // Ein nicht-revoziertes Gerät fehlt in der Liste: abgelehnt, kein halb
     // rotiertes Konto.
@@ -259,7 +271,10 @@ async fn rotate_identity_over_postgres() {
             .await,
         Err(StoreError::ConcurrentUpdate)
     );
-    assert_eq!(store.get(&handle).await.unwrap().unwrap().identity_key, b64(1));
+    assert_eq!(
+        store.get(&handle).await.unwrap().unwrap().identity_key,
+        b64(1)
+    );
 
     // Vollständig und mit korrektem Altschlüssel: Schlüssel, Credentials und
     // Ablauf werden gesetzt.
@@ -275,7 +290,10 @@ async fn rotate_identity_over_postgres() {
         )
         .await
         .unwrap();
-    assert_eq!(store.get(&handle).await.unwrap().unwrap().identity_key, b64(9));
+    assert_eq!(
+        store.get(&handle).await.unwrap().unwrap().identity_key,
+        b64(9)
+    );
     let devices = store.devices(&handle).await.unwrap();
     let d1 = devices.iter().find(|d| d.id == first.id).unwrap();
     assert_eq!(d1.credential, b64(60));
@@ -294,7 +312,10 @@ async fn rotate_identity_over_postgres() {
         )
         .await
         .unwrap();
-    assert_eq!(store.get(&handle).await.unwrap().unwrap().identity_key, b64(12));
+    assert_eq!(
+        store.get(&handle).await.unwrap().unwrap().identity_key,
+        b64(12)
+    );
 
     // Unbekanntes Konto bleibt ein eigener Fehler.
     assert_eq!(
