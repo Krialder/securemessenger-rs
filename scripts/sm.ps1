@@ -101,6 +101,10 @@ if ($Setup) {
             Write-Bad "$($c.Name): offen ($($after.Detail))"
         }
     }
+    # Model Runner auch dann abschalten, wenn der Daemon schon lief (dann rief
+    # die Komponenten-Schleife den daemon-Fix nie auf): die Ursache der
+    # wiederkehrenden Docker-Abstuerze bleibt so dauerhaft aus.
+    if (Test-SmDockerDaemon) { Disable-SmModelRunner }
     if ($allOk) {
         Write-Host "`nEinrichtung abgeschlossen. Starten mit: scripts\sm.ps1 (oder Doppelklick auf SecureMessenger.cmd)." -ForegroundColor White
     } else {
@@ -130,8 +134,30 @@ $trunkExe = Join-Path $cargoBin 'trunk.exe'
 foreach ($tool in 'cargo', 'docker') {
     if (-not (Have $tool)) { Write-Bad "$tool fehlt; zuerst scripts\sm.ps1 -Setup ausfuehren"; exit 1 }
 }
-try { docker info *> $null } catch {}
-if ($LASTEXITCODE -ne 0) { Write-Bad 'Docker-Daemon nicht erreichbar; zuerst scripts\sm.ps1 -Setup ausfuehren'; exit 1 }
+
+# Die geteilte Pruef-/Reparatur-Bibliothek einbinden, damit der Start
+# dieselbe robuste Logik nutzt wie -Setup: einen abgestuerzten Docker-Daemon
+# wiederbeleben (verwaiste Sockets aufraeumen, Docker Desktop starten,
+# warten) und den sm-postgres-Container bei Bedarf anlegen, statt nur
+# abzubrechen. Genau dieser Selbstheil-Schritt fehlte bisher: fiel Docker
+# Desktop zwischendurch aus, scheiterte der Start mit einem Hinweis auf
+# -Setup, statt sich selbst zu erholen.
+. (Join-Path $scriptsDir 'lib-checks.ps1')
+$healLog = { param($t) Write-Host "        $t" -ForegroundColor DarkGray }
+$smComponents = Get-SmComponents
+$daemonComp = $smComponents | Where-Object { $_.Key -eq 'daemon' }
+$pgComp = $smComponents | Where-Object { $_.Key -eq 'postgres' }
+
+if (-not (Test-SmDockerDaemon)) {
+    Write-Step 'Docker-Daemon nicht erreichbar, belebe ihn wieder'
+    [void](& $daemonComp.Fix $healLog)
+}
+if (-not (Test-SmDockerDaemon)) {
+    Write-Bad 'Docker-Daemon liess sich nicht starten; Docker Desktop pruefen (docker desktop status).'
+    exit 1
+}
+# Ursache der wiederkehrenden Abstuerze klein halten: Model Runner aus.
+Disable-SmModelRunner
 
 # Deterministische Demo-Schluessel (32 Bytes je Wert, Base64). NUR fuer die
 # Vorfuehrung; in jeder echten Umgebung kommen sie aus einem Secret-Store.
@@ -143,10 +169,15 @@ $sealedRoot    = DemoKey 4
 $webhookKey    = DemoKey 5
 $internalToken = 'demo-internes-secret'
 
-# 1. Datenbanken
+# 1. Datenbanken: den sm-postgres-Container ueber die geteilte Reparatur
+# sicherstellen (legt ihn an, wenn er fehlt, startet ihn, wenn er gestoppt
+# ist, wartet auf pg_isready). Frueher nur 'docker start sm-postgres', was
+# scheiterte, wenn der Container gar nicht existierte.
 Write-Step 'Demo-Datenbanken (sm-postgres)'
 $databases = @('demo_identity', 'demo_directory', 'demo_delivery', 'demo_kt', 'demo_integrations')
-docker start sm-postgres *> $null
+if ((Test-SmComponent $pgComp).State -ne 'ok') {
+    [void](& $pgComp.Fix $healLog)
+}
 $ready = $false
 for ($i = 0; $i -lt 30; $i++) {
     docker exec sm-postgres pg_isready -U postgres *> $null

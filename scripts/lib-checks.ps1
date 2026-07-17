@@ -50,6 +50,22 @@ function Test-SmDockerDaemon {
     return ($LASTEXITCODE -eq 0)
 }
 
+# Docker Desktops Model Runner (Inference) legt die kaputten Sockets an, die
+# den Daemon unter Windows immer wieder sterben lassen (siehe
+# Clear-SmStaleDockerSockets). Der unterstuetzte, umkehrbare Weg ihn
+# abzuschalten ist `docker desktop disable model-runner`; das haelt die
+# Ursache klein statt nur das Symptom aufzuraeumen. Idempotent und
+# best-effort: aeltere Docker-Versionen kennen den Befehl nicht, das ist
+# dann ein harmloser No-op. Rueckgaengig per `docker desktop enable
+# model-runner` oder in den Einstellungen unter AI.
+function Disable-SmModelRunner {
+    if (-not (Test-SmHave 'docker')) { return }
+    # Gibt es die Docker-Desktop-CLI mit dem disable-Zweig ueberhaupt?
+    docker desktop disable --help *> $null
+    if ($LASTEXITCODE -ne 0) { return }
+    docker desktop disable model-runner *> $null
+}
+
 # Verwaiste Socket-Dateien hart beendeter Docker-Laeufe (kaputte Reparse
 # Points unter Docker\run) lassen den Daemon-Start mit "The file cannot be
 # accessed by the system" sterben; der Inference-Manager legt sie auch bei
@@ -360,7 +376,13 @@ function Get-SmComponents {
             Start-Process $dd | Out-Null
             for ($i = 0; $i -lt 90; $i++) {
                 Start-Sleep -Seconds 2
-                if (Test-SmDockerDaemon) { & $log 'Docker-Daemon laeuft jetzt.'; return $true }
+                if (Test-SmDockerDaemon) {
+                    & $log 'Docker-Daemon laeuft jetzt.'
+                    # Model Runner abschalten, sobald der Daemon steht: er ist
+                    # die Ursache der wiederkehrenden Socket-Abstuerze.
+                    Disable-SmModelRunner
+                    return $true
+                }
             }
             & $log 'Daemon nicht rechtzeitig bereit; Docker Desktop manuell pruefen.'
             return $false
