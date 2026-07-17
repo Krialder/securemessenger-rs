@@ -11,6 +11,7 @@
 pub mod api;
 pub mod auth;
 pub mod domain;
+pub mod outbox;
 pub mod pg;
 pub mod realtime_client;
 pub mod store;

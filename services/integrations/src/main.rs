@@ -76,6 +76,10 @@ async fn main() {
             .unwrap_or(false),
     );
 
+    // Outbox-Worker starten, bevor der State in den Router wandert: er liefert
+    // die von /internal/presence-event eingereihten Webhooks mit Wiederholung.
+    state.spawn_outbox_worker();
+
     let router = app(state);
 
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr)

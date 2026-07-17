@@ -4,7 +4,9 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
-use crate::domain::{event_required_scope, Tenant, WebhookEndpoint};
+use crate::domain::{
+    event_required_scope, OutboxDelivery, Tenant, WebhookEndpoint, MAX_DELIVERY_ATTEMPTS,
+};
 use crate::store::{NewTenant, StoreError, TenantStore};
 
 use async_trait::async_trait;
@@ -41,6 +43,18 @@ fn backend(err: sqlx::Error) -> StoreError {
 fn parse_uuid(value: &str, what: &str) -> Result<Uuid, StoreError> {
     // Die UUIDs erzeugt api.rs beim Anlegen; unparsebar hieße Programmierfehler.
     Uuid::try_parse(value).map_err(|_| StoreError::Backend(format!("{what} ist keine UUID")))
+}
+
+fn row_to_outbox(row: &sqlx::postgres::PgRow) -> OutboxDelivery {
+    let id: Uuid = row.get("id");
+    let attempts: i32 = row.get("attempts");
+    OutboxDelivery {
+        id: id.to_string(),
+        url: row.get("url"),
+        event_type: row.get("event_type"),
+        body: row.get("body"),
+        attempts: attempts.max(0) as u32,
+    }
 }
 
 fn row_to_webhook(row: &sqlx::postgres::PgRow) -> WebhookEndpoint {
@@ -251,5 +265,69 @@ impl TenantStore for PgTenantStore {
         .await
         .map_err(backend)?;
         Ok(rows.iter().map(row_to_webhook).collect())
+    }
+
+    async fn enqueue_webhook_delivery(&self, delivery: OutboxDelivery) -> Result<(), StoreError> {
+        let id = parse_uuid(&delivery.id, "Zustell-ID")?;
+        sqlx::query(
+            "INSERT INTO integration_webhook_outbox (id, url, event_type, body) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(id)
+        .bind(&delivery.url)
+        .bind(&delivery.event_type)
+        .bind(&delivery.body)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn claim_due_deliveries(&self, limit: usize) -> Result<Vec<OutboxDelivery>, StoreError> {
+        // In EINER Anweisung faellige Zeilen sperren (FOR UPDATE SKIP LOCKED,
+        // damit sich mehrere Repliken die Outbox teilen), die Versuchszahl
+        // erhoehen und den naechsten Backoff einplanen (Claim-Lease). Der
+        // Backoff-Ausdruck spiegelt domain::delivery_backoff_secs: LEAST(10 *
+        // 2^attempts_alt, 3600), attempts_alt = attempts VOR dem UPDATE.
+        let rows = sqlx::query(
+            "UPDATE integration_webhook_outbox \
+             SET attempts = attempts + 1, \
+                 next_attempt_at = now() + make_interval(secs => LEAST(10.0 * pow(2, attempts), 3600.0)) \
+             WHERE id IN ( \
+                 SELECT id FROM integration_webhook_outbox \
+                 WHERE delivered_at IS NULL AND next_attempt_at <= now() AND attempts < $1 \
+                 ORDER BY next_attempt_at \
+                 LIMIT $2 \
+                 FOR UPDATE SKIP LOCKED \
+             ) \
+             RETURNING id, url, event_type, body, attempts",
+        )
+        .bind(MAX_DELIVERY_ATTEMPTS as i32)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(rows.iter().map(row_to_outbox).collect())
+    }
+
+    async fn mark_delivery_done(&self, id: &str) -> Result<(), StoreError> {
+        let uuid = parse_uuid(id, "Zustell-ID")?;
+        sqlx::query("UPDATE integration_webhook_outbox SET delivered_at = now() WHERE id = $1")
+            .bind(uuid)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn mark_delivery_error(&self, id: &str, error: &str) -> Result<(), StoreError> {
+        let uuid = parse_uuid(id, "Zustell-ID")?;
+        sqlx::query("UPDATE integration_webhook_outbox SET last_error = $2 WHERE id = $1")
+            .bind(uuid)
+            .bind(error)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(())
     }
 }

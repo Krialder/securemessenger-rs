@@ -16,9 +16,11 @@ use axum::Router;
 use common::identity_client::{AccountDevices, CallerIdentity, DeviceInfo, IdentityGateway};
 use http_body_util::BodyExt;
 use integrations::api::{app, AppState};
+use integrations::domain::OutboxDelivery;
+use integrations::outbox;
 use integrations::realtime_client::RealtimeGateway;
-use integrations::store::InMemoryTenantStore;
-use integrations::webhook::{Delivery, WebhookSender};
+use integrations::store::{InMemoryTenantStore, TenantStore};
+use integrations::webhook::{Delivery, WebhookSender, WebhookSigner};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -85,12 +87,17 @@ impl RealtimeGateway for FakeRealtime {
 #[derive(Default)]
 struct FakeWebhookSender {
     sent: Mutex<Vec<Delivery>>,
+    /// Wenn gesetzt, schlaegt jede Zustellung fehl (fuer den Retry-Test).
+    fail: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
 impl WebhookSender for FakeWebhookSender {
     async fn deliver(&self, delivery: Delivery) -> Result<(), String> {
         self.sent.lock().unwrap().push(delivery);
+        if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("Empfaenger nicht erreichbar".to_string());
+        }
         Ok(())
     }
 }
@@ -132,16 +139,24 @@ fn test_app() -> (Router, Arc<FakeRealtime>) {
 }
 
 /// Wie test_app, aber mit einem Fake-Webhook-Sender, den der Test einsieht.
-fn test_app_with_webhooks() -> (Router, Arc<FakeWebhookSender>) {
+fn test_app_with_webhooks() -> (
+    Router,
+    Arc<dyn TenantStore>,
+    Arc<WebhookSigner>,
+    Arc<FakeWebhookSender>,
+) {
+    let store: Arc<dyn TenantStore> = Arc::new(InMemoryTenantStore::default());
+    let signer = Arc::new(WebhookSigner::ephemeral());
     let sender = Arc::new(FakeWebhookSender::default());
     let state = AppState::new(
-        Arc::new(InMemoryTenantStore::default()),
+        store.clone(),
         Arc::new(fake_identity()),
         Arc::new(FakeRealtime::default()),
     )
     .with_internal_token("dienst-geheim")
+    .with_webhook_signer(signer.clone())
     .with_webhook_sender(sender.clone());
-    (app(state), sender)
+    (app(state), store, signer, sender)
 }
 
 async fn send(
@@ -674,7 +689,7 @@ async fn webhook_registration_and_presence_fanout() {
     use base64::Engine as _;
     use ed25519_dalek::{Verifier, VerifyingKey};
 
-    let (app, sender) = test_app_with_webhooks();
+    let (app, store, signer, sender) = test_app_with_webhooks();
     let (_, _, token) = provision_tenant(&app, "azubi-os", json!(["notify", "presence"])).await;
 
     // Der oeffentliche Schluessel ist ohne Auth abrufbar.
@@ -713,7 +728,7 @@ async fn webhook_registration_and_presence_fanout() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(list.as_array().unwrap().len(), 1);
 
-    // Praesenz-Ereignis fuer kai (mit Uebergangs-Nummer) -> eine Zustellung.
+    // Praesenz-Ereignis fuer kai (mit Uebergangs-Nummer) -> in die Outbox.
     let (status, res) = send(
         &app,
         "POST",
@@ -725,7 +740,12 @@ async fn webhook_registration_and_presence_fanout() {
     .await;
     assert_eq!(status, StatusCode::OK, "{res}");
     assert_eq!(res["matched"], 1);
-    assert_eq!(res["delivered"], 1);
+    assert_eq!(res["enqueued"], 1);
+
+    // Der Worker liefert die eingereihte Zustellung aus (hier ein Durchlauf).
+    let dyn_sender: Arc<dyn WebhookSender> = sender.clone();
+    let delivered = outbox::drain_once(&store, &signer, &dyn_sender, 10).await;
+    assert_eq!(delivered, 1);
 
     {
         let deliveries = sender.sent.lock().unwrap();
@@ -817,8 +837,47 @@ async fn webhook_allows_local_target_only_with_flag() {
 }
 
 #[tokio::test]
+async fn outbox_failed_delivery_is_retained_and_rescheduled() {
+    let store: Arc<dyn TenantStore> = Arc::new(InMemoryTenantStore::default());
+    let signer = Arc::new(WebhookSigner::ephemeral());
+    let sender = Arc::new(FakeWebhookSender::default());
+    sender
+        .fail
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    store
+        .enqueue_webhook_delivery(OutboxDelivery {
+            id: "11111111-1111-4111-8111-111111111111".to_string(),
+            url: "https://azubios.example/hook".to_string(),
+            event_type: "presence.changed".to_string(),
+            body: b"{\"id\":\"x\"}".to_vec(),
+            attempts: 0,
+        })
+        .await
+        .unwrap();
+
+    // Erster Durchlauf: der Empfaenger scheitert -> 0 zugestellt, aber der
+    // Versuch ging raus (der Envelope wurde gesendet).
+    let dyn_sender: Arc<dyn WebhookSender> = sender.clone();
+    let delivered = outbox::drain_once(&store, &signer, &dyn_sender, 10).await;
+    assert_eq!(delivered, 0);
+    assert_eq!(sender.sent.lock().unwrap().len(), 1);
+
+    // Sofort erneut: nichts faellig (der naechste Versuch ist per Backoff
+    // eingeplant). Die Zeile ist NICHT verloren und wird NICHT heiss
+    // wiederholt.
+    let again = outbox::drain_once(&store, &signer, &dyn_sender, 10).await;
+    assert_eq!(again, 0);
+    assert_eq!(
+        sender.sent.lock().unwrap().len(),
+        1,
+        "kein sofortiger Wieder-Versuch (Backoff)"
+    );
+}
+
+#[tokio::test]
 async fn webhook_requires_scope_and_isolates_tenants() {
-    let (app, _sender) = test_app_with_webhooks();
+    let (app, _store, _signer, _sender) = test_app_with_webhooks();
     let (_, _, notify_only) = provision_tenant(&app, "nur-notify", json!(["notify"])).await;
     let (_, _, other) = provision_tenant(&app, "anderes", json!(["notify", "presence"])).await;
 

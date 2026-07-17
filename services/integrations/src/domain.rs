@@ -87,3 +87,30 @@ impl WebhookEndpoint {
         self.events.iter().any(|e| e == event) && self.handles.iter().any(|h| h == handle)
     }
 }
+
+/// Hoechstzahl Zustellversuche je Webhook-Ereignis; danach bleibt die
+/// Outbox-Zeile als Dead Letter liegen (nicht zugestellt, attempts = MAX).
+pub const MAX_DELIVERY_ATTEMPTS: u32 = 12;
+
+/// Backoff in Sekunden nach dem `attempt`-ten Versuch (1-basiert): 10, 20,
+/// 40, ... gedeckelt bei einer Stunde. Dieselbe Formel bildet der
+/// PostgreSQL-Claim nach, damit In-Memory und PG gleich takten.
+pub fn delivery_backoff_secs(attempt: u32) -> u64 {
+    let exponent = attempt.saturating_sub(1).min(20);
+    10u64.saturating_mul(1u64 << exponent).min(3600)
+}
+
+/// Eine eingereihte Webhook-Zustellung (eine Outbox-Zeile), wie der Worker
+/// sie zum Senden bekommt. Die Signatur steht bewusst NICHT drin: der Worker
+/// signiert `body` je Versuch mit frischem Zeitstempel neu.
+#[derive(Debug, Clone)]
+pub struct OutboxDelivery {
+    /// Zugleich die Envelope-id (Dedup beim Empfaenger).
+    pub id: String,
+    pub url: String,
+    pub event_type: String,
+    /// Der signierte JSON-Koerper (mit stabiler id und created_at).
+    pub body: Vec<u8>,
+    /// Bisherige Versuche (nach dem Claim inklusive des laufenden).
+    pub attempts: u32,
+}

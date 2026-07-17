@@ -9,7 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 
-use crate::domain::{event_required_scope, Tenant, WebhookEndpoint};
+use crate::domain::{
+    delivery_backoff_secs, event_required_scope, OutboxDelivery, Tenant, WebhookEndpoint,
+    MAX_DELIVERY_ATTEMPTS,
+};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -100,6 +103,23 @@ pub trait TenantStore: Send + Sync {
         handle: &str,
         event: &str,
     ) -> Result<Vec<WebhookEndpoint>, StoreError>;
+
+    /// Reiht eine Zustellung in die Outbox ein (faellig sofort).
+    async fn enqueue_webhook_delivery(&self, delivery: OutboxDelivery) -> Result<(), StoreError>;
+
+    /// Nimmt bis zu `limit` faellige, noch nicht zugestellte Zustellungen in
+    /// Besitz: erhoeht ihre Versuchszahl und verschiebt sie auf den naechsten
+    /// Backoff (damit kein zweiter Worker sie parallel greift), und gibt sie
+    /// zum Senden zurueck. Zeilen mit `attempts >= MAX_DELIVERY_ATTEMPTS`
+    /// bleiben liegen (Dead Letter).
+    async fn claim_due_deliveries(&self, limit: usize) -> Result<Vec<OutboxDelivery>, StoreError>;
+
+    /// Markiert eine Zustellung als erledigt.
+    async fn mark_delivery_done(&self, id: &str) -> Result<(), StoreError>;
+
+    /// Vermerkt den letzten Fehler (der naechste Versuch ist schon beim
+    /// Claim eingeplant); nur fuer die Nachvollziehbarkeit.
+    async fn mark_delivery_error(&self, id: &str, error: &str) -> Result<(), StoreError>;
 }
 
 fn now_epoch() -> u64 {
@@ -117,6 +137,17 @@ struct TokenRecord {
     expires_at: u64,
 }
 
+/// Eine Outbox-Zeile im Prozessspeicher.
+struct OutboxRecord {
+    url: String,
+    event_type: String,
+    body: Vec<u8>,
+    attempts: u32,
+    next_attempt_at: u64,
+    delivered: bool,
+    last_error: Option<String>,
+}
+
 #[derive(Default)]
 struct Inner {
     /// client_id -> (Tenant, secret_hash)
@@ -125,6 +156,8 @@ struct Inner {
     tokens: HashMap<String, TokenRecord>,
     /// webhook-id -> Endpunkt
     webhooks: HashMap<String, WebhookEndpoint>,
+    /// delivery-id -> Outbox-Zeile
+    outbox: HashMap<String, OutboxRecord>,
 }
 
 /// Prozesslokale Umsetzung für Entwicklung und Tests.
@@ -286,6 +319,71 @@ impl TenantStore for InMemoryTenantStore {
             })
             .cloned()
             .collect())
+    }
+
+    async fn enqueue_webhook_delivery(&self, delivery: OutboxDelivery) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().expect("Lock nicht vergiftet");
+        inner.outbox.insert(
+            delivery.id,
+            OutboxRecord {
+                url: delivery.url,
+                event_type: delivery.event_type,
+                body: delivery.body,
+                attempts: 0,
+                next_attempt_at: now_epoch(),
+                delivered: false,
+                last_error: None,
+            },
+        );
+        Ok(())
+    }
+
+    async fn claim_due_deliveries(&self, limit: usize) -> Result<Vec<OutboxDelivery>, StoreError> {
+        let mut inner = self.inner.lock().expect("Lock nicht vergiftet");
+        let now = now_epoch();
+        // Faellige Zeilen, aelteste (frueheste next_attempt_at) zuerst.
+        let mut due: Vec<(String, u64)> = inner
+            .outbox
+            .iter()
+            .filter(|(_, r)| {
+                !r.delivered && r.next_attempt_at <= now && r.attempts < MAX_DELIVERY_ATTEMPTS
+            })
+            .map(|(id, r)| (id.clone(), r.next_attempt_at))
+            .collect();
+        due.sort_by_key(|(_, next)| *next);
+        let mut claimed = Vec::new();
+        for (id, _) in due.into_iter().take(limit) {
+            if let Some(record) = inner.outbox.get_mut(&id) {
+                record.attempts += 1;
+                // Naechsten Versuch schon einplanen (Claim-Lease = Backoff),
+                // damit kein zweiter Durchlauf dieselbe Zeile greift.
+                record.next_attempt_at = now + delivery_backoff_secs(record.attempts);
+                claimed.push(OutboxDelivery {
+                    id: id.clone(),
+                    url: record.url.clone(),
+                    event_type: record.event_type.clone(),
+                    body: record.body.clone(),
+                    attempts: record.attempts,
+                });
+            }
+        }
+        Ok(claimed)
+    }
+
+    async fn mark_delivery_done(&self, id: &str) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().expect("Lock nicht vergiftet");
+        if let Some(record) = inner.outbox.get_mut(id) {
+            record.delivered = true;
+        }
+        Ok(())
+    }
+
+    async fn mark_delivery_error(&self, id: &str, error: &str) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().expect("Lock nicht vergiftet");
+        if let Some(record) = inner.outbox.get_mut(id) {
+            record.last_error = Some(error.to_string());
+        }
+        Ok(())
     }
 }
 

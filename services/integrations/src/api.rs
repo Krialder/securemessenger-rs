@@ -31,12 +31,12 @@ use sha2::{Digest, Sha256};
 
 use crate::auth;
 use crate::domain::{
-    event_required_scope, Tenant, WebhookEndpoint, EVENT_PRESENCE_CHANGED, KNOWN_SCOPES,
-    KNOWN_WEBHOOK_EVENTS, SCOPE_NOTIFY, SCOPE_PRESENCE,
+    event_required_scope, OutboxDelivery, Tenant, WebhookEndpoint, EVENT_PRESENCE_CHANGED,
+    KNOWN_SCOPES, KNOWN_WEBHOOK_EVENTS, SCOPE_NOTIFY, SCOPE_PRESENCE,
 };
 use crate::realtime_client::RealtimeGateway;
 use crate::store::{NewTenant, StoreError, TenantStore};
-use crate::webhook::{Delivery, HttpWebhookSender, WebhookSender, WebhookSigner};
+use crate::webhook::{HttpWebhookSender, WebhookSender, WebhookSigner};
 use common::identity_client::IdentityGateway;
 use common::rate::RateLimiter;
 
@@ -117,6 +117,16 @@ impl AppState {
     pub fn with_webhook_sender(mut self, sender: Arc<dyn WebhookSender>) -> Self {
         self.webhook_sender = sender;
         self
+    }
+
+    /// Startet den Outbox-Worker (liefert eingereihte Webhooks mit
+    /// Wiederholung aus). In main nach dem Bau des State aufrufen.
+    pub fn spawn_outbox_worker(&self) {
+        crate::outbox::spawn_worker(
+            self.store.clone(),
+            self.webhook_signer.clone(),
+            self.webhook_sender.clone(),
+        );
     }
 }
 
@@ -871,9 +881,11 @@ async fn presence_event(
     };
     let matched = subscribers.len();
     let now = now_epoch();
-    // Nebenlaeufig zustellen: ein langsamer oder haengender Empfaenger haelt
-    // die anderen nicht auf (der Timeout des Senders deckelt jede Zustellung).
-    let mut set = tokio::task::JoinSet::new();
+    // In die Outbox einreihen (nicht direkt senden): der Hintergrund-Worker
+    // liefert mit Wiederholung aus (mindestens einmal). Der Envelope-Koerper
+    // wird jetzt gebaut (stabile id und created_at), signiert wird je Versuch
+    // im Worker neu. Ein nicht erreichbarer Empfaenger verliert kein Ereignis.
+    let mut enqueued = 0u32;
     for endpoint in subscribers {
         let delivery_id = uuid::Uuid::new_v4().to_string();
         let envelope = json!({
@@ -884,31 +896,21 @@ async fn presence_event(
             "data": { "handle": &req.handle, "online": req.online, "seq": req.seq },
         });
         let body = serde_json::to_vec(&envelope).unwrap_or_default();
-        let signature = st.webhook_signer.sign(now, &body);
-        let delivery = Delivery {
+        let delivery = OutboxDelivery {
+            id: delivery_id,
             url: endpoint.url,
-            event: EVENT_PRESENCE_CHANGED.to_string(),
-            delivery_id,
-            timestamp: now,
-            signature,
+            event_type: EVENT_PRESENCE_CHANGED.to_string(),
             body,
+            attempts: 0,
         };
-        let sender = st.webhook_sender.clone();
-        set.spawn(async move { sender.deliver(delivery).await });
-    }
-    let mut delivered = 0u32;
-    while let Some(joined) = set.join_next().await {
-        match joined {
-            Ok(Ok(())) => delivered += 1,
-            // Best effort: ein nicht erreichbarer Empfaenger haelt die anderen
-            // nicht auf (kein Retry in dieser Etappe, siehe ADR-Folgepunkt).
-            Ok(Err(error)) => tracing::warn!(%error, "Webhook-Zustellung fehlgeschlagen"),
-            Err(join_error) => tracing::warn!(%join_error, "Webhook-Task abgebrochen"),
+        match st.store.enqueue_webhook_delivery(delivery).await {
+            Ok(()) => enqueued += 1,
+            Err(error) => tracing::error!(%error, "Outbox-Einreihung fehlgeschlagen"),
         }
     }
     (
         StatusCode::OK,
-        Json(json!({ "matched": matched, "delivered": delivered })),
+        Json(json!({ "matched": matched, "enqueued": enqueued })),
     )
         .into_response()
 }

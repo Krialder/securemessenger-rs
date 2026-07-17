@@ -5,7 +5,7 @@
 //! übersprungen. Die Tests räumen nicht auf, sondern nutzen eindeutige
 //! Namen pro Lauf.
 
-use integrations::domain::WebhookEndpoint;
+use integrations::domain::{OutboxDelivery, WebhookEndpoint};
 use integrations::pg::{connect_and_migrate, PgTenantStore};
 use integrations::store::{NewTenant, StoreError, TenantStore};
 use uuid::Uuid;
@@ -172,4 +172,43 @@ async fn webhook_store_roundtrip() {
         .unwrap());
     assert!(store.delete_webhook(&tenant_id, &both_id).await.unwrap());
     assert_eq!(store.list_webhooks(&tenant_id).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn outbox_claim_reschedule_and_done() {
+    let Some(store) = store().await else {
+        return;
+    };
+    let id = Uuid::new_v4().to_string();
+    store
+        .enqueue_webhook_delivery(OutboxDelivery {
+            id: id.clone(),
+            url: "https://example.test/hook".to_string(),
+            event_type: "presence.changed".to_string(),
+            body: b"{\"id\":\"abc\"}".to_vec(),
+            attempts: 0,
+        })
+        .await
+        .unwrap();
+
+    // Claim: liefert die faellige Zeile, erhoeht attempts auf 1 und plant den
+    // naechsten Versuch per Backoff ein (LEAST(10*2^attempts,3600) in SQL).
+    let claimed = store.claim_due_deliveries(10).await.unwrap();
+    let mine: Vec<_> = claimed.iter().filter(|d| d.id == id).collect();
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].attempts, 1);
+    assert_eq!(mine[0].body, b"{\"id\":\"abc\"}");
+
+    // Sofort erneut: die eigene Zeile ist nicht mehr faellig (Backoff).
+    let again = store.claim_due_deliveries(10).await.unwrap();
+    assert!(
+        again.iter().all(|d| d.id != id),
+        "nicht sofort erneut faellig"
+    );
+
+    // Erledigen: danach nie wieder faellig.
+    store.mark_delivery_done(&id).await.unwrap();
+    store.mark_delivery_error(&id, "test").await.unwrap();
+    let after = store.claim_due_deliveries(10).await.unwrap();
+    assert!(after.iter().all(|d| d.id != id), "erledigt bleibt erledigt");
 }
