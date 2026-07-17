@@ -28,7 +28,9 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use client_app::account::{build_device_credential, build_rotation_cert, decode_seed, IdentityKeypair};
+use client_app::account::{
+    build_device_credential, build_rotation_cert, decode_seed, IdentityKeypair,
+};
 use client_app::delivery::{
     parse_ws_event, ws_auth_frame, DeliveryClient, GroupOutgoing, OutgoingEnvelope, WsEvent,
 };
@@ -39,16 +41,16 @@ use client_app::kt::KtClient;
 use client_app::policy::{
     CREDENTIAL_TTL_SECONDS, INVITE_BUFFER_MAX, MAX_PENDING_INVITES, MLS_KEY_PACKAGE_TARGET,
 };
-use client_app::store_keys::{
-    invite_buffer_key, invite_key, roster_key, COUNTER_KEY, GROUPS_INDEX_KEY, INVITES_INDEX_KEY,
-    MLS_STATE_KEY, OWN_DEVICES_KEY,
-};
 use client_app::prekeys::{
     bundle_from_directory, device_id_from_u32, new_uuid, publication_from_bundle, DirectoryPrekey,
     PROTOCOL_DEVICE_ID,
 };
 use client_app::protocol_store::{store_own_identity, PersistentProtocolStore};
 use client_app::storage::KeyValueStorage as _;
+use client_app::store_keys::{
+    invite_buffer_key, invite_key, roster_key, COUNTER_KEY, GROUPS_INDEX_KEY, INVITES_INDEX_KEY,
+    MLS_STATE_KEY, OWN_DEVICES_KEY,
+};
 use client_app::{wire, ClientError, IdentityClient, NewAccount};
 use client_core::group::{GroupInbound, GroupMember, GroupSession};
 use client_core::libsignal_protocol::{IdentityKeyPair, ProtocolAddress};
@@ -477,9 +479,7 @@ fn save_roster(
     devices: &[RosterDevice],
 ) -> Result<(), String> {
     let bytes = serde_json::to_vec(devices).map_err(|e| e.to_string())?;
-    storage
-        .borrow_mut()
-        .put(&roster_key(group_id), &bytes)
+    storage.borrow_mut().put(&roster_key(group_id), &bytes)
 }
 
 fn load_roster(storage: &SharedStorage, group_id: &str) -> Result<Vec<RosterDevice>, String> {

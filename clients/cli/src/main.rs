@@ -22,7 +22,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use client_app::account::{build_device_credential, build_rotation_cert, decode_seed, IdentityKeypair};
+use client_app::account::{
+    build_device_credential, build_rotation_cert, decode_seed, IdentityKeypair,
+};
 use client_app::delivery::{
     parse_ws_event, ws_auth_frame, DeliveryClient, GroupOutgoing, OutgoingEnvelope, WsEvent,
 };
@@ -32,15 +34,15 @@ use client_app::identity::{DeviceEnrollment, RotateDeviceCredential};
 use client_app::policy::{
     CREDENTIAL_TTL_SECONDS, INVITE_BUFFER_MAX, MAX_PENDING_INVITES, MLS_KEY_PACKAGE_TARGET,
 };
-use client_app::store_keys::{
-    invite_buffer_key, invite_key, roster_key, COUNTER_KEY, GROUPS_INDEX_KEY, INVITES_INDEX_KEY,
-    MLS_STATE_KEY, OWN_DEVICES_KEY,
-};
 use client_app::prekeys::{
     bundle_from_directory, device_id_from_u32, new_uuid, publication_from_bundle, DirectoryPrekey,
 };
 use client_app::protocol_store::{has_own_identity, store_own_identity, PersistentProtocolStore};
 use client_app::storage::{FileStorage, KeyValueStorage as _};
+use client_app::store_keys::{
+    invite_buffer_key, invite_key, roster_key, COUNTER_KEY, GROUPS_INDEX_KEY, INVITES_INDEX_KEY,
+    MLS_STATE_KEY, OWN_DEVICES_KEY,
+};
 use client_app::{wire, IdentityClient, NewAccount};
 use client_core::group::{GroupInbound, GroupMember, GroupSession};
 use client_core::libsignal_protocol::ProtocolAddress;
@@ -566,7 +568,10 @@ async fn build_sync_envelopes(
     text: &str,
     expires_at: Option<u64>,
 ) -> Result<Vec<OutgoingEnvelope>, String> {
-    let cached = storage.borrow().get(OWN_DEVICES_KEY).map_err(|e| e.to_string())?;
+    let cached = storage
+        .borrow()
+        .get(OWN_DEVICES_KEY)
+        .map_err(|e| e.to_string())?;
     let siblings: Vec<ContactDevice> = match cached {
         Some(bytes) => {
             serde_json::from_slice(&bytes).map_err(|e| format!("Eigene Geräte unlesbar: {e}"))?
@@ -1466,7 +1471,12 @@ async fn rotate_key() -> Result<(), String> {
         .collect();
 
     match client
-        .rotate_identity(&token, &new_identity_key, &rotation_signature, &device_creds)
+        .rotate_identity(
+            &token,
+            &new_identity_key,
+            &rotation_signature,
+            &device_creds,
+        )
         .await
     {
         Ok(()) => {
@@ -1500,7 +1510,10 @@ async fn rotate_key() -> Result<(), String> {
 
 /// Befördert den bestätigten neuen Wurzelschlüssel nach `account_seed` und
 /// leert `pending_account_seed`. Erst nach dem Servererfolg aufgerufen.
-fn promote_pending_seed(profile: &mut Profile, new_account: &IdentityKeypair) -> Result<(), String> {
+fn promote_pending_seed(
+    profile: &mut Profile,
+    new_account: &IdentityKeypair,
+) -> Result<(), String> {
     profile.account_seed = BASE64.encode(new_account.to_seed());
     profile.pending_account_seed = String::new();
     save_profile(profile)
