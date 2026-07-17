@@ -65,6 +65,12 @@ spec:
               value: "https://sso.intern" # Platzhalter
             - name: KC_PROXY_HEADERS
               value: "xforwarded" # TLS terminiert die Edge
+            # Hinter der TLS-terminierenden Edge lauscht der Pod selbst per
+            # HTTP; ohne dieses Flag verlangt der Produktionsmodus (start)
+            # eigenes TLS-Material und bricht den Start ab. (Fund aus dem
+            # ersten echten Lauf der Manifeste auf kind.)
+            - name: KC_HTTP_ENABLED
+              value: "true"
             - name: KC_HEALTH_ENABLED
               value: "true"
             - name: KC_BOOTSTRAP_ADMIN_USERNAME

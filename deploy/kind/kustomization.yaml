@@ -1,0 +1,75 @@
+# kind-Overlay: die ECHTEN Manifeste (deploy/k8s, inklusive securityContext-
+# Haertung, Probes, PDBs, Policies, Keycloak, Ingress) auf einem lokalen
+# kind-Cluster, ergaenzt um die cluster-internen Abhaengigkeiten (infra.yaml:
+# PostgreSQL, MinIO), die in echt Operatoren stellen. Einstieg: up.ps1
+# (Cluster anlegen, Image bauen und laden, Secrets generieren, anwenden).
+#
+# Zwei bewusste Abweichungen von der echten Umgebung:
+# - Ein Image fuer alle sechs Dienste (deploy/compose/Dockerfile, Auswahl
+#   per SM_SERVICE): EIN Release-Build statt sechs. Die Registry-Images je
+#   Dienst bleiben Sache der CI/GitOps-Pipeline.
+# - kinds Standard-CNI (kindnet) setzt NetworkPolicies nicht durch; die
+#   Policy wird angewendet, aber nicht erzwungen (Enforcement prueft ein
+#   Cluster mit Netz-Plugin, z. B. Calico).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: securemessenger
+
+resources:
+  - ../k8s
+  - infra.yaml
+
+images:
+  - name: registry.intern/securemessenger/identity
+    newName: securemessenger-local
+    newTag: dev
+  - name: registry.intern/securemessenger/directory
+    newName: securemessenger-local
+    newTag: dev
+  - name: registry.intern/securemessenger/delivery
+    newName: securemessenger-local
+    newTag: dev
+  - name: registry.intern/securemessenger/kt
+    newName: securemessenger-local
+    newTag: dev
+  - name: registry.intern/securemessenger/integrations
+    newName: securemessenger-local
+    newTag: dev
+  - name: registry.intern/securemessenger/media
+    newName: securemessenger-local
+    newTag: dev
+
+# Das Ein-Image waehlt sein Binary ueber SM_SERVICE (Entrypoint des
+# Compose-Dockerfiles). Je Dienst ein Patch, der die Variable ergaenzt.
+patches:
+  - target: { kind: Deployment, name: identity }
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value: { name: SM_SERVICE, value: identity }
+  - target: { kind: Deployment, name: directory }
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value: { name: SM_SERVICE, value: directory }
+  - target: { kind: Deployment, name: delivery }
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value: { name: SM_SERVICE, value: delivery }
+  - target: { kind: Deployment, name: kt }
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value: { name: SM_SERVICE, value: kt }
+  - target: { kind: Deployment, name: integrations }
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value: { name: SM_SERVICE, value: integrations }
+  - target: { kind: Deployment, name: media }
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value: { name: SM_SERVICE, value: media }

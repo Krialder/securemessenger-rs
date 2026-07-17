@@ -1,0 +1,170 @@
+# Cluster-interne Abhaengigkeiten fuer den lokalen kind-Lauf: PostgreSQL und
+# MinIO. Die Haupt-Manifeste (deploy/k8s) setzen beide bewusst als extern
+# voraus (Operatoren, betrieb.md); fuer einen selbst-genuegsamen lokalen
+# Cluster stellt kind sie hier schlank bereit. Zugangsdaten kommen aus den
+# von up.ps1 GENERIERTEN Secrets (postgres-admin, media-s3), keine
+# eingebauten Demo-Werte. KEIN persistentes Volume (emptyDir): ein
+# Wegwerf-Cluster, Datenverlust beim Pod-Neustart ist einkalkuliert.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+data:
+  # Eine Datenbank je Dienst (sqlx-Migrationstabellen kollidieren sonst),
+  # plus eine fuer Keycloak. Nur beim ersten Start eingespielt (Semantik des
+  # offiziellen Images bei leerem Datenverzeichnis).
+  01-create-databases.sql: |
+    CREATE DATABASE identity;
+    CREATE DATABASE directory;
+    CREATE DATABASE delivery;
+    CREATE DATABASE kt;
+    CREATE DATABASE integrations;
+    CREATE DATABASE keycloak;
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  labels:
+    app: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-admin
+                  key: password
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+      volumes:
+        - name: init
+          configMap:
+            name: postgres-init
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  labels:
+    app: minio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:latest
+          args: ["server", "/data"]
+          env:
+            # Dieselben Zugangsdaten, die media als media-s3 nutzt: EINE
+            # Quelle, von up.ps1 zufaellig erzeugt.
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: media-s3
+                  key: access-key
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: media-s3
+                  key: secret-key
+          ports:
+            - containerPort: 9000
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 3
+            periodSeconds: 5
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+spec:
+  selector:
+    app: minio
+  ports:
+    - port: 9000
+      targetPort: 9000
+---
+# Legt den media-Bucket an, sobald MinIO bereit ist. mc bringt die
+# Warteschleife mit; mb --ignore-existing macht den Job idempotent.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-init
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc:latest
+          env:
+            - name: KEY
+              valueFrom:
+                secretKeyRef:
+                  name: media-s3
+                  key: access-key
+            - name: SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: media-s3
+                  key: secret-key
+          command:
+            - /bin/sh
+            - -c
+            - >-
+              until mc alias set local http://minio:9000 "$KEY" "$SECRET"; do sleep 2; done;
+              mc mb --ignore-existing local/media;
+              echo 'media-Bucket bereit'

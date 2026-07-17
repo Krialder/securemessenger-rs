@@ -317,6 +317,27 @@ function Get-SmComponents {
     })
 
     [void]$components.Add([pscustomobject]@{
+        Key = 'kind'; Name = 'kind (Kubernetes lokal)'; Kind = 'tool'
+        Why = 'Faehrt die echten deploy/k8s-Manifeste lokal (deploy\kind\up.ps1)'
+        Optional = $true
+        Check = {
+            $kindExe = Join-Path $env:USERPROFILE '.cargo\bin\kind.exe'
+            if ((Test-SmHave 'kind') -or (Test-Path $kindExe)) { New-SmStatus 'ok' 'vorhanden' }
+            else { New-SmStatus 'missing' 'fehlt (nur fuer den Kubernetes-Weg noetig)' }
+        }
+        Fix = { param($log)
+            $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+            $kindExe = Join-Path $cargoBin 'kind.exe'
+            & $log 'Lade das kind-Windows-Binary von GitHub...'
+            try {
+                if (-not (Test-Path $cargoBin)) { New-Item -ItemType Directory -Force -Path $cargoBin | Out-Null }
+                Invoke-WebRequest -Uri 'https://github.com/kubernetes-sigs/kind/releases/latest/download/kind-windows-amd64' -OutFile $kindExe -UseBasicParsing
+                return (Test-Path $kindExe)
+            } catch { & $log "kind-Download fehlgeschlagen: $_"; return $false }
+        }
+    })
+
+    [void]$components.Add([pscustomobject]@{
         Key = 'docker'; Name = 'Docker Desktop'; Kind = 'tool'
         Why = 'Container fuer PostgreSQL und die Dienst-Images'
         Optional = $false
