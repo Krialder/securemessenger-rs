@@ -1,20 +1,23 @@
-# Lokaler Compose-Stack
+# Compose-Stack
 
-Der ganze Backend-Verbund in Containern, als robuster Gegenpart zum schnellen
-nativen Start (`scripts\sm.ps1`). Ein Befehl bringt PostgreSQL, MinIO und die
-sechs Dienste gesundheits-geprueft und in der richtigen Reihenfolge hoch;
-`restart: unless-stopped` faengt einen Container-Ausfall ab.
+Der ganze Verbund in Containern: PostgreSQL, MinIO und die sechs Dienste,
+gesundheits-geprueft, in der richtigen Reihenfolge und im PRODUKTIONSMODUS
+(`SM_ENV=production`: fehlende Pflicht-Konfiguration bricht den Start ab,
+statt still auf In-Memory auszuweichen); `restart: unless-stopped` faengt
+einen Container-Ausfall ab.
 
 ## Starten
 
 ```
-scripts\sm.ps1 -Compose            # Docker sicherstellen, dann up -d --build
-scripts\sm.ps1 -Compose -Web       # zusaetzlich der Web-Client (Port 3000)
-scripts\sm.ps1 -Compose -Sso       # zusaetzlich Keycloak (Port 8090)
-scripts\sm.ps1 -Compose -Stop      # herunterfahren (Daten bleiben)
+scripts\sm.ps1                # Docker sicherstellen, .env erzeugen, up -d --build
+scripts\sm.ps1 -Web           # zusaetzlich der Web-Client (Port 3000)
+scripts\sm.ps1 -Sso           # zusaetzlich Keycloak (Port 8090)
+scripts\sm.ps1 -Stop          # herunterfahren (Daten bleiben)
+scripts\sm.ps1 -Reset         # vorher die Daten-Volumes loeschen
 ```
 
-Oder direkt mit Docker aus dem Projekt-Root:
+Oder direkt mit Docker aus dem Projekt-Root (die `.env` muss dann schon
+existieren, Vorlage `.env.example`):
 
 ```
 docker compose up -d --build
@@ -23,10 +26,21 @@ docker compose down          # stoppen, Daten bleiben
 docker compose down -v       # stoppen und Daten (Volumes) loeschen
 ```
 
-Der Wrapper `-Compose` nutzt dieselbe Docker-Selbstheilung wie der native
-Start: ein abgestuerzter Daemon wird wiederbelebt, der Model Runner (Ursache
-der Windows-Abstuerze) bleibt aus, und der native `sm-postgres` wird gestoppt,
-damit der Compose-postgres Port 5432 bekommt.
+Der Wrapper `scripts\sm.ps1` nutzt die Docker-Selbstheilung aus
+lib-checks.ps1: ein abgestuerzter Daemon wird wiederbelebt, der Model Runner
+(Ursache der Windows-Abstuerze) bleibt aus, und der Entwicklungs-Container
+`sm-postgres` (Test-Datenbanken) wird gestoppt, damit der Stack-postgres
+Port 5432 bekommt.
+
+## Geheimnisse (.env)
+
+Alle Schluessel und Passwoerter kommen aus einer lokalen `.env` im
+Projekt-Root (nicht eingecheckt; Formate wie in deploy/k8s/SECRETS.md).
+`scripts\sm.ps1` erzeugt sie beim ersten Start mit starken Zufallswerten und
+laesst eine vorhandene unangetastet. Wichtig: die KT-Schluessel signieren das
+Transparenz-Log; wer die `.env` loescht und neu erzeugt, muss auch die
+Daten-Volumes loeschen (`-Reset`), sonst scheitert der kt-Dienst am
+Integritaets-Check seines eigenen Logs.
 
 ## Ports (Host)
 
@@ -39,9 +53,8 @@ damit der Compose-postgres Port 5432 bekommt.
 | media         | 8084 |
 | integrations  | 8085 |
 | PostgreSQL    | 5432 |
-| MinIO API     | 9000 |
-| MinIO Konsole | 9001 (minioadmin/minioadmin) |
-| Keycloak      | 8090 (Profil sso) |
+| MinIO API     | 9000 (Zugangsdaten in der `.env`) |
+| Keycloak      | 8090 (Profil sso, Admin-Passwort in der `.env`) |
 | Web-Client    | 3000 (Profil web) |
 
 ## Aufbau
@@ -55,12 +68,15 @@ damit der Compose-postgres Port 5432 bekommt.
 - **Reihenfolge ueber Healthchecks.** `depends_on: condition: service_healthy`
   laesst directory/delivery/integrations/media erst starten, wenn identity und
   PostgreSQL wirklich bereit sind (nicht nur gestartet).
-- **PostgreSQL** legt beim ersten Start eine Datenbank je Dienst an
-  (`postgres-init/01-create-databases.sql`, nur bei leerem Volume).
+- **PostgreSQL** legt beim ersten Start eine Datenbank je Dienst an, plus
+  eine fuer Keycloak (`postgres-init/01-create-databases.sql`, nur bei
+  leerem Volume; nach Aenderungen dort `docker compose down -v`).
 - **MinIO** haelt die Medien-Blobs; `minio-init` legt den `media`-Bucket an.
-- **Schluessel** sind die deterministischen DEMO-Werte wie im nativen Start,
-  NUR fuer lokal. In echt kommen sie aus einem Secret-Store.
+- **Keycloak** (Profil sso) laeuft im Produktionsmodus (`start`) gegen die
+  eigene PostgreSQL-Datenbank; HTTP nur, weil lokal die TLS-Edge fehlt. Der
+  Realm-Import bringt keine Nutzer und kein Client-Secret mit (siehe
+  deploy/keycloak/README.md).
 
-Der Compose-Stack laeuft im Entwicklungsmodus (kein `SM_ENV=production`); die
-Produktions-Fail-Fast-Pfade und die restriktive Haertung pruefen die
-Kubernetes-Manifeste (`deploy/k8s`, lokal ueber `deploy/k8s/kind`).
+Die restriktive Kubernetes-Haertung (securityContext, NetworkPolicies, PDBs)
+pruefen die echten Manifeste: `deploy\kind\up.ps1` faehrt sie lokal auf
+einem kind-Cluster.

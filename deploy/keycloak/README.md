@@ -9,38 +9,23 @@ Wichtig zur Abgrenzung: dieses SSO ist die **Anmelde-Identitaet** (wer bin ich a
 - **Realm `securemessenger`**: `sslRequired: external` (HTTP nur fuer localhost, sonst TLS-Pflicht), Selbstregistrierung aus (Konten werden bereitgestellt), Access-Token-Laufzeit 5 Minuten, SSO-Sitzung 10 Stunden.
 - **Client `azubios`** (vertraulich): fuer ein serverseitiges Fremdprojekt. Authorization Code Flow mit Client-Secret und PKCE (S256), kein Implicit, kein Direct Access (ROPC), keine Service-Accounts.
 - **Client `azubios-spa`** (oeffentlich): fuer eine Browser-App ohne Secret. Authorization Code Flow mit PKCE (Pflicht). So kann ein Fremdprojekt server- oder browserseitig anbinden, ganz wie es gebaut ist.
-- **Demo-Nutzer `azubi-demo`** (Passwort `azubi-demo-passwort`): nur fuer die Vorfuehrung des Login-Flusses.
 
-Die Werte `secret` und das Demo-Passwort im Export sind **ausschliesslich fuer die lokale Vorfuehrung**. In jeder echten Umgebung kommen Client-Secrets und Nutzer-Konten aus einem Secret-Store bzw. der Nutzerverwaltung, nie aus einer eingecheckten Datei.
+Der Export enthaelt bewusst **keine Nutzer und kein Client-Secret**: Keycloak erzeugt das Secret des vertraulichen Clients beim Import selbst (nachlesen in der Admin-Konsole unter Clients -> azubios -> Credentials, oder dort rotieren), und Nutzer-Konten legt der Betreiber in der Admin-Konsole an bzw. bindet eine Nutzer-Foederation an. So liegt kein Geheimnis und kein Konto in einer eingecheckten Datei.
 
 ## Lokal starten und ausprobieren
 
-Keycloak 26.2 im Entwicklungsmodus, Realm direkt importiert (Port 8090, weil 8080 der identity-Dienst belegt):
+Ueber das `sso`-Profil des Compose-Stacks (Port 8090, weil 8080 der identity-Dienst belegt; das Admin-Passwort kommt aus der lokalen `.env`, siehe deploy/compose/README.md):
 
-```bash
-docker run -d --name sm-keycloak -p 8090:8080 \
-  -e KC_BOOTSTRAP_ADMIN_USERNAME=admin \
-  -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin-demo-passwort \
-  -v "$(pwd)/deploy/keycloak:/opt/keycloak/data/import:ro" \
-  quay.io/keycloak/keycloak:26.2 start-dev --import-realm
-```
-
-Unter Windows/Git-Bash, wo der Volume-Mount-Pfad zickt, stattdessen die Datei hineinkopieren:
-
-```bash
-docker create --name sm-keycloak -p 8090:8080 \
-  -e KC_BOOTSTRAP_ADMIN_USERNAME=admin \
-  -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin-demo-passwort \
-  quay.io/keycloak/keycloak:26.2 start-dev --import-realm
-docker cp deploy/keycloak/realm-securemessenger.json \
-  sm-keycloak:/opt/keycloak/data/import/realm-securemessenger.json
-docker start sm-keycloak
+```powershell
+scripts\sm.ps1 -Sso
 ```
 
 Danach:
 
 - **Discovery** (die OIDC-Bibliothek des Fremdprojekts liest hier alle Endpunkte): `http://localhost:8090/realms/securemessenger/.well-known/openid-configuration`
-- **Admin-Konsole**: `http://localhost:8090/admin/` (admin / admin-demo-passwort)
+- **Admin-Konsole**: `http://localhost:8090/admin/` (Zugangsdaten aus der `.env`)
+- **Nutzer anlegen**: Admin-Konsole -> Users -> Create user (der Export bringt bewusst keine mit)
+- **Client-Secret nachlesen**: Clients -> `azubios` -> Credentials
 - **Login-Seite des Clients**: der Authorization-Code-Fluss beginnt am `authorization_endpoint` aus der Discovery, mit `client_id=azubios`, `redirect_uri`, `scope=openid`, `code_challenge` (PKCE).
 
 ## Im Cluster (Kubernetes)

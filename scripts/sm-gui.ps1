@@ -13,7 +13,7 @@
   Der eigentliche Start laeuft ueber scripts\sm.ps1 (die eine Konsolen-Logik,
   geteilt mit der Kommandozeile), die Pruefung und Reparatur ueber
   lib-checks.ps1 (die geteilte Bibliothek). Im Alltag ein Messenger-Fenster
-  auf http://localhost:3000, im Vorfuehrmodus zusaetzlich Bob auf 3001.
+  auf http://localhost:3000 (Container-Stack ueber docker compose).
 
   Mit -SelfTest wird nur das Fenster aufgebaut und wieder geschlossen; mit
   -ScanTest laeuft zusaetzlich der Scan ueber die echte Pump-Mechanik durch
@@ -73,8 +73,6 @@ $xaml = @"
     </Expander>
 
     <Grid Grid.Row="4" Margin="0,14,0,0">
-      <CheckBox x:Name="DemoMode" Content="Vorfuehrmodus (Alice und Bob)" VerticalAlignment="Center"
-                Foreground="$($t.Muted)"/>
       <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
         <Button x:Name="StopBtn" Content="Beenden" Visibility="Collapsed" Width="110" Height="36"
                 Margin="0,0,10,0" Background="$($t.Card)" Foreground="$($t.Text)" BorderBrush="$($t.Border)"/>
@@ -95,7 +93,6 @@ $ui = @{
     LogBox      = $window.FindName('LogBox')
     Primary     = $window.FindName('PrimaryBtn')
     StopBtn     = $window.FindName('StopBtn')
-    DemoMode    = $window.FindName('DemoMode')
     Window      = $window
     Rows        = @{}
     Checks      = @{}
@@ -170,9 +167,8 @@ $onMessage = {
             if ($ui.Timer) { $ui.Timer.Stop() }
             if ($ui.Job) { Stop-SmJob $ui.Job; $ui.Job = $null }
             $ui.Phase = 'running'
-            $urls = if ($msg.solo) { 'http://localhost:3000' } else { 'http://localhost:3000 (Alice), http://localhost:3001 (Bob)' }
             $ui.Subtitle.Text = 'Laeuft. Im Browser geoeffnet.'
-            $ui.StatusLine.Text = $urls
+            $ui.StatusLine.Text = 'Web http://localhost:3000, Dienste 8080-8085 (docker compose ps)'
             $ui.Primary.Visibility = 'Collapsed'
             $ui.StopBtn.Visibility = 'Visible'
         }
@@ -220,26 +216,25 @@ $Queue.Enqueue(@{ kind = 'status'; key = 'daemon'; state = 'running'; detail = '
 if ((Test-SmComponent $daemon).State -ne 'ok') { try { [void](& $daemon.Fix $log) } catch { & $log "Fehler: $_" } }
 $Queue.Enqueue(@{ kind = 'status'; key = 'daemon'; state = (Test-SmComponent $daemon).State; detail = '' })
 
-# 3. Starten ueber sm.ps1.
-$Queue.Enqueue(@{ kind = 'phase'; text = 'Starte Dienste und Web-Client...' })
+# 3. Starten ueber sm.ps1: der Container-Stack samt Web-Client, danach
+# oeffnet sich der Browser. sm.ps1 kuemmert sich um .env, Docker-
+# Selbstheilung und die Reihenfolge der Container.
+$Queue.Enqueue(@{ kind = 'phase'; text = 'Starte den Container-Stack (erster Build dauert)...' })
 $sm = Join-Path $ScriptsDir 'sm.ps1'
-$smArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $sm, '-Hidden', '-NoBuild', '-OpenBrowser')
-if ($Solo) { $smArgs += '-Solo' }
+$smArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $sm, '-Web', '-OpenBrowser')
 & powershell @smArgs 2>&1 | ForEach-Object { $Queue.Enqueue(@{ kind = 'log'; text = "$_" }) }
-$Queue.Enqueue(@{ kind = 'launched'; solo = $Solo })
+$Queue.Enqueue(@{ kind = 'launched' })
 '@
 
 $ui.Primary.Add_Click({
     if ($ui.Phase -ne 'ready') { return }
     $ui.Phase = 'working'
     $ui.Primary.IsEnabled = $false
-    $ui.DemoMode.IsEnabled = $false
     $ui.StatusLine.Text = 'Starte...'
     $selected = @()
     foreach ($key in $ui.Checks.Keys) { if ($ui.Checks[$key].IsChecked) { $selected += $key } }
-    $solo = -not [bool]$ui.DemoMode.IsChecked
     $ui.Timer = Register-SmQueuePump $ui.Window $queue $onMessage
-    $ui.Job = Start-SmJob $startWorker @{ Queue = $queue; ScriptsDir = $scriptsDir; Selected = $selected; Solo = $solo }
+    $ui.Job = Start-SmJob $startWorker @{ Queue = $queue; ScriptsDir = $scriptsDir; Selected = $selected }
 }.GetNewClosure())
 
 $ui.StopBtn.Add_Click({

@@ -9,3 +9,5 @@ CREATE DATABASE directory;
 CREATE DATABASE delivery;
 CREATE DATABASE kt;
 CREATE DATABASE integrations;
+-- Fuer das sso-Profil (Keycloak im Produktionsmodus braucht eine echte DB).
+CREATE DATABASE keycloak;

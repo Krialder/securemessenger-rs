@@ -21,7 +21,6 @@
       "enabled": true,
       "protocol": "openid-connect",
       "publicClient": false,
-      "secret": "azubios-dev-secret-nur-fuer-die-vorfuehrung",
       "standardFlowEnabled": true,
       "implicitFlowEnabled": false,
       "directAccessGrantsEnabled": false,
@@ -63,23 +62,6 @@
       },
       "defaultClientScopes": ["profile", "email", "roles", "web-origins"],
       "optionalClientScopes": []
-    }
-  ],
-  "users": [
-    {
-      "username": "azubi-demo",
-      "enabled": true,
-      "emailVerified": true,
-      "email": "azubi-demo@messenger.intern",
-      "firstName": "Azubi",
-      "lastName": "Demo",
-      "credentials": [
-        {
-          "type": "password",
-          "value": "azubi-demo-passwort",
-          "temporary": false
-        }
-      ]
     }
   ]
 }
