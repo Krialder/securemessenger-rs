@@ -7,4 +7,6 @@
 *.md text
 *.ps1 text eol=crlf
 *.cmd text eol=crlf
+# Shell-Skripte laufen auf dem Linux-Server: CRLF wuerde sh dort brechen.
+*.sh text eol=lf
 *.pdf binary

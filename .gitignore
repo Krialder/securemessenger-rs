@@ -9,6 +9,10 @@ clients/web/dist/
 .env
 *.env.local
 
+# Server-Auslieferung: lokales Verbindungsprofil und SSH-Schluessel
+deploy/remote/profile.json
+deploy/remote/keys/
+
 # Lokaler Laufzeit-Zustand des CLI-Clients: das Profil und der verschluesselte
 # Keystore-Blob (SM_PROFILE/SM_STATE, Vorgabe im Arbeitsverzeichnis). Enthaelt
 # Geraete-Schluessel, gehoert nie ins Repo.
