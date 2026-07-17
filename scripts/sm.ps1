@@ -8,16 +8,22 @@
   Konsole und GUI nicht auseinanderdriften.
 
   Aufrufe:
-    sm.ps1              startet die Umgebung (vier Dienste plus Web-Clients)
+    sm.ps1              startet die Umgebung nativ (Dienste als Prozesse plus
+                        Web-Clients ueber trunk; schnell fuer die Entwicklung)
+    sm.ps1 -Compose     startet den ganzen Verbund in Containern (docker
+                        compose): robust, gesundheits-geprueft, selbst-
+                        heilend. -Compose -Web nimmt den Web-Client dazu,
+                        -Compose -Sso Keycloak, -Compose -Stop faehrt herunter.
     sm.ps1 -Setup       richtet nur ein und aktualisiert (Werkzeuge, Docker,
                         Datenbanken, Build), ohne zu starten
-    sm.ps1 -Stop        beendet eine laufende Umgebung
+    sm.ps1 -Stop        beendet eine laufende native Umgebung
     sm.ps1 -Reset       loescht die demo_*-Datenbanken vor dem Start
     sm.ps1 -Solo        nur ein Web-Client (Alice, 3000) statt Alice und Bob
     sm.ps1 -NoWeb       nur die Dienste, keine Web-Clients
     sm.ps1 -NoBuild     ueberspringt cargo build (die GUI baut selbst)
     sm.ps1 -Hidden      Dienst-Fenster versteckt (fuer den GUI-Start)
     sm.ps1 -Sso         startet zusaetzlich Keycloak (SSO-Provider) mit Realm
+    sm.ps1 -Web         (mit -Compose) nimmt den Web-Client-Container dazu
     sm.ps1 -OpenBrowser oeffnet nach dem Start den Standardbrowser
 #>
 param(
@@ -29,6 +35,8 @@ param(
     [switch]$NoBuild,
     [switch]$Hidden,
     [switch]$Sso,
+    [switch]$Compose,
+    [switch]$Web,
     [switch]$OpenBrowser
 )
 
@@ -43,6 +51,56 @@ function Write-Step($m) { Write-Host "`n==> $m" -ForegroundColor Cyan }
 function Write-Ok($m)   { Write-Host "    [ok] $m" -ForegroundColor Green }
 function Write-Bad($m)  { Write-Host "    [x]  $m" -ForegroundColor Red }
 function Have($name)    { return [bool](Get-Command $name -ErrorAction SilentlyContinue) }
+
+# ---------------------------------------------------------------------------
+# Compose-Weg: der ganze Verbund in Containern (docker compose), der robuste
+# Gegenpart zum schnellen nativen Start. Vor dem -Stop-Zweig, damit
+# `-Compose -Stop` den Stack herunterfaehrt statt die nativen Prozesse zu
+# suchen. Nutzt dieselbe Docker-Selbstheilung wie der native Start.
+# ---------------------------------------------------------------------------
+if ($Compose) {
+    $dockerCliDir = Join-Path $env:ProgramFiles 'Docker\Docker\resources\bin'
+    if (-not (Have 'docker') -and (Test-Path (Join-Path $dockerCliDir 'docker.exe'))) { $env:Path = "$dockerCliDir;$env:Path" }
+    if (-not (Have 'docker')) { Write-Bad 'docker fehlt; zuerst scripts\sm.ps1 -Setup ausfuehren'; exit 1 }
+    . (Join-Path $scriptsDir 'lib-checks.ps1')
+    $healLog = { param($t) Write-Host "        $t" -ForegroundColor DarkGray }
+    $daemonComp = Get-SmComponents | Where-Object { $_.Key -eq 'daemon' }
+    if (-not (Test-SmDockerDaemon)) {
+        Write-Step 'Docker-Daemon nicht erreichbar, belebe ihn wieder'
+        [void](& $daemonComp.Fix $healLog)
+    }
+    if (-not (Test-SmDockerDaemon)) { Write-Bad 'Docker-Daemon liess sich nicht starten (docker desktop status pruefen).'; exit 1 }
+    Disable-SmModelRunner
+
+    Push-Location $root
+    if ($Stop) {
+        Write-Step 'Compose-Stack herunterfahren (docker compose down)'
+        docker compose down
+        Pop-Location
+        Write-Host 'Compose-Stack gestoppt (Daten bleiben; -v im Aufruf loeschte sie).'
+        exit 0
+    }
+    # Der native sm-postgres belegt sonst Port 5432 und der Compose-postgres
+    # kann nicht binden. Der Compose-Stack bringt seine eigene Datenbank mit.
+    docker stop sm-postgres *> $null
+    $composeArgs = @()
+    if ($Sso) { $composeArgs += @('--profile', 'sso') }
+    if ($Web) { $composeArgs += @('--profile', 'web') }
+    Write-Step 'Compose-Stack bauen und starten (docker compose up -d --build; erster Build dauert)'
+    docker compose @composeArgs up -d --build
+    $ok = ($LASTEXITCODE -eq 0)
+    Pop-Location
+    if ($ok) {
+        Write-Ok 'Stack laeuft. Status: docker compose ps'
+        Write-Host '    Dienste: identity 8080, directory 8081, delivery 8082, kt 8083, media 8084, integrations 8085'
+        if ($Web) { Write-Host '    Web:     http://localhost:3000' }
+        if ($Sso) { Write-Host '    SSO:     http://localhost:8090 (Keycloak)' }
+        Write-Host '    Stoppen: scripts\sm.ps1 -Compose -Stop'
+    } else {
+        Write-Bad 'docker compose up fehlgeschlagen (Ausgabe oben pruefen).'
+    }
+    exit 0
+}
 
 # ---------------------------------------------------------------------------
 # Stoppen: die frueher eigene demo-stop.ps1. Erst die festgehaltenen

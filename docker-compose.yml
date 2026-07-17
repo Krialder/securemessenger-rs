@@ -1,0 +1,227 @@
+# Lokaler Ein-Befehl-Stack: der ganze Backend-Verbund in Containern, statt
+# fuenf native Prozesse von Hand zu jonglieren. `docker compose up` bringt
+# PostgreSQL, MinIO und die sechs Dienste gesundheits-geprueft und in der
+# richtigen Reihenfolge hoch; `restart: unless-stopped` faengt einen
+# Container-Ausfall ab. Das ist der robuste Weg neben dem schnellen nativen
+# Start (scripts\sm.ps1).
+#
+#   docker compose up -d --build                 nur das Backend
+#   docker compose --profile web up -d --build   zusaetzlich der Web-Client
+#   docker compose --profile sso up -d           zusaetzlich Keycloak
+#   docker compose down                          stoppen (Daten bleiben)
+#   docker compose down -v                        stoppen und Daten loeschen
+#
+# Bequemer Wrapper mit Docker-Selbstheilung: scripts\sm.ps1 -Compose.
+#
+# Die Schluessel sind die deterministischen DEMO-Werte (DemoKey(n) =
+# Base64 aus 32 Bytes n) wie im nativen Start; NUR fuer lokal, in echt aus
+# einem Secret-Store.
+
+name: securemessenger
+
+# Geteilte Bausteine fuer die sechs Rust-Dienste: dasselbe Image (ein
+# Build, sechsmal gestartet, Auswahl ueber SM_SERVICE), Neustart-Politik und
+# ein /ready-Healthcheck (curl steckt nur im Compose-Image).
+x-backend: &backend
+  image: securemessenger-local:dev
+  build:
+    context: .
+    dockerfile: deploy/compose/Dockerfile
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://localhost:8080/ready"]
+    interval: 10s
+    timeout: 3s
+    retries: 12
+    start_period: 20s
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: dev
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Legt beim ersten Start eine Datenbank je Dienst an (nur bei leerem
+      # Volume, Semantik des offiziellen Images).
+      - ./deploy/compose/postgres-init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - miniodata:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  # Legt den media-Bucket an, sobald MinIO antwortet, und beendet sich dann.
+  # mc bringt seine eigene Warteschleife mit (kein Healthcheck an MinIO
+  # noetig); media vertraegt einen noch nicht bereiten Speicher beim Start,
+  # weil object_store erst beim ersten Zugriff verbindet.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >-
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 1; done;
+      mc mb --ignore-existing local/media;
+      echo 'media-Bucket bereit';
+      "
+    restart: "no"
+
+  identity:
+    <<: *backend
+    environment:
+      SM_SERVICE: identity
+      INTERNAL_TOKEN: demo-internes-secret
+      DATABASE_URL: postgres://postgres:dev@postgres:5432/identity
+      KT_URL: http://kt:8080
+      CDS_OPRF_KEY: AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=
+      SEALED_SENDER_TRUST_ROOT: BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=
+      POW_DIFFICULTY: "8"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+
+  directory:
+    <<: *backend
+    environment:
+      SM_SERVICE: directory
+      INTERNAL_TOKEN: demo-internes-secret
+      DATABASE_URL: postgres://postgres:dev@postgres:5432/directory
+      IDENTITY_URL: http://identity:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      identity:
+        condition: service_healthy
+    ports:
+      - "8081:8080"
+
+  delivery:
+    <<: *backend
+    environment:
+      SM_SERVICE: delivery
+      INTERNAL_TOKEN: demo-internes-secret
+      DATABASE_URL: postgres://postgres:dev@postgres:5432/delivery
+      IDENTITY_URL: http://identity:8080
+      # Praesenz-Aenderungen an integrations melden (best effort, Noop wenn
+      # integrations noch nicht da ist).
+      INTEGRATIONS_URL: http://integrations:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      identity:
+        condition: service_healthy
+    ports:
+      - "8082:8080"
+
+  kt:
+    <<: *backend
+    environment:
+      SM_SERVICE: kt
+      INTERNAL_TOKEN: demo-internes-secret
+      DATABASE_URL: postgres://postgres:dev@postgres:5432/kt
+      KT_SIGNING_KEY: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
+      KT_VRF_KEY: AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=
+      KT_EPOCH_SECONDS: "5"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8083:8080"
+
+  integrations:
+    <<: *backend
+    environment:
+      SM_SERVICE: integrations
+      INTERNAL_TOKEN: demo-internes-secret
+      DATABASE_URL: postgres://postgres:dev@postgres:5432/integrations
+      IDENTITY_URL: http://identity:8080
+      DELIVERY_URL: http://delivery:8080
+      INTEGRATIONS_WEBHOOK_SIGNING_KEY: BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU=
+      # Lokaler Lauf: Webhook-Ziele auf localhost/privat erlauben (SSRF-Schutz
+      # sonst an). In echt aus bleiben.
+      INTEGRATIONS_ALLOW_PRIVATE_WEBHOOKS: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      identity:
+        condition: service_healthy
+      delivery:
+        condition: service_healthy
+    ports:
+      - "8085:8080"
+
+  media:
+    <<: *backend
+    environment:
+      SM_SERVICE: media
+      INTERNAL_TOKEN: demo-internes-secret
+      IDENTITY_URL: http://identity:8080
+      MEDIA_S3_BUCKET: media
+      MEDIA_S3_ENDPOINT: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+    depends_on:
+      identity:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    ports:
+      - "8084:8080"
+
+  # Optional (Profil sso): SSO/OIDC-Provider mit importiertem Realm. Schweres
+  # Image, der Chat-Demo braucht es nicht; es gehoert zum Fundament fuer die
+  # anderen Projekte (ADR-0011). Der Import greift nur bei leerem Datenstand.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.2
+    profiles: ["sso"]
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin-demo-passwort
+    volumes:
+      - ./deploy/keycloak/realm-securemessenger.json:/opt/keycloak/data/import/realm-securemessenger.json:ro
+    ports:
+      - "8090:8080"
+
+  # Optional (Profil web): der Web-Client (WASM) hinter nginx, das /api/* auf
+  # die Dienste proxyt (wie der trunk-Dev-Server und der Cluster-Ingress).
+  web:
+    build:
+      context: .
+      dockerfile: deploy/compose/web.Dockerfile
+    profiles: ["web"]
+    depends_on:
+      identity:
+        condition: service_healthy
+      directory:
+        condition: service_healthy
+      delivery:
+        condition: service_healthy
+      kt:
+        condition: service_healthy
+    ports:
+      - "3000:80"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  miniodata:
