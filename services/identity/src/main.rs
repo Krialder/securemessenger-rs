@@ -70,6 +70,8 @@ fn session_config_from_env() -> SessionConfig {
 async fn main() {
     telemetry::init();
     let cfg = ServiceConfig::from_env("identity");
+    common::require_in_production(&cfg.database_url, "DATABASE_URL");
+    common::require_in_production(&cfg.internal_token, "INTERNAL_TOKEN");
 
     // Mit DATABASE_URL persistiert der Dienst in PostgreSQL, ohne läuft er
     // mit prozesslokaler Ablage (Entwicklung, Tests). Schlägt Verbindung
@@ -192,5 +194,8 @@ async fn main() {
         "Dienst gestartet"
     );
 
-    axum::serve(listener, router).await.expect("Server läuft");
+    axum::serve(listener, router)
+        .with_graceful_shutdown(common::shutdown_signal())
+        .await
+        .expect("Server läuft");
 }

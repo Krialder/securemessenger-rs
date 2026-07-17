@@ -13,6 +13,7 @@ use delivery::store::InMemoryMessageStore;
 async fn main() {
     telemetry::init();
     let cfg = ServiceConfig::from_env("delivery");
+    common::require_in_production(&cfg.database_url, "DATABASE_URL");
 
     // Ohne identity-Anbindung kann der Dienst keine Tokens prüfen und
     // keine Empfänger auflösen: harter Startfehler statt eines Dienstes,
@@ -68,5 +69,8 @@ async fn main() {
         "Dienst gestartet"
     );
 
-    axum::serve(listener, router).await.expect("Server läuft");
+    axum::serve(listener, router)
+        .with_graceful_shutdown(common::shutdown_signal())
+        .await
+        .expect("Server läuft");
 }

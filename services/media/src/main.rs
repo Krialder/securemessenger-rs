@@ -44,6 +44,11 @@ async fn main() {
             Arc::new(s3)
         }
         _ => {
+            // Im Produktionsbetrieb ist die Blob-Ablage Pflicht: kein stiller
+            // In-Memory-Speicher, der beim Neustart alle Medien verliert.
+            if common::production_mode() {
+                panic!("MEDIA_S3_BUCKET ist im Produktionsbetrieb (SM_ENV=production) Pflicht");
+            }
             tracing::warn!("MEDIA_S3_BUCKET nicht gesetzt, Blobs nur im Prozessspeicher");
             Arc::new(InMemory::new())
         }
@@ -62,5 +67,8 @@ async fn main() {
         "Dienst gestartet"
     );
 
-    axum::serve(listener, router).await.expect("Server läuft");
+    axum::serve(listener, router)
+        .with_graceful_shutdown(common::shutdown_signal())
+        .await
+        .expect("Server läuft");
 }

@@ -15,6 +15,8 @@ use kt::store::{InMemoryKtStore, KtStore};
 async fn main() {
     telemetry::init();
     let cfg = ServiceConfig::from_env("kt");
+    common::require_in_production(&cfg.database_url, "DATABASE_URL");
+    common::require_in_production(&cfg.internal_token, "INTERNAL_TOKEN");
 
     // Schlüssel aus Secrets; ohne Konfiguration flüchtige Dev-Schlüssel
     // mit deutlicher Warnung (Wurzeln überleben dann keinen Neustart).
@@ -23,6 +25,11 @@ async fn main() {
             RootSigner::from_seed_b64(&seed).expect("KT_SIGNING_KEY gültig (Base64, 32 Byte)")
         }
         _ => {
+            // Ein flüchtiger KT-Signaturschlüssel bricht die Transparenz-
+            // Garantie über Neustarts: im Produktionsbetrieb harter Fehler.
+            if common::production_mode() {
+                panic!("KT_SIGNING_KEY ist im Produktionsbetrieb (SM_ENV=production) Pflicht");
+            }
             tracing::warn!(
                 "KT_SIGNING_KEY nicht gesetzt, flüchtiger Signaturschlüssel (nur Entwicklung)"
             );
@@ -34,6 +41,9 @@ async fn main() {
             SecretVrf::from_seed_b64(&seed).expect("KT_VRF_KEY gültig (Base64, 32 Byte)")
         }
         _ => {
+            if common::production_mode() {
+                panic!("KT_VRF_KEY ist im Produktionsbetrieb (SM_ENV=production) Pflicht");
+            }
             tracing::warn!("KT_VRF_KEY nicht gesetzt, flüchtiger VRF-Schlüssel (nur Entwicklung)");
             SecretVrf::ephemeral()
         }
@@ -109,5 +119,8 @@ async fn main() {
         addr = %cfg.bind_addr,
         "Dienst gestartet"
     );
-    axum::serve(listener, router).await.expect("Server läuft");
+    axum::serve(listener, router)
+        .with_graceful_shutdown(common::shutdown_signal())
+        .await
+        .expect("Server läuft");
 }

@@ -35,7 +35,8 @@ pub struct HttpRealtimeGateway {
 impl HttpRealtimeGateway {
     pub fn new(base_url: &str, internal_token: &str) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            // Mit Timeouts (notify/presence laufen inline im Anfrage-Pfad).
+            client: common::http::internal_client(),
             base_url: base_url.trim_end_matches('/').to_string(),
             internal_token: internal_token.to_string(),
         }

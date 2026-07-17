@@ -4,14 +4,102 @@
 //! OpenMLS), das Backend hält und verteilt Chiffretext
 //! (dokumentation/architektur.md).
 
-use axum::http::header;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::{routing::get, Router};
+
+/// Prozessweite Bereitschaft fuer die `/ready`-Probe. Startet als bereit und
+/// wird beim Shutdown auf `false` gesetzt, damit Kubernetes den drainenden
+/// Pod aus der Rotation nimmt, bevor der Server die letzten Anfragen auslaufen
+/// laesst (sonst laufen noch neue Anfragen in einen sterbenden Pod).
+static READY: AtomicBool = AtomicBool::new(true);
+
+/// Setzt die Bereitschaft, die `/ready` meldet.
+pub fn set_ready(ready: bool) {
+    READY.store(ready, Ordering::Relaxed);
+}
 
 pub mod identity_client;
 pub mod kt;
 pub mod metrics;
 pub mod rate;
+
+pub mod http {
+    //! Geteilter HTTP-Client fuer Dienst-zu-Dienst-Aufrufe.
+    //!
+    //! Immer mit Timeouts: ein verbundener, aber nicht antwortender
+    //! Nachbardienst (etwa identity auf dem Auth-Heisspfad) wuerde sonst jede
+    //! Anfrage unbegrenzt blockieren und Tasks samt DB-Pool erschoepfen, ein
+    //! Kaskadenausfall. reqwest hat von sich aus KEINEN Request-Timeout.
+    use std::time::Duration;
+
+    /// reqwest-Client mit Verbindungs- und Gesamt-Timeout fuer interne Aufrufe.
+    pub fn internal_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("reqwest-Client baubar")
+    }
+}
+
+/// Ein Future, das aufloest, wenn der Prozess enden soll: SIGTERM (Unix, so
+/// stoppt Kubernetes einen Pod) oder Ctrl-C. Fuer
+/// `axum::serve(...).with_graceful_shutdown(...)`, damit laufende Anfragen und
+/// WebSockets beim Rollout/Drain sauber auslaufen statt hart abzubrechen.
+pub async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    // Erst unbereit melden (Kubernetes nimmt den Pod aus der Rotation), dann
+    // laesst axum::serve die laufenden Anfragen auslaufen.
+    set_ready(false);
+    tracing::info!("Shutdown-Signal empfangen, fahre geordnet herunter");
+    // Im Produktionsbetrieb kurz warten, damit Kubernetes die Unbereitschaft
+    // sieht und keine neuen Anfragen mehr schickt, BEVOR der Server aufhoert
+    // anzunehmen (sonst liefen sie in einen sterbenden Pod). Im
+    // Entwicklungsbetrieb kein Warten, damit Ctrl-C sofort greift.
+    if production_mode() {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+/// Laeuft der Dienst im Produktionsbetrieb (`SM_ENV=production`)? Dann sind
+/// Persistenz und Secrets Pflicht; fehlen sie, bricht der Start ab, statt
+/// still auf In-Memory oder ephemere Schluessel auszuweichen (ein
+/// Datenverlust- und Sicherheitsrisiko). Ohne den Schalter bleibt der
+/// bequeme Entwicklungsbetrieb (Ausweichen mit Warnung).
+pub fn production_mode() -> bool {
+    std::env::var("SM_ENV")
+        .map(|v| v.eq_ignore_ascii_case("production"))
+        .unwrap_or(false)
+}
+
+/// Bricht mit klarer Meldung ab, wenn im Produktionsbetrieb ein Pflicht-
+/// Konfigurationswert fehlt. Im Entwicklungsbetrieb tut sie nichts.
+pub fn require_in_production<T>(value: &Option<T>, name: &str) {
+    if production_mode() && value.is_none() {
+        panic!("{name} ist im Produktionsbetrieb (SM_ENV=production) Pflicht, fehlt aber");
+    }
+}
 
 pub mod telemetry {
     //! Strukturiertes Logging nach stdout, niemals mit Nachrichteninhalt (NF100).
@@ -93,9 +181,20 @@ where
     S: Clone + Send + Sync + 'static,
 {
     Router::new()
+        // /live: lebt der Prozess ueberhaupt? (statisch ok, korrekt fuer
+        // Liveness.) /ready: nimmt der Pod neue Anfragen an? Waehrend des
+        // Shutdowns 503, damit Kubernetes ihn aus der Rotation nimmt.
         .route("/live", get(|| async { "ok" }))
-        .route("/ready", get(|| async { "ok" }))
+        .route("/ready", get(ready_probe))
         .route("/metrics", get(serve_metrics))
+}
+
+async fn ready_probe() -> impl IntoResponse {
+    if READY.load(Ordering::Relaxed) {
+        (StatusCode::OK, "ok")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "shutting down")
+    }
 }
 
 /// SLI-Metriken der prozessweiten Registry (siehe metrics-Modul); gefüllt
@@ -105,4 +204,31 @@ async fn serve_metrics() -> impl IntoResponse {
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         metrics::render(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{production_mode, require_in_production};
+
+    #[test]
+    fn require_in_production_only_bricht_im_produktionsbetrieb_ab() {
+        // Ohne Produktionsschalter: kein Abbruch, auch bei fehlendem Wert.
+        std::env::remove_var("SM_ENV");
+        assert!(!production_mode());
+        require_in_production::<String>(&None, "TEST_WERT");
+
+        // Mit Schalter: ein fehlender Pflichtwert bricht den Start ab.
+        std::env::set_var("SM_ENV", "production");
+        assert!(production_mode());
+        let abgebrochen =
+            std::panic::catch_unwind(|| require_in_production::<String>(&None, "TEST_WERT"))
+                .is_err();
+        assert!(
+            abgebrochen,
+            "fehlender Wert muss im Produktionsbetrieb abbrechen"
+        );
+        // Ein gesetzter Wert ist auch im Produktionsbetrieb in Ordnung.
+        require_in_production(&Some("da".to_string()), "TEST_WERT");
+        std::env::remove_var("SM_ENV");
+    }
 }

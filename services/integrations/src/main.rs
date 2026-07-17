@@ -13,6 +13,7 @@ use integrations::store::InMemoryTenantStore;
 async fn main() {
     telemetry::init();
     let cfg = ServiceConfig::from_env("integrations");
+    common::require_in_production(&cfg.database_url, "DATABASE_URL");
 
     // Ohne die Nachbardienste kann der Dienst weder Nutzer auflösen noch
     // Events zustellen: harter Startfehler statt eines Dienstes, der jede
@@ -87,5 +88,8 @@ async fn main() {
         "Dienst gestartet"
     );
 
-    axum::serve(listener, router).await.expect("Server läuft");
+    axum::serve(listener, router)
+        .with_graceful_shutdown(common::shutdown_signal())
+        .await
+        .expect("Server läuft");
 }
