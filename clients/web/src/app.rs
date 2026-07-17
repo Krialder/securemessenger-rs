@@ -1022,6 +1022,7 @@ async fn onboard(
     storage: SharedStorage,
     handle: String,
     password: String,
+    display_name: Option<String>,
 ) -> Result<Onboarded, String> {
     // Ab dem ersten Schreibvorgang verschlüsseln: bei der Registrierung
     // steht das Passwort durch die eigene Wahl fest, es gibt keine
@@ -1049,7 +1050,7 @@ async fn onboard(
     identity_client
         .register(&NewAccount {
             handle: &handle,
-            display_name: None,
+            display_name: display_name.as_deref(),
             password: &password,
             account_key: &account_key,
             device_public_key: &device_public,
@@ -2881,6 +2882,10 @@ fn App() -> impl IntoView {
     let (me, set_me) = signal(String::new());
     let (handle_input, set_handle_input) = signal(String::new());
     let (password_input, set_password_input) = signal(String::new());
+    // Anzeigename fürs Registrierungs-Formular (F010, optional): trägt
+    // Groß-/Kleinschreibung und Leerzeichen (Vor- und Nachname), anders als
+    // der technische Handle; leer heißt Rückfall auf den Handle.
+    let (reg_name_input, set_reg_name_input) = signal(String::new());
     let (text_input, set_text_input) = signal(String::new());
     // Die Unterhaltungen der Seitenleiste (jüngste zuerst) und der offene
     // Chat. Der Verlauf des offenen Chats liegt in `messages`.
@@ -3098,6 +3103,10 @@ fn App() -> impl IntoView {
             };
             let handle = handle_input.get_untracked();
             let password = password_input.get_untracked();
+            // Optionaler Anzeigename; nur Weißraum zählt als nicht angegeben
+            // (der Server trimmt ebenso und fällt dann auf den Handle zurück).
+            let display_name = Some(reg_name_input.get_untracked().trim().to_string())
+                .filter(|name| !name.is_empty());
             if handle.is_empty() || password.is_empty() {
                 set_status.set("Handle und Passwort angeben.".to_string());
                 return;
@@ -3106,7 +3115,7 @@ fn App() -> impl IntoView {
             set_status.set("Konto wird angelegt ...".to_string());
             let activate_session = activate_session.clone();
             spawn_local(async move {
-                match onboard(storage, handle.clone(), password).await {
+                match onboard(storage, handle.clone(), password, display_name).await {
                     Ok(onboarded) => {
                         activate_session(onboarded);
                         set_status.set("Bereit.".to_string());
@@ -5782,8 +5791,20 @@ fn App() -> impl IntoView {
                                                     />
                                                 </div>
                                                 <div class="sm-field">
+                                                    <label for="sm-regname">
+                                                        "Anzeigename (optional, z. B. Vor- und Nachname)"
+                                                    </label>
+                                                    <input
+                                                        id="sm-regname"
+                                                        prop:value=reg_name_input
+                                                        on:input=move |ev| {
+                                                            set_reg_name_input.set(event_target_value(&ev))
+                                                        }
+                                                    />
+                                                </div>
+                                                <div class="sm-field">
                                                     <label for="sm-newpass">
-                                                        "Passwort (mindestens 12 Zeichen)"
+                                                        "Passwort (12 bis 128 Zeichen, alle Zeichen erlaubt)"
                                                     </label>
                                                     <input
                                                         id="sm-newpass"

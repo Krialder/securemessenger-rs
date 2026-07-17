@@ -313,6 +313,32 @@ async fn register_login_logout_flow() {
 }
 
 #[tokio::test]
+async fn register_takes_display_name_and_free_password_charset() {
+    let app = test_app();
+    let identity = key(60);
+
+    // Das Passwort hat bewusst NUR eine Längenregel (NIST-Linie, keine
+    // Kompositionsregeln): Großbuchstaben, Umlaute, Leer- und Sonderzeichen
+    // gehen durch. Der Anzeigename trägt Groß-/Kleinschreibung und
+    // Leerzeichen (Vor- und Nachname); nur der Handle bleibt die technische
+    // Kennung (a-z, 0-9, _ . -). Dieser Test schreibt beides fest, damit
+    // eine spätere Validierungs-Änderung es nicht still verengt.
+    let password = "Größeres!Geheimnis 2026";
+    let mut register = register_body(&identity, "kai-delor", password, DEV_LAPTOP);
+    register["display_name"] = json!("Kai Delor");
+    let (status, body) = send(&app, "POST", "/accounts", Some(register), None).await;
+    assert_eq!(status, StatusCode::CREATED, "Antwort war: {body}");
+    assert_eq!(body["display_name"], "Kai Delor");
+
+    // Die Anmeldung mit genau diesem Passwort klappt und trägt den bei der
+    // Registrierung gewählten Namen zurück (Vorbelegung der Einstellungen).
+    let login = login_body("kai-delor", password, DEV_LAPTOP);
+    let (status, body) = send(&app, "POST", "/sessions", Some(login), None).await;
+    assert_eq!(status, StatusCode::OK, "Antwort war: {body}");
+    assert_eq!(body["display_name"], "Kai Delor");
+}
+
+#[tokio::test]
 async fn refresh_rotates_and_detects_reuse() {
     let app = test_app();
     let identity = key(2);

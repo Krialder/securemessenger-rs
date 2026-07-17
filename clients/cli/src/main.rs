@@ -177,12 +177,19 @@ async fn run() -> Result<(), String> {
     }
 }
 
-/// `sm register <handle> <passwort>`: erzeugt Konto-Wurzelschlüssel und
-/// libsignal-Geräte-Identität, registriert das Konto und legt Profil plus
-/// Zustands-Ablage an.
+/// `sm register <handle> <passwort> [anzeigename]`: erzeugt Konto-
+/// Wurzelschlüssel und libsignal-Geräte-Identität, registriert das Konto und
+/// legt Profil plus Zustands-Ablage an. Der optionale Anzeigename (F010)
+/// trägt Groß-/Kleinschreibung und Leerzeichen (Vor- und Nachname), anders
+/// als der technische Handle; ohne ihn fällt der Server auf den Handle
+/// zurück. Nachträglich ändert ihn `sm rename`.
 async fn register(args: &[String]) -> Result<(), String> {
-    let [handle, password] = args else {
-        return Err("Aufruf: sm register <handle> <passwort>".to_string());
+    let (handle, password, display_name) = match args {
+        [handle, password] => (handle, password, None),
+        [handle, password, name] => (handle, password, Some(name.as_str())),
+        _ => {
+            return Err("Aufruf: sm register <handle> <passwort> [anzeigename]".to_string());
+        }
     };
 
     let account_key = IdentityKeypair::generate();
@@ -201,7 +208,7 @@ async fn register(args: &[String]) -> Result<(), String> {
     let account = client
         .register(&NewAccount {
             handle: handle.as_str(),
-            display_name: None,
+            display_name,
             password: password.as_str(),
             account_key: &account_key,
             device_public_key: &device_public,
@@ -226,8 +233,8 @@ async fn register(args: &[String]) -> Result<(), String> {
     })?;
 
     println!(
-        "Registriert: {} (Gerät {}, Nummer {})",
-        account.handle, account.device_id, account.protocol_device_id
+        "Registriert: {} als \"{}\" (Gerät {}, Nummer {})",
+        account.handle, account.display_name, account.device_id, account.protocol_device_id
     );
     Ok(())
 }
@@ -2391,7 +2398,7 @@ fn print_usage() {
         "sm - SecureMessenger Referenzclient\n\
          \n\
          Befehle:\n\
-         \x20 register <handle> <passwort>   Konto und erstes Gerät anlegen\n\
+         \x20 register <handle> <passwort> [anzeigename]  Konto und erstes Gerät anlegen\n\
          \x20 login <passwort>               Gerät anmelden, Token speichern\n\
          \x20 logout                         Session abmelden\n\
          \x20 passwd <altes> <neues>         Konto-Passwort aendern (meldet andere Geraete ab)\n\
