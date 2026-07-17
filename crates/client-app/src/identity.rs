@@ -458,6 +458,30 @@ impl IdentityClient {
         Ok(renamed.display_name)
     }
 
+    /// `GET /accounts/{handle}`: den Anzeigenamen eines bekannten Kontakts
+    /// holen (F010), um ihn statt des rohen Handles anzuzeigen. `Ok(None)`
+    /// bei unbekanntem Handle. Der Aufrufer sollte den zuletzt gespeicherten
+    /// Namen bei Fehler NICHT löschen (der Name ist Server-Datum und darf bei
+    /// einem Ausfall nicht verschwinden).
+    pub async fn account_name(
+        &self,
+        access_token: &str,
+        handle: &str,
+    ) -> Result<Option<String>, ClientError> {
+        let response = self
+            .http
+            .get(self.url(&format!("/accounts/{handle}")))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(transport)?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let profile: ProfileFetched = parse_json(response).await?;
+        Ok(Some(profile.display_name))
+    }
+
     /// `POST /provision`: legt einen verschlüsselten Kopplungs-Antrag unter
     /// seiner Kanal-ID im Relay ab (QR-Kopplung). Tokenlos, weil das neue
     /// Gerät noch nicht registriert ist und der Inhalt für den Dienst opak
@@ -555,6 +579,11 @@ struct DisplayNameBody<'a> {
 
 #[derive(Deserialize)]
 struct DisplayNamed {
+    display_name: String,
+}
+
+#[derive(Deserialize)]
+struct ProfileFetched {
     display_name: String,
 }
 

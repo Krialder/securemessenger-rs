@@ -339,6 +339,53 @@ async fn register_takes_display_name_and_free_password_charset() {
 }
 
 #[tokio::test]
+async fn account_profile_returns_display_name_for_known_handle() {
+    let app = test_app();
+    let identity = key(61);
+
+    // Konto mit Anzeigename anlegen, zweites Konto als Abrufer.
+    let mut register = register_body(
+        &identity,
+        "kai-delor",
+        "korrektes-pferd-batterie",
+        DEV_LAPTOP,
+    );
+    register["display_name"] = json!("Kai Delor");
+    let (status, _) = send(&app, "POST", "/accounts", Some(register), None).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let viewer = register_body(&key(62), "lea", "korrektes-pferd-batterie", DEV_HANDY);
+    let (status, _) = send(&app, "POST", "/accounts", Some(viewer), None).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, body) = send(
+        &app,
+        "POST",
+        "/sessions",
+        Some(login_body("lea", "korrektes-pferd-batterie", DEV_HANDY)),
+        None,
+    )
+    .await;
+    let token = body["access_token"].as_str().unwrap().to_string();
+
+    // Ein Angemeldeter liest das Profil eines bekannten Handles: Handle plus
+    // Anzeigename, sonst nichts.
+    let (status, body) = send(&app, "GET", "/accounts/kai-delor", None, Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["handle"], "kai-delor");
+    assert_eq!(body["display_name"], "Kai Delor");
+    assert!(
+        body.get("identity_key").is_none(),
+        "kein Schluessel im Profil"
+    );
+
+    // Unbekanntes Handle: 404. Ohne Token: 401. Die festen /accounts-Unterpfade
+    // bleiben ihre eigenen Routen (kein Missverstaendnis als Handle).
+    let (status, _) = send(&app, "GET", "/accounts/gibt-es-nicht", None, Some(&token)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(&app, "GET", "/accounts/kai-delor", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn refresh_rotates_and_detects_reuse() {
     let app = test_app();
     let identity = key(2);

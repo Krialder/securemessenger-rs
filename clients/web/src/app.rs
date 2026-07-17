@@ -123,6 +123,66 @@ fn save_summaries(storage: &SharedStorage, summaries: &[ChatSummary]) {
     }
 }
 
+/// Ablage der Kontakt-Anzeigenamen (Handle -> Anzeigename) als ein Blob. Der
+/// Anzeigename ist Server-Datum (nicht Ende-zu-Ende); er wird beim App-Start
+/// und Chat-Öffnen aufgefrischt. Der Handle bleibt daneben die
+/// kryptografische Identität und wird in der Oberfläche mit angezeigt.
+const CONTACT_NAMES_KEY: &str = "contacts/names";
+
+fn load_contact_names(storage: &SharedStorage) -> std::collections::HashMap<String, String> {
+    storage
+        .borrow()
+        .get(CONTACT_NAMES_KEY)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_contact_names(storage: &SharedStorage, names: &std::collections::HashMap<String, String>) {
+    if let Ok(json) = serde_json::to_vec(names) {
+        let _ = storage.borrow_mut().put(CONTACT_NAMES_KEY, &json);
+    }
+}
+
+/// Holt für die gegebenen 1:1-Kontakte den aktuellen Anzeigenamen vom
+/// identity-Dienst und aktualisiert Signal und Ablage. Best effort: bei
+/// Fehler oder unbekanntem Handle bleibt der letzte Stand (ein Ausfall darf
+/// einen Namen nicht löschen). Gruppen (`grp:`) und der eigene Handle werden
+/// übersprungen.
+fn refresh_contact_names(
+    peers: Vec<String>,
+    own: &str,
+    token: String,
+    storage: SharedStorage,
+    set_contact_names: WriteSignal<std::collections::HashMap<String, String>>,
+) {
+    if token.is_empty() {
+        return;
+    }
+    for peer in peers {
+        if peer.starts_with("grp:") || peer.is_empty() || peer == own {
+            continue;
+        }
+        let token = token.clone();
+        let storage = storage.clone();
+        spawn_local(async move {
+            if let Ok(Some(name)) = IdentityClient::new(identity_url())
+                .account_name(&token, &peer)
+                .await
+            {
+                set_contact_names.update(|map| {
+                    let changed = map.get(&peer) != Some(&name);
+                    if changed {
+                        map.insert(peer.clone(), name);
+                        save_contact_names(&storage, map);
+                    }
+                });
+            }
+        });
+    }
+}
+
 /// Ablage-Schlüssel der Einstellung "versiegelt senden als Vorgabe". Ein
 /// Byte (0/1), damit die Wahl über Neuladen und Neuanmeldung erhalten
 /// bleibt; sie liegt im selben verschlüsselten Zustandsblob wie der Rest.
@@ -2909,6 +2969,10 @@ fn App() -> impl IntoView {
     // aus der Ablage geladen und bei Gründung/Beitritt fortgeschrieben.
     let (group_labels, set_group_labels) =
         signal(std::collections::HashMap::<String, GroupUi>::new());
+    // Anzeigenamen der 1:1-Kontakte (Handle -> Name), aus der Ablage geladen
+    // und beim App-Start und Chat-Öffnen aufgefrischt.
+    let (contact_names, set_contact_names) =
+        signal(std::collections::HashMap::<String, String>::new());
     // Offene Gruppen-Einladungen (Gruppen-IDs, Welcome vorgemerkt, noch
     // nicht beigetreten); als Banner mit Annehmen/Ablehnen in der
     // Seitenleiste. Aus der Ablage geladen, damit sie ein Neuladen
@@ -3081,8 +3145,20 @@ fn App() -> impl IntoView {
             set_me.set(new_core.handle.clone());
             set_group_labels.set(load_group_labels(&storage, &new_core.handle));
             set_invites.set(load_invites(&storage));
+            let summaries = load_summaries(&storage);
+            // Kontakt-Anzeigenamen aus der Ablage übernehmen und beim Start
+            // für alle 1:1-Kontakte auffrischen (automatische Übernahme einer
+            // Namensänderung eines Kontakts).
+            set_contact_names.set(load_contact_names(&storage));
+            refresh_contact_names(
+                summaries.iter().map(|c| c.peer.clone()).collect(),
+                &new_core.handle,
+                access_token.get_untracked(),
+                storage.clone(),
+                set_contact_names,
+            );
             *core.borrow_mut() = Some(new_core);
-            set_chats.set(load_summaries(&storage));
+            set_chats.set(summaries);
             let sealed = load_sealed_default(&storage);
             set_sealed_default.set(sealed);
             set_sealed_choice.set(sealed);
@@ -3831,6 +3907,15 @@ fn App() -> impl IntoView {
             set_blocked.set(None);
             // Einen Chat zu öffnen verlässt die Einstellungen-Ansicht.
             set_settings_open.set(false);
+            // Den Anzeigenamen des Kontakts frisch holen (eine Änderung des
+            // Kontakts kommt so beim Öffnen automatisch an).
+            refresh_contact_names(
+                vec![peer.clone()],
+                &me.get_untracked(),
+                access_token.get_untracked(),
+                storage.clone(),
+                set_contact_names,
+            );
             set_selected.set(Some(peer.clone()));
             // Blockier-Zustand des Kontakts nachladen; das Ergebnis zählt
             // nur, wenn der Chat beim Eintreffen noch offen ist.
@@ -4750,6 +4835,7 @@ fn App() -> impl IntoView {
                                     {move || {
                                         let sel = selected.get();
                                         let labels = group_labels.get();
+                                        let names = contact_names.get();
                                         let list = chats.get();
                                         if list.is_empty() {
                                             view! {
@@ -4773,10 +4859,13 @@ fn App() -> impl IntoView {
                                                     let click_peer = peer.clone();
                                                     // Gruppen-Chats zeigen ihren
                                                     // Anzeigenamen statt des
-                                                    // grp:-Schlüssels.
+                                                    // grp:-Schlüssels; 1:1-Chats
+                                                    // den Kontakt-Anzeigenamen,
+                                                    // sonst den rohen Handle.
                                                     let shown = labels
                                                         .get(&peer)
                                                         .map(|ui| ui.label.clone())
+                                                        .or_else(|| names.get(&peer).cloned())
                                                         .unwrap_or_else(|| peer.clone());
                                                     view! {
                                                         <li>
@@ -5306,19 +5395,41 @@ fn App() -> impl IntoView {
                                                     >
                                                         "Zurück"
                                                     </button>
-                                                    <h2
-                                                        class="sm-chat-name"
-                                                        tabindex="-1"
-                                                        node_ref=chat_name_ref
-                                                    >
-                                                        {move || {
-                                                            group_labels
-                                                                .get()
-                                                                .get(&name_peer)
-                                                                .map(|ui| ui.label.clone())
-                                                                .unwrap_or_else(|| name_peer.clone())
-                                                        }}
-                                                    </h2>
+                                                    <div class="sm-chat-title">
+                                                        <h2
+                                                            class="sm-chat-name"
+                                                            tabindex="-1"
+                                                            node_ref=chat_name_ref
+                                                        >
+                                                            {move || {
+                                                                group_labels
+                                                                    .get()
+                                                                    .get(&name_peer)
+                                                                    .map(|ui| ui.label.clone())
+                                                                    .or_else(|| {
+                                                                        contact_names.get().get(&name_peer).cloned()
+                                                                    })
+                                                                    .unwrap_or_else(|| name_peer.clone())
+                                                            }}
+                                                        </h2>
+                                                        {
+                                                            // Bei 1:1-Kontakten mit Anzeigenamen den
+                                                            // Handle klein darunter, damit die
+                                                            // kryptografische Identität sichtbar bleibt
+                                                            // (gegen Namens-Täuschung).
+                                                            let handle_peer = peer.clone();
+                                                            move || {
+                                                                let p = handle_peer.clone();
+                                                                (group_id_of(&p).is_none()
+                                                                    && contact_names.get().contains_key(&p))
+                                                                    .then(|| {
+                                                                        view! {
+                                                                            <span class="sm-chat-handle">{p.clone()}</span>
+                                                                        }
+                                                                    })
+                                                            }
+                                                        }
+                                                    </div>
                                                     {move || {
                                                         if connected.get() {
                                                             view! {

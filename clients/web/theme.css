@@ -739,11 +739,27 @@ button:disabled {
   background: var(--sm-surface-container);
 }
 
+/* Titelspalte des Chat-Kopfs: Anzeigename und darunter der Handle. Trägt
+   den auto-Rand, der die Verbindungsanzeige nach rechts schiebt. */
+.sm-chat-title {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-inline-end: auto;
+  min-width: 0;
+}
+
 .sm-chat-name {
   font-size: 1.05rem;
   font-weight: 700;
   margin: 0;
-  margin-inline-end: auto;
+}
+
+/* Der Handle unter dem Anzeigenamen: klein und gedämpft, aber lesbar. */
+.sm-chat-handle {
+  font-size: 0.78rem;
+  font-weight: 400;
+  color: var(--sm-on-surface-muted);
 }
 
 /* Der Kontaktname ist beim Chat-Wechsel das Fokusziel (tabindex=-1). */

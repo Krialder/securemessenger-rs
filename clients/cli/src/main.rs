@@ -146,6 +146,7 @@ async fn run() -> Result<(), String> {
         "delete-account" => delete_account(&args[1..]).await,
         "undelete" => undelete().await,
         "rename" => rename(&args[1..]).await,
+        "whois" => whois(&args[1..]).await,
         "rotate-key" => rotate_key().await,
         "publish-keys" => publish_keys().await,
         "group-create" => group_create(&args[1..]).await,
@@ -1416,6 +1417,26 @@ async fn rename(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `sm whois <handle>`: den aktuellen Anzeigenamen eines Kontakts abfragen
+/// (F010). Der Handle bleibt die kryptografische Identität; der Anzeigename
+/// ist Server-Datum und dient nur der Darstellung.
+async fn whois(args: &[String]) -> Result<(), String> {
+    let [handle] = args else {
+        return Err("Aufruf: sm whois <handle>".to_string());
+    };
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    match IdentityClient::new(identity_url())
+        .account_name(&token, handle)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        Some(name) => println!("{handle}: \"{name}\""),
+        None => println!("{handle}: unbekanntes Konto"),
+    }
+    Ok(())
+}
+
 /// `sm rotate-key`: rotiert den Konto-Wurzelschlüssel (ADR-0010). Nur auf
 /// dem Erstgerät (das den Wurzel-Seed hält). Zieht ein neues Wurzelpaar,
 /// signiert mit dem ALTEN Schlüssel das Rotations-Zertifikat (Kontinuität),
@@ -2399,6 +2420,7 @@ fn print_usage() {
          \n\
          Befehle:\n\
          \x20 register <handle> <passwort> [anzeigename]  Konto und erstes Gerät anlegen\n\
+         \x20 whois <handle>                 Anzeigename eines Kontakts abfragen\n\
          \x20 login <passwort>               Gerät anmelden, Token speichern\n\
          \x20 logout                         Session abmelden\n\
          \x20 passwd <altes> <neues>         Konto-Passwort aendern (meldet andere Geraete ab)\n\

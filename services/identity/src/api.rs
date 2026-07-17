@@ -43,6 +43,10 @@ const REGISTER_RATE_LIMIT: u32 = 5;
 /// Client. [ANNAHME: 20/min; die Spec fordert striktes Limit, nennt keine
 /// Zahl.]
 const DISCOVERY_RATE_LIMIT: u32 = 20;
+/// Anzeigename-Abrufe je Abrufer und Minute. Grosszuegig, weil die Clients
+/// beim App-Start je Kontakt einmal fragen und beim Chat-Oeffnen auffrischen;
+/// nur eine Bremse gegen missbraeuchliches Reihum-Abfragen. [ANNAHME: 120/min.]
+const PROFILE_RATE_LIMIT: u32 = 120;
 
 /// Geteilter Zustand aller Handler.
 #[derive(Clone)]
@@ -169,6 +173,11 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/accounts/undelete", post(undelete_account))
         .route("/accounts/rotate-identity", post(rotate_identity))
+        // Anzeigename eines bekannten Kontos (F010): jeder Angemeldete darf
+        // das Profil eines Handles lesen, um es bei seinen Kontakten
+        // anzuzeigen. Nach den festen /accounts/*-Routen eingehängt, damit
+        // 'undelete'/'rotate-identity' nicht als Handle missgedeutet werden.
+        .route("/accounts/{handle}", get(account_profile))
         .route("/pow", get(pow_info))
         .route("/sessions", post(login).delete(logout))
         .route("/sessions/refresh", post(refresh))
@@ -477,6 +486,16 @@ struct RotateDeviceCredential {
 /// Client die kanonische Form übernimmt statt seiner Roh-Eingabe.
 #[derive(Serialize)]
 struct DisplayNameResponse {
+    display_name: String,
+}
+
+/// Öffentliches Kontakt-Profil (Handle plus Anzeigename), das ein
+/// angemeldeter Nutzer zu einem bekannten Handle abfragt, um es bei seinen
+/// Kontakten anzuzeigen. Bewusst minimal: nur was zum Anzeigen nötig ist,
+/// keine Geräte, kein Schlüssel (die holt der Krypto-Pfad getrennt).
+#[derive(Serialize)]
+struct ProfileResponse {
+    handle: String,
     display_name: String,
 }
 
@@ -1205,6 +1224,45 @@ async fn change_display_name(
             Json(DisplayNameResponse { display_name: name }),
         )
             .into_response(),
+        Err(error) => store_failure(error),
+    }
+}
+
+/// `GET /accounts/{handle}`: das öffentliche Profil (Handle plus
+/// Anzeigename) eines bekannten Kontos. Bearer nötig (kein anonymes
+/// Verzeichnis-Grasen), aber jeder Angemeldete darf jedes Handle abfragen,
+/// wie beim Bündel-Abruf: die Clients zeigen den Anzeigenamen ihrer
+/// Kontakte an und frischen ihn bei Bedarf auf. Ehrliche Grenze: der
+/// Anzeigename ist Server-Datum, nicht Ende-zu-Ende und nicht im
+/// KT-Commitment; der Handle bleibt die kryptografische Identität. Ein
+/// vorgemerkt gelöschtes Konto bleibt bis zum Purge normal abfragbar (es ist
+/// in der Widerrufsfrist voll nutzbar).
+async fn account_profile(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(handle): axum::extract::Path<String>,
+) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return invalid_token(),
+        Err(error) => return session_failure(error),
+    };
+    if let Err(retry_after) = st
+        .limiter
+        .check(&format!("profile:{}", who.handle), PROFILE_RATE_LIMIT)
+    {
+        return common::rate::too_many_requests(retry_after);
+    }
+    match st.store.get(&handle).await {
+        Ok(Some(account)) => (
+            StatusCode::OK,
+            Json(ProfileResponse {
+                handle: account.handle,
+                display_name: account.display_name,
+            }),
+        )
+            .into_response(),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "not_found", "Kein solches Konto"),
         Err(error) => store_failure(error),
     }
 }
