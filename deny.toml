@@ -32,8 +32,10 @@ version = 2
 # Abhaengigkeit mit unbekannter/nicht gelisteter Lizenz laesst die CI rot
 # werden, damit keine unklare Lizenz unbemerkt hereinkommt.
 allow = [
-  # Eigene, nicht veroeffentlichte Workspace-Crates (erst-Partei).
-  "LicenseRef-Proprietary",
+  # Das Projekt selbst und sein Krypto-Kern (Signals libsignal, SPQR) stehen
+  # unter AGPL-3.0-only; der kombinierte Netzdienst wird unter AGPL
+  # offengelegt (Entscheidung 13.07.2026).
+  "AGPL-3.0-only",
   "MIT",
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
@@ -50,23 +52,9 @@ allow = [
   "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
-# Die eigenen Workspace-Crates tragen license = "LicenseRef-Proprietary"
-# (erst-Partei, nicht veroeffentlicht).
+# Die eigenen Workspace-Crates werden ohnehin uebersprungen (erst-Partei,
+# nicht veroeffentlicht); sie tragen die AGPL des Gesamtwerks.
 private = { ignore = true }
-# AUSNAHME, bewusst und dokumentiert: der Krypto-Kern von Signal (libsignal
-# und der Post-Quantum-Ratchet SPQR) steht unter AGPL-3.0-only. Das ist eine
-# fundamentale Architektur-Entscheidung (ADR-0005), kein Versehen; AGPL wird
-# NUR fuer genau diese Crates erlaubt, jedes andere AGPL-Crate laesst die CI
-# weiter rot werden. Die lizenzrechtliche Vertraeglichkeit von AGPL-Kern und
-# proprietaerer Auslieferung ist eine offene Rechts-/Betriebsfrage (siehe
-# offene-fragen.md), nicht durch diese Ausnahme geklaert.
-exceptions = [
-  { name = "libsignal-core", allow = ["AGPL-3.0-only"] },
-  { name = "libsignal-debug", allow = ["AGPL-3.0-only"] },
-  { name = "libsignal-protocol", allow = ["AGPL-3.0-only"] },
-  { name = "signal-crypto", allow = ["AGPL-3.0-only"] },
-  { name = "spqr", allow = ["AGPL-3.0-only"] },
-]
 
 [bans]
 # Mehrfach-Versionen desselben Crates sind im Baum normal (transitive

@@ -23,3 +23,7 @@ Guter Einstieg:
 - [Protokoll und Kryptografie](dokumentation/protokoll.md)
 - [Sicherheit und Bedrohungsmodell](dokumentation/sicherheit.md)
 - [Roadmap](dokumentation/roadmap.md)
+
+## Lizenz
+
+Dieses Projekt steht unter der **GNU Affero General Public License v3.0** (AGPL-3.0-only), voller Text in [LICENSE](LICENSE). Der Krypto-Kern (Signals libsignal) ist AGPL, und da AGPL Netzwerk-Copyleft ist, wird das kombinierte Werk unter AGPL offengelegt: wer den Dienst betreibt und über ein Netz anbietet, muss den korrespondierenden Quellcode unter denselben Bedingungen zugänglich machen.

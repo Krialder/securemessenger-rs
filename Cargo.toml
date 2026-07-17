@@ -32,9 +32,10 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-# SPDX-konforme Form der proprietaeren Lizenz (LicenseRef-*); die Crates
-# werden nicht veroeffentlicht, die Lizenz ist erst-Partei.
-license = "LicenseRef-Proprietary"
+# AGPL-3.0-only: das Projekt baut auf Signals libsignal (AGPL) auf, der
+# kombinierte Netzdienst wird daher unter AGPL offengelegt (Entscheidung
+# 13.07.2026, siehe offene-fragen.md). Der volle Lizenztext liegt in LICENSE.
+license = "AGPL-3.0-only"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
