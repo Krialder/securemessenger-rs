@@ -12,14 +12,16 @@ Viele früher offene Punkte sind inzwischen umgesetzt (Contact Discovery, Messag
 
 **Wer betreibt den KT-Auditor.** Wir selbst reicht nicht für echten Split-View-Schutz. Konsortium? Ein Transparenz-Verein? Mindestschutz inzwischen gesetzt: Client-Gossip (Clients und Auditoren vergleichen ihre signierten Wurzeln) ist ab Phase 3 verbindlich, weil er ohne externe Organisation auskommt. Ein unabhängiger externer Auditor bleibt das Ziel; solange er fehlt, ist im Bedrohungsmodell ehrlich ausgewiesen, dass der Split-View-Schutz reduziert ist. Offen bleibt, wer den externen Auditor betreibt.
 
-**OIDC-Provider für SSO. Entschieden:** gehärteter Standard-Provider (Default Keycloak) statt Eigenbau, redundant betrieben, weil "kein Eigenbau bei Sicherheit" auch für den Anmeldedienst gilt. Finale Produktwahl vor M3.
+**OIDC-Provider für SSO. Entschieden und gebaut:** gehärteter Standard-Provider (Default Keycloak) statt Eigenbau, redundant betrieben, weil "kein Eigenbau bei Sicherheit" auch für den Anmeldedienst gilt. Inzwischen scharf: versionierter Realm `securemessenger` mit zwei OIDC-Clients (Authorization Code Flow plus PKCE), per `--import-realm` geladen, Login-Fluss live bewiesen ([ADR-0011](entscheidungen/0011-sso-keycloak-realm.md)). Offen bleibt die finale Produktwahl vor M3 und die Produktionshärtung (Brute-Force, MFA, echte Nutzer-Föderation).
 
 **Compliance-Position.** CSAR und Online Safety Act. Muss vor Phase 3 stehen, weil es Datenmodell und Server-Fähigkeiten berührt. Aktuell bewusst offen, aber mit Deadline.
 
+**Lizenz-Verträglichkeit AGPL-Kern gegen proprietäre Auslieferung.** Der Krypto-Kern (Signals libsignal und der Post-Quantum-Ratchet SPQR, ADR-0005) steht unter AGPL-3.0-only; das Projekt selbst ist als `LicenseRef-Proprietary` deklariert. AGPL ist Netzwerk-Copyleft: wer das kombinierte Werk verbreitet oder als Netzdienst anbietet, loest damit eine Pflicht zur Quelloffenlegung des Gesamtwerks unter AGPL aus. Das ist eine Rechts- und Geschaeftsentscheidung, die nur die Organisation treffen kann (mögliche Wege: die AGPL-Pflichten annehmen und den Quellcode offenlegen, eine kommerzielle Lizenz von Signal einholen, oder das Auslieferungsmodell so wählen, dass keine Verbreitung/kein Netzangebot im AGPL-Sinn vorliegt). Der cargo-deny-Lizenz-Gate erlaubt AGPL bewusst NUR fuer diese Signal-Crates (deny.toml), damit der intendierte Kern die CI nicht blockiert; die Rechtsfrage bleibt davon unberuehrt offen.
+
 ## Krypto-Kern
 
-- Exakte Version-Pins für libsignal, OpenMLS, die ML-KEM- und ML-DSA-Implementierung. Beim Integrationsschritt setzen, mit signed commit.
-- Skipped-Keys-Fenster: Zielwert bis ~2000 übersprungene Keys, Aging, Speicherlimit pro Sitzung. Genau festlegen.
+- ~~Exakte Version-Pins für libsignal, OpenMLS, die ML-KEM- und ML-DSA-Implementierung. Beim Integrationsschritt setzen, mit signed commit.~~ GELÖST: libsignal v0.96.4 und OpenMLS sind in `crates/client-core/Cargo.toml` per Git-`rev` auf feste Release-Commits gepinnt (57d41c8 bzw. 47dbede), ML-KEM und ML-DSA kommen aus libsignal (PQXDH-Hybrid) und teilen dessen Pin. Offen bleibt nur der PQ-MLS-Pfad, der am Combiner-Draft haengt (siehe unten).
+- ~~Skipped-Keys-Fenster: Zielwert bis ~2000 übersprungene Keys, Aging, Speicherlimit pro Sitzung. Genau festlegen.~~ Der Zielwert ist gesetzt (`MAX_FORWARD_DISTANCE = 2000`, `crates/client-core/src/group.rs`); Aging und Speicherlimit je Sitzung liegen in der OpenMLS-Ratchet-Implementierung, nicht im eigenen Code.
 - Wie SPQR-Versionen in die eigene Wire-Version eingehängt werden.
 - Stichtags-Mechanik für erzwungene Re-Handshakes bei Suite-Wechsel.
 - PQ-MLS-Zeitpunkt, hängt am Combiner-Draft.
@@ -29,7 +31,7 @@ Viele früher offene Punkte sind inzwischen umgesetzt (Contact Discovery, Messag
 - ~~Rotation des Konto-Identitätsschlüssels. Das ist die Wurzel, also dringlich, nicht "irgendwann".~~ GELÖST durch [ADR-0010](entscheidungen/0010-wurzelschluessel-rotation.md): kontinuitätssigniertes Ersetzen (der alte Wurzelschlüssel signiert den neuen), atomar unter Kontosperre, mit Ablauf-Erneuerung und absturzsicherem Client. Offen bleibt nur die rollierende Übergangsvariante (alt und neu eine Zeit lang gültig) als spätere Verfeinerung.
 - Cross-Signing ja oder nein, und falls ja, wie man die Matrix-Fehler vermeidet (verlorene Cross-Signing-Schlüssel, Verifikations-Loops).
 - Safety Number bei Multi-Device: pro Identität rechnen (Tendenz), aber dann muss die Geräte-Sichtbarkeit woanders hin.
-- Geräte-Credential-Format im Detail.
+- ~~Geräte-Credential-Format im Detail.~~ GELÖST durch [ADR-0009](entscheidungen/0009-eine-geraete-identitaet.md) und die Umsetzung: eine Geräte-Identität, vom Konto-Wurzelschlüssel signiertes Credential über die libsignal-Geräteidentität, mit `not_after`; Format und Prüfung sind in identity und im Client-Core gebaut und getestet.
 
 ## Sealed Sender, Abuse, Messaging
 
@@ -41,7 +43,7 @@ Viele früher offene Punkte sind inzwischen umgesetzt (Contact Discovery, Messag
 
 ## Contact Discovery und MLS-DS
 
-- OPRF-Konstruktion und Rate-Limiting gegen Enumeration über die Suche.
+- ~~OPRF-Konstruktion und Rate-Limiting gegen Enumeration über die Suche.~~ GELÖST: `crates/oprf` (voprf 0.5, Ristretto255), identity `POST /discovery/evaluate` und `/discovery/lookup`, Rate-Limit `DISCOVERY_RATE_LIMIT = 20`/min je Abfrager (`services/identity/src/api.rs`). Der Server lernt aus der Suche nichts über die Anfrage (oblivious).
 - MLS Delivery Service: Reorder-Garantien, Auflösung konkurrierender Commits, Umgang mit External Commits. Steht in der Spec, die Werte fehlen.
 
 ## Betrieb, Zahlen, Kleinkram
@@ -57,4 +59,4 @@ Viele früher offene Punkte sind inzwischen umgesetzt (Contact Discovery, Messag
 
 - Umfang der formalen Modelle (ProVerif, Tamarin), Skelett ab Phase 2.
 - Fuzzing für Parser und Wire-Code.
-- Property-Tests für die Krypto-Integration (Round-Trip, Tampering, Out-of-Order).
+- ~~Property-Tests für die Krypto-Integration (Round-Trip, Tampering, Out-of-Order).~~ GELÖST: proptest in `franking`, `pow`, `kt-format`, `btlog`, `client-app` (Wire-Framing) und `client-core` (Session-Round-Trip, Tampering, Out-of-Order über echte PQXDH-Sitzungen). Offen bleiben die formalen Modelle (ProVerif/Tamarin) und ein cargo-fuzz-Harness (braucht nightly).
