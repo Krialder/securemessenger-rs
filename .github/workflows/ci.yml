@@ -83,6 +83,79 @@ jobs:
           TEST_DATABASE_URL_KT: postgres://postgres:ci@localhost:5432/kt
         run: cargo test --workspace --locked
 
+  coverage:
+    name: Test-Abdeckung (llvm-cov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      # Wie der check-Job: die PostgreSQL-Integrationstests zaehlen mit in die
+      # Abdeckung, sonst faellt der Store-Code faelschlich als ungetestet auf.
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: protoc installieren
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      # Source-based Coverage braucht die LLVM-Werkzeuge der Toolchain.
+      - name: llvm-tools-preview
+        run: rustup component add llvm-tools-preview
+
+      - name: cargo-llvm-cov installieren
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Cargo-Cache (coverage)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-cov-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Datenbanken anlegen
+        run: |
+          for db in identity directory delivery integrations kt; do
+            PGPASSWORD=ci psql -h localhost -U postgres -c "CREATE DATABASE $db"
+          done
+
+      # Ein instrumentierter Testlauf erzeugt lcov.info; der report-Aufruf
+      # nutzt dieselben Daten (kein zweiter Lauf) fuer die Job-Zusammenfassung.
+      - name: Abdeckung messen
+        env:
+          TEST_DATABASE_URL: postgres://postgres:ci@localhost:5432/identity
+          TEST_DATABASE_URL_DIRECTORY: postgres://postgres:ci@localhost:5432/directory
+          TEST_DATABASE_URL_DELIVERY: postgres://postgres:ci@localhost:5432/delivery
+          TEST_DATABASE_URL_INTEGRATIONS: postgres://postgres:ci@localhost:5432/integrations
+          TEST_DATABASE_URL_KT: postgres://postgres:ci@localhost:5432/kt
+        run: |
+          cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+          {
+            echo '### Test-Abdeckung'
+            echo '```'
+            cargo llvm-cov report --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: lcov-Artefakt hochladen
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
+
   supply-chain:
     name: Lieferkette (cargo-deny)
     runs-on: ubuntu-latest
@@ -97,6 +170,78 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  sbom:
+    name: SBOM (CycloneDX)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cargo-cyclonedx installieren
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx
+
+      # Erzeugt je Crate eine <crate>.cdx.json neben der Cargo.toml
+      # (CycloneDX 1.5). Der Lauf liest nur cargo metadata (Cargo.toml/.lock),
+      # baut nichts und braucht daher kein protoc.
+      - name: SBOM erzeugen
+        run: cargo cyclonedx --format json --spec-version 1.5
+
+      - name: SBOMs sammeln
+        run: |
+          mkdir -p sbom
+          find . -name '*.cdx.json' -not -path './sbom/*' -print0 \
+            | while IFS= read -r -d '' f; do
+                cp "$f" "sbom/$(echo "${f#./}" | tr '/' '_')"
+              done
+          ls -l sbom
+
+      - name: SBOM-Artefakt hochladen
+        uses: actions/upload-artifact@v7
+        with:
+          name: sbom-cyclonedx
+          path: sbom/
+          if-no-files-found: error
+
+  trivy:
+    name: Trivy (Dateisystem-Scan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Gate: echte Abhaengigkeits-Schwachstellen (Cargo.lock) und
+      # versehentlich eingecheckte Geheimnisse lassen den Job rot werden.
+      # Ergaenzt cargo-deny (RUSTSEC/Lizenzen) um den Secret-Scan; nur
+      # behebbare CRITICAL/HIGH zaehlen (ignore-unfixed).
+      - name: Trivy vuln und secret (Gate)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: 1
+          format: table
+
+      # Informativ (bricht NICHT ab): Trivy liest die Basis-Manifeste statisch,
+      # die Laufzeit-Haertung (securityContext mit runAsNonRoot und
+      # readOnlyRootFilesystem) steht aber im securityContext-Patch in
+      # deploy/k8s/kustomization.yaml, den erst kustomize einspielt. Ein Gate
+      # auf misconfig wuerde daher die dort bereits behobenen Punkte
+      # faelschlich anschlagen; die Ausgabe bleibt als Hinweis sichtbar.
+      - name: Trivy misconfig (informativ)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: misconfig
+          severity: CRITICAL,HIGH
+          exit-code: 0
+          format: table
 
   wasm:
     name: WASM-Build und Lint (Web-Client)
