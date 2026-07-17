@@ -37,6 +37,18 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: ingress-nginx
+    # Prometheus scrapt /metrics aus dem Monitoring-Namespace (siehe
+    # deploy/k8s/monitoring). Nur Port 8080; /metrics teilt sich diesen Port
+    # mit der API und den /internal-Routen, die aber weiter der
+    # INTERNAL_TOKEN schuetzt. Ohne einen so beschrifteten Namespace trifft
+    # die Regel nichts.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8080
   egress:
     # DNS-Aufloesung (kube-dns), sonst loest kein Dienstname auf.
     - to:

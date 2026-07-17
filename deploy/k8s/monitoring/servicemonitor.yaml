@@ -1,0 +1,43 @@
+# ServiceMonitor: der Prometheus-Operator scrapt /metrics aller sechs
+# eigenen Dienste. Die Metriken (process_up, http_requests_total,
+# http_request_duration_seconds) liefert jeder Dienst im Prometheus-
+# Textformat auf demselben Port wie die API (crates/common ops_router,
+# common::metrics). keycloak ist bewusst NICHT enthalten: es bringt eigene
+# Metriken in eigenem Format mit.
+#
+# jobLabel: app setzt das Prometheus-Label `job` auf den Dienstnamen
+# (identity/directory/...), damit die Alerts in prometheusrule.yaml sauber
+# je Dienst gruppieren (by (job)).
+#
+# [ANNAHME: Der Prometheus-Operator ist installiert und die Prometheus-CR
+# waehlt ServiceMonitors mit dem Label app.kubernetes.io/part-of=
+# securemessenger aus (serviceMonitorSelector). Ist der Selector der
+# Installation anders, passt die GitOps-Pipeline das Label hier an.]
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: securemessenger-services
+  labels:
+    app.kubernetes.io/part-of: securemessenger
+spec:
+  jobLabel: app
+  namespaceSelector:
+    matchNames:
+      - securemessenger
+  selector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - identity
+          - directory
+          - delivery
+          - integrations
+          - media
+          - kt
+  endpoints:
+    - port: http
+      path: /metrics
+      scheme: http
+      interval: 30s
+      scrapeTimeout: 10s

@@ -1,0 +1,84 @@
+# PrometheusRule: Alerts auf den SLIs aus common::metrics. Die Schwellen
+# spiegeln die SLO-Ziele (metrics.rs: API p95 < 2 s, Zustellpfad p95 <
+# 500 ms). Die Betriebs-Routen /live, /ready und /metrics sind aus den
+# SLO-Regeln ausgenommen: /ready antwortet beim Herunterfahren bewusst mit
+# 503, das ist kein Fehler im Sinne der Verfuegbarkeit und wuerde die
+# Fehlerquote bei jedem Rollout faelschlich hochtreiben.
+#
+# Das Label `job` traegt den Dienstnamen (ServiceMonitor jobLabel: app),
+# `namespace` setzt der Operator. Beide grenzen die Auswertung auf die
+# eigenen Dienste ein.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: securemessenger-slo
+  labels:
+    app.kubernetes.io/part-of: securemessenger
+spec:
+  groups:
+    - name: securemessenger.availability
+      rules:
+        # Ein Ziel, das Prometheus nicht scrapen kann (up == 0), heisst: der
+        # Pod ist weg oder haengt. 5 Minuten Toleranz gegen Rollout-Flattern.
+        - alert: SecureMessengerServiceDown
+          expr: |
+            up{namespace="securemessenger", job=~"identity|directory|delivery|integrations|media|kt"} == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Dienst {{ $labels.job }} nicht scrapebar"
+            description: >-
+              Prometheus erreicht {{ $labels.job }} (Pod {{ $labels.pod }})
+              seit 5 Minuten nicht. Liveness/Readiness und Pod-Ereignisse
+              pruefen.
+
+    - name: securemessenger.slo
+      rules:
+        # Fehlerquote: Anteil 5xx an allen echten API-Anfragen je Dienst.
+        - alert: SecureMessengerHighErrorRate
+          expr: |
+            sum by (job) (rate(http_requests_total{namespace="securemessenger", status=~"5..", route!~"/live|/ready|/metrics"}[5m]))
+            /
+            sum by (job) (rate(http_requests_total{namespace="securemessenger", route!~"/live|/ready|/metrics"}[5m]))
+            > 0.05
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.job }}: Fehlerquote ueber 5 %"
+            description: >-
+              Der Anteil der 5xx-Antworten von {{ $labels.job }} liegt seit
+              10 Minuten ueber 5 % ({{ $value | humanizePercentage }}).
+
+        # API-Latenz-SLO: p95 unter 2 s ueber alle Dienste.
+        - alert: SecureMessengerHighLatencyP95
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (job, le) (rate(http_request_duration_seconds_bucket{namespace="securemessenger", route!~"/live|/ready|/metrics"}[5m]))
+            ) > 2
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.job }}: p95-Latenz ueber 2 s"
+            description: >-
+              Das 95-Perzentil der Antwortzeit von {{ $labels.job }} liegt
+              seit 10 Minuten ueber dem SLO von 2 s ({{ $value }}s).
+
+        # Zustellpfad-SLO: strenger, p95 unter 500 ms (metrics.rs).
+        - alert: SecureMessengerDeliveryLatencyP95
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le) (rate(http_request_duration_seconds_bucket{namespace="securemessenger", job="delivery", route!~"/live|/ready|/metrics"}[5m]))
+            ) > 0.5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "delivery: p95-Latenz ueber 500 ms"
+            description: >-
+              Das 95-Perzentil der Antwortzeit des Zustelldienstes liegt seit
+              10 Minuten ueber dem SLO von 500 ms ({{ $value }}s).

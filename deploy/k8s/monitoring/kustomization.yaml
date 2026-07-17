@@ -1,0 +1,14 @@
+# Monitoring-Basis: ServiceMonitor und PrometheusRule fuer den Prometheus-
+# Operator. BEWUSST getrennt von der Haupt-Kustomization (deploy/k8s):
+# beide nutzen CRDs (monitoring.coreos.com/v1), die nur existieren, wenn der
+# Operator installiert ist. In der Haupt-Kustomization wuerde `kubectl apply
+# -k deploy/k8s` sonst auf jedem Cluster ohne Operator scheitern. Wer
+# Monitoring will, zeigt zusaetzlich hierauf.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: securemessenger
+
+resources:
+  - servicemonitor.yaml
+  - prometheusrule.yaml
