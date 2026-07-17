@@ -13,6 +13,16 @@ on:
     branches: [main]
   pull_request:
 
+# Least Privilege: der GITHUB_TOKEN darf nur lesen (keine Schreibrechte
+# noetig; kein Push, kein Kommentar, kein Release aus dieser Pipeline).
+permissions:
+  contents: read
+
+# Aeltere Laeufe desselben Branch/PR abbrechen, wenn ein neuer Commit kommt.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -20,6 +30,7 @@ jobs:
   check:
     name: Format, Lint, Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       # Eine PG-Instanz, eine Datenbank je Dienst (die sqlx-Migrations-
       # tabellen duerfen sich nicht in die Quere kommen, ENTWICKLUNG.md).
@@ -72,9 +83,25 @@ jobs:
           TEST_DATABASE_URL_KT: postgres://postgres:ci@localhost:5432/kt
         run: cargo test --workspace --locked
 
+  supply-chain:
+    name: Lieferkette (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # Prueft Cargo.lock gegen die RUSTSEC-Advisory-DB und setzt die
+      # Lizenz-/Quellen-Policy aus deny.toml durch (advisories, bans,
+      # licenses, sources). Bewusst akzeptierte Punkte stehen begruendet in
+      # deny.toml; alles andere laesst den Job rot werden.
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
   wasm:
     name: WASM-Build und Lint (Web-Client)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -108,6 +135,7 @@ jobs:
   docker:
     name: Docker-Image ${{ matrix.service }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: check
     strategy:
       matrix:

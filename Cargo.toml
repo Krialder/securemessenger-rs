@@ -32,7 +32,9 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-license = "Proprietär"
+# SPDX-konforme Form der proprietaeren Lizenz (LicenseRef-*); die Crates
+# werden nicht veroeffentlicht, die Lizenz ist erst-Partei.
+license = "LicenseRef-Proprietary"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }

@@ -1,0 +1,87 @@
+# Lieferketten-Pruefung fuer die CI (cargo-deny): RUSTSEC-Sicherheits-
+# advisories, erlaubte Lizenzen und erlaubte Quellen. Ein sicherheits-
+# kritischer Messenger prueft seine Abhaengigkeiten, nicht nur seinen
+# eigenen Code (pflichtenheft.md 8.2/8.8). Kalibriert gegen den echten
+# Cargo.lock-Baum, laeuft lokal und in .github/workflows/ci.yml gruen.
+
+[advisories]
+version = 2
+# Bewusst akzeptierte Advisories, jede mit Begruendung. Alles andere laesst
+# die CI rot werden. Behebbares wird behoben (crossbeam-deque/-epoch wurden
+# fuer RUSTSEC-2026-0204 aktualisiert), nicht ignoriert.
+ignore = [
+  # quick-xml-DoS (OOM/quadratisch) beim XML-Parsen. Kommt transitiv ueber
+  # object_store (S3-Client im media-Dienst); das XML stammt NUR vom
+  # operator-eigenen S3/MinIO-Backend (MEDIA_S3_*), nicht von Angreifer-
+  # Eingabe. Kein Fix: object_store 0.12.5 (aktuell) pinnt quick-xml < 0.41.
+  # Aufheben, sobald object_store quick-xml >= 0.41 zulaesst.
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+  # "Unmaintained", keine Verwundbarkeit: transitive Build-/Hilfs-Crates ohne
+  # eigenen Fix-Pfad. bincode 1.3.3 ist bewusst "fertig" (via kt/sm-web);
+  # instant, paste, proc-macro-error2 haengen an openmls/leptos/libcrux.
+  "RUSTSEC-2025-0141",
+  "RUSTSEC-2024-0384",
+  "RUSTSEC-2024-0436",
+  "RUSTSEC-2026-0173",
+]
+
+[licenses]
+version = 2
+# Erlaubte Lizenzen (permissiv, wie im Rust-Oekosystem ueblich). Eine
+# Abhaengigkeit mit unbekannter/nicht gelisteter Lizenz laesst die CI rot
+# werden, damit keine unklare Lizenz unbemerkt hereinkommt.
+allow = [
+  # Eigene, nicht veroeffentlichte Workspace-Crates (erst-Partei).
+  "LicenseRef-Proprietary",
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-DFS-2016",
+  "Unicode-3.0",
+  "Zlib",
+  "CC0-1.0",
+  "MPL-2.0",
+  "BSL-1.0",
+  # Permissive Daten-Lizenz (z. B. fuer Unicode-/Zeitzonen-Datentabellen).
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+# Die eigenen Workspace-Crates tragen license = "LicenseRef-Proprietary"
+# (erst-Partei, nicht veroeffentlicht).
+private = { ignore = true }
+# AUSNAHME, bewusst und dokumentiert: der Krypto-Kern von Signal (libsignal
+# und der Post-Quantum-Ratchet SPQR) steht unter AGPL-3.0-only. Das ist eine
+# fundamentale Architektur-Entscheidung (ADR-0005), kein Versehen; AGPL wird
+# NUR fuer genau diese Crates erlaubt, jedes andere AGPL-Crate laesst die CI
+# weiter rot werden. Die lizenzrechtliche Vertraeglichkeit von AGPL-Kern und
+# proprietaerer Auslieferung ist eine offene Rechts-/Betriebsfrage (siehe
+# offene-fragen.md), nicht durch diese Ausnahme geklaert.
+exceptions = [
+  { name = "libsignal-core", allow = ["AGPL-3.0-only"] },
+  { name = "libsignal-debug", allow = ["AGPL-3.0-only"] },
+  { name = "libsignal-protocol", allow = ["AGPL-3.0-only"] },
+  { name = "signal-crypto", allow = ["AGPL-3.0-only"] },
+  { name = "spqr", allow = ["AGPL-3.0-only"] },
+]
+
+[bans]
+# Mehrfach-Versionen desselben Crates sind im Baum normal (transitive
+# Abhaengigkeiten); nur warnen, nicht blockieren.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Der Krypto-Kern zieht libsignal, OpenMLS und den Post-Quantum-Ratchet
+# SPQR bewusst per Git-rev/-tag (Pins in crates/client-core/Cargo.toml und
+# transitiv ueber libsignal); diese Quellen sind erlaubt.
+allow-git = [
+  "https://github.com/signalapp/libsignal",
+  "https://github.com/openmls/openmls",
+  "https://github.com/signalapp/SparsePostQuantumRatchet",
+]

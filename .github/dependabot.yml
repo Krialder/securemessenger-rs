@@ -1,0 +1,26 @@
+# Automatische Update-PRs: Dependabot oeffnet woechentlich PRs fuer neue
+# Crate- und Action-Versionen (und, zusammen mit dem cargo-deny-Job und der
+# RUSTSEC-DB, fuer sicherheitsrelevante Updates). So verrottet die Lieferkette
+# nicht still zwischen manuellen Durchsichten.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    # Patch- und Minor-Updates buendeln, damit nicht Dutzende Einzel-PRs
+    # entstehen; Major-Updates kommen einzeln (potenziell brechend).
+    groups:
+      minor-und-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Hält auch die in ci.yml genutzten GitHub-Actions aktuell (und erlaubt
+  # spaeter das Umstellen auf Commit-SHA-Pins ueber automatische PRs).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
