@@ -167,6 +167,8 @@ async fn run() -> Result<(), String> {
         "send" => send(&args[1..]).await,
         "edit" => edit(&args[1..]).await,
         "delete" => delete(&args[1..]).await,
+        "export" => export_backup(&args[1..]),
+        "import" => import_backup(&args[1..]),
         "recv" => recv().await,
         "listen" => listen(&args[1..]).await,
         "verify" => verify().await,
@@ -2875,6 +2877,8 @@ fn print_usage() {
          \x20 send <handle> <text> [--ttl s] [--sealed]  E2EE senden (--ttl: verschwindet; --sealed: ohne Absender-Klartext)\n\
          \x20 edit <handle> <msg-id> <text>  gesendete Nachricht bearbeiten\n\
          \x20 delete <handle> <msg-id>       gesendete Nachricht bei allen loeschen\n\
+         \x20 export <datei> <sicherungs-pw>  Sicherung (Profil+Zustand) schreiben\n\
+         \x20 import <datei> <sicherungs-pw>  Sicherung in ein frisches Profil einspielen\n\
          \x20 recv                           wartende Nachrichten abholen und entschlüsseln\n\
          \x20 listen [--once]                Hinweiskanal halten und bei Hinweisen abholen\n\
          \x20 verify                         eigenen KT-Eintrag pruefen (Selbstpruefung)\n\
@@ -2962,6 +2966,85 @@ fn access_token(profile: &Profile) -> Result<String, String> {
         .access_token
         .clone()
         .ok_or_else(|| "Kein aktives Token. Zuerst 'sm login'.".to_string())
+}
+
+/// `sm export <datei> <sicherungs-passwort>`: schreibt eine tragbare,
+/// passwort-geschützte Sicherung von Profil UND Zustand (Geräte-Identität,
+/// Sitzungen, Gruppen, Verlauf). Auf einem frischen Client mit `sm import`
+/// wieder einspielbar. Das Sicherungs-Passwort ist unabhängig vom
+/// Konto-Passwort; es schützt nur die Datei.
+fn export_backup(args: &[String]) -> Result<(), String> {
+    let [file, passphrase] = args else {
+        return Err("Aufruf: sm export <datei> <sicherungs-passwort>".to_string());
+    };
+    let profile = load_profile()?;
+    let storage = open_storage()?;
+    let profile_json = serde_json::to_vec(&profile).map_err(|e| e.to_string())?;
+    let state = storage.borrow().snapshot()?;
+    let bundle = serde_json::json!({
+        "profile": BASE64.encode(&profile_json),
+        "state": BASE64.encode(&state),
+    });
+    let payload = serde_json::to_vec(&bundle).map_err(|e| e.to_string())?;
+    let sealed = client_app::backup::seal(&payload, passphrase)?;
+    std::fs::write(file, &sealed).map_err(|e| format!("Sicherung nicht schreibbar: {e}"))?;
+    println!(
+        "Sicherung geschrieben nach {file} ({} Byte). Auf einem frischen \
+         Client mit 'sm import' einspielen.",
+        sealed.len()
+    );
+    Ok(())
+}
+
+/// `sm import <datei> <sicherungs-passwort>`: stellt Profil und Zustand aus
+/// einer Sicherung wieder her. Verweigert, wenn schon ein Profil liegt (in
+/// ein FRISCHES Profil importieren, also SM_PROFILE/SM_STATE auf neue Pfade
+/// setzen). Danach mit dem Konto-Passwort `sm login`. Schreibt beide Dateien
+/// unter der aktuellen SM_PASSPHRASE-Betriebsart.
+fn import_backup(args: &[String]) -> Result<(), String> {
+    let [file, passphrase] = args else {
+        return Err("Aufruf: sm import <datei> <sicherungs-passwort>".to_string());
+    };
+    // Weder Profil noch Zustand überschreiben: der Import geht in ein
+    // FRISCHES Profil (sonst gingen die Schlüssel des bestehenden verloren).
+    for path in [profile_path(), state_path()] {
+        if std::path::Path::new(&path).exists() {
+            return Err(format!(
+                "Unter {path} liegt schon eine Datei. In ein frisches Profil \
+                 importieren (SM_PROFILE UND SM_STATE auf neue, leere Pfade setzen)."
+            ));
+        }
+    }
+    let bytes = std::fs::read(file).map_err(|e| format!("Sicherung nicht lesbar: {e}"))?;
+    let payload = client_app::backup::open(&bytes, passphrase)?;
+    let bundle: serde_json::Value =
+        serde_json::from_slice(&payload).map_err(|e| format!("Sicherung unlesbar: {e}"))?;
+    let decode = |field: &str| -> Result<Vec<u8>, String> {
+        let b64 = bundle[field]
+            .as_str()
+            .ok_or_else(|| format!("Sicherung ohne Feld '{field}'"))?;
+        BASE64
+            .decode(b64)
+            .map_err(|_| format!("Sicherung: '{field}' kein Base64"))
+    };
+    let profile: Profile =
+        serde_json::from_slice(&decode("profile")?).map_err(|e| format!("Profil unlesbar: {e}"))?;
+    let state = decode("state")?;
+    // Zustand und Profil unter der aktuellen Betriebsart ablegen. Scheitert
+    // das Schreiben des Zustands NACH dem Profil, die Profildatei wieder
+    // entfernen: sonst blockierte der Existenz-Wächter oben einen erneuten
+    // Import in dieselben Pfade (halber Import, aus dem kein 'sm login' käme).
+    save_profile(&profile)?;
+    if let Err(error) = open_storage()?.borrow_mut().replace_all(&state) {
+        let _ = std::fs::remove_file(profile_path());
+        return Err(error);
+    }
+    println!(
+        "Sicherung eingespielt: Konto {}. Jetzt mit dem Konto-Passwort \
+         anmelden ('sm login <passwort>').",
+        profile.handle
+    );
+    Ok(())
 }
 
 /// Die Ablage-Passphrase aus der Umgebung. Ist `SM_PASSPHRASE` gesetzt,

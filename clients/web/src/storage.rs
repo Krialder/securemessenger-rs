@@ -189,6 +189,47 @@ impl BrowserStorage {
         stored
     }
 
+    /// Erzeugt eine Sicherungs-Datei des gesamten Zustands, versiegelt unter
+    /// einer Sicherungs-Passphrase (`backup`-Modul, smbak.v1). Braucht einen
+    /// entsperrten Zustand (angemeldet); der Aufrufer bietet den Download an.
+    pub fn export_backup(&self, passphrase: &str) -> Result<Vec<u8>, String> {
+        let json = encode_state(&self.values);
+        client_app::backup::seal(json.as_bytes(), passphrase)
+    }
+
+    /// Stellt den Zustand aus einer Sicherungs-Datei wieder her: entschlüsselt
+    /// mit der Sicherungs-Passphrase und ERSETZT den gesamten Zustand. Wird
+    /// bewusst NICHT sofort geschrieben: der Sealer bleibt offen, damit die
+    /// anschließende Anmeldung die Ablage unter dem Konto-Passwort versiegelt
+    /// (kein Klartext im Ruhezustand und kein Passwort, das vom Konto-Passwort
+    /// abweicht). Bricht der Nutzer vor der Anmeldung ab, ist nichts
+    /// geschrieben und der Import zu wiederholen. Liefert nichts; den Handle
+    /// liest der Aufrufer danach aus dem Profil.
+    ///
+    /// `required_key` muss in der Sicherung liegen (der Profil-Schlüssel),
+    /// sonst ist sie kein brauchbares Konto und der bestehende Zustand bleibt
+    /// UNANGETASTET (erst prüfen, dann ersetzen), statt ihn gegen eine
+    /// unbrauchbare Sicherung einzutauschen.
+    pub fn import_backup(
+        &mut self,
+        file: &[u8],
+        passphrase: &str,
+        required_key: &str,
+    ) -> Result<(), String> {
+        let plaintext = client_app::backup::open(file, passphrase)?;
+        let values = decode_state(&plaintext)?;
+        if !values.contains_key(required_key) {
+            return Err("Die Sicherung enthält kein Konto.".to_string());
+        }
+        self.values = values;
+        self.sealer = None;
+        // has_state() soll true melden (ein Konto liegt vor); der Blob ist
+        // aber unversiegelt, also is_locked() = false -> die Anmeldung für den
+        // wiederhergestellten Handle greift.
+        self.raw = Some(plaintext);
+        Ok(())
+    }
+
     /// Serialisiert synchron (der Zustand ist klein, wenige KiB), sealt ihn
     /// mit dem Sealer, falls gesetzt, und schreibt asynchron; Fehler landen
     /// in der Konsole, weil der synchrone Trait sie nicht mehr zurückgeben

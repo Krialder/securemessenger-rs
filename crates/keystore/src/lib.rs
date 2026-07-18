@@ -28,7 +28,7 @@
 //! sind kein Geheimnis, nur je Ablage beziehungsweise je Schreibvorgang
 //! einmalig.
 
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use rand::RngCore as _;
@@ -68,16 +68,30 @@ impl std::fmt::Display for KeystoreError {
 
 impl std::error::Error for KeystoreError {}
 
+/// Feste Argon2id-Parameter, damit ein einmal versiegelter Blob (vor allem
+/// eine tragbare, langlebige Sicherungsdatei) auch nach einem Update der
+/// argon2-Bibliothek noch mit demselben Schlüssel öffnet: das Envelope trägt
+/// die Parameter NICHT mit, die Ableitung muss also reproduzierbar sein. Die
+/// Bibliotheks-Defaults haben sich schon einmal geändert (m_cost 4096 -> 19456
+/// zwischen 0.4 und 0.5); diese Werte pinnen den 0.5-Default (RFC-9106-nah:
+/// 19 MiB Speicher, 2 Durchläufe, 1 Spur), sodass bestehende Envelopes weiter
+/// öffnen und ein späteres Update nichts unlesbar macht.
+const ARGON2_M_COST: u32 = 19_456;
+const ARGON2_T_COST: u32 = 2;
+const ARGON2_P_COST: u32 = 1;
+
 /// Leitet den 32-Byte-Schlüssel deterministisch aus Passphrase und Salt ab.
-/// Argon2id mit den Bibliotheks-Defaultparametern (RFC-9106-nah); die
-/// Ableitung ist absichtlich teuer, deshalb ruft der [`Sealer`] sie nur
-/// einmal.
+/// Argon2id mit fest gepinnten Parametern (siehe oben); die Ableitung ist
+/// absichtlich teuer, deshalb ruft der [`Sealer`] sie nur einmal.
 fn derive_key(passphrase: &str, salt: &[u8]) -> [u8; KEY_LEN] {
     let mut key = [0u8; KEY_LEN];
+    let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, None)
+        .expect("gepinnte Argon2-Parameter sind gültig");
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     // hash_password_into mit rohem Salt scheitert nur bei absurden
     // Parametern (Salt zu kurz/lang); SALT_LEN liegt im gültigen Bereich,
     // der expect ist damit unerreichbar.
-    Argon2::default()
+    argon2
         .hash_password_into(passphrase.as_bytes(), salt, &mut key)
         .expect("Argon2id mit gültigem Salt und 32-Byte-Ausgabe");
     key

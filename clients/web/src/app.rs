@@ -1377,6 +1377,48 @@ fn save_counter(storage: &SharedStorage, next_prekey_id: u32) -> Result<(), Stri
         .put(COUNTER_KEY, &next_prekey_id.to_be_bytes())
 }
 
+/// Bietet Bytes als Datei-Download an: ein Blob, eine Objekt-URL und ein
+/// programmatisch geklickter Anker. Rein clientseitig, nichts verlässt den
+/// Browser (die Sicherung ist ohnehin schon verschlüsselt).
+fn download_file(filename: &str, bytes: &[u8]) -> Result<(), String> {
+    use wasm_bindgen::JsCast as _;
+    let array = js_sys::Uint8Array::from(bytes);
+    let parts = js_sys::Array::new();
+    parts.push(&array);
+    let blob = web_sys::Blob::new_with_u8_array_sequence(&parts)
+        .map_err(|_| "Blob nicht erzeugbar".to_string())?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob)
+        .map_err(|_| "Objekt-URL nicht erzeugbar".to_string())?;
+    let document = web_sys::window()
+        .and_then(|w| w.document())
+        .ok_or("kein Dokument")?;
+    let anchor = document
+        .create_element("a")
+        .map_err(|_| "Anker nicht erzeugbar".to_string())?
+        .dyn_into::<web_sys::HtmlAnchorElement>()
+        .map_err(|_| "kein Anker-Element".to_string())?;
+    anchor.set_href(&url);
+    anchor.set_download(filename);
+    anchor.click();
+    // Die Objekt-URL erst NACH einem kurzen Tick freigeben: manche Browser
+    // brechen den gerade angestoßenen Download ab, wenn die URL im selben
+    // synchronen Ablauf schon wieder ungültig ist.
+    spawn_local(async move {
+        gloo_timers::future::TimeoutFuture::new(1_000).await;
+        let _ = web_sys::Url::revoke_object_url(&url);
+    });
+    Ok(())
+}
+
+/// Liest die Bytes einer im Datei-Feld gewählten Datei (asynchron über die
+/// File-API des Browsers).
+async fn read_file_bytes(file: &web_sys::File) -> Result<Vec<u8>, String> {
+    let buffer = wasm_bindgen_futures::JsFuture::from(file.array_buffer())
+        .await
+        .map_err(|_| "Datei nicht lesbar".to_string())?;
+    Ok(js_sys::Uint8Array::new(&buffer).to_vec())
+}
+
 /// Konto anlegen: Schlüssel erzeugen, registrieren, anmelden, Prekeys
 /// veröffentlichen, Profil und Zähler verankern. Ein Schritt aus
 /// Nutzersicht, weil ein frisch angelegtes Konto ohne veröffentlichte
@@ -3453,6 +3495,11 @@ fn App() -> impl IntoView {
     let (me, set_me) = signal(String::new());
     let (handle_input, set_handle_input) = signal(String::new());
     let (password_input, set_password_input) = signal(String::new());
+    // Sicherungs-Passwörter: getrennt vom Konto-Passwort (die Sicherung
+    // verlässt das Gerät). Eines fürs Erstellen (Einstellungen), eines fürs
+    // Einspielen (Boot-Bildschirm).
+    let (backup_export_pw, set_backup_export_pw) = signal(String::new());
+    let (backup_import_pw, set_backup_import_pw) = signal(String::new());
     // Anzeigename fürs Registrierungs-Formular (F010, optional): trägt
     // Groß-/Kleinschreibung und Leerzeichen (Vor- und Nachname), anders als
     // der technische Handle; leer heißt Rückfall auf den Handle.
@@ -3557,6 +3604,10 @@ fn App() -> impl IntoView {
     let (theme, set_theme) = signal(stored_theme());
     // Fokusziel beim Chat-Wechsel: der Kontaktname im Chat-Kopf (SC 2.4.3).
     let chat_name_ref = NodeRef::<leptos::html::H2>::new();
+    // Das Datei-Feld für den Sicherungs-Import. Nur ein Ref, obwohl es in
+    // zwei Boot-Zweigen (Fresh und Locked) steht: die Zweige sind exklusiv,
+    // gebunden wird das gerade gerenderte Feld.
+    let backup_file_ref = NodeRef::<leptos::html::Input>::new();
     // Der Verlauf-Container, für den Auto-Scroll ans Ende bei neuen
     // Nachrichten und beim Öffnen eines Chats.
     let log_ref = NodeRef::<leptos::html::Ul>::new();
@@ -3864,6 +3915,163 @@ fn App() -> impl IntoView {
             }
             set_status.set(String::new());
             set_boot.set(Boot::Fresh);
+        }
+    };
+
+    // Sicherung erstellen (Einstellungen, angemeldet): den gesamten Zustand
+    // unter einem Sicherungs-Passwort versiegeln und als Datei herunterladen.
+    let on_backup_export = {
+        let current_storage = current_storage.clone();
+        move |_| {
+            let Some(storage) = current_storage() else {
+                set_status.set("Nicht angemeldet.".to_string());
+                return;
+            };
+            // Die Mindestlänge prüft backup::seal zentral (auch fürs CLI);
+            // hier wird nur die Fehlermeldung gezeigt.
+            let bytes = match storage
+                .borrow()
+                .export_backup(&backup_export_pw.get_untracked())
+            {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    set_status.set(error);
+                    return;
+                }
+            };
+            match download_file("securemessenger-sicherung.smbak", &bytes) {
+                Ok(()) => {
+                    set_backup_export_pw.set(String::new());
+                    set_status.set(
+                        "Sicherung heruntergeladen. Getrennt vom Gerät und sicher aufbewahren; \
+                         das Passwort ist der einzige Schlüssel dazu."
+                            .to_string(),
+                    );
+                }
+                Err(error) => set_status.set(format!("Download fehlgeschlagen: {error}")),
+            }
+        }
+    };
+
+    // Sicherung einspielen (Boot-Bildschirm): die gewählte Datei mit dem
+    // Sicherungs-Passwort entschlüsseln, den Zustand laden und zur Anmeldung
+    // des wiederhergestellten Handles wechseln (das Konto-Passwort versiegelt
+    // die Ablage dann wieder lokal).
+    let on_backup_import = SendWrapper::new(Rc::new({
+        let boot_storage = boot_storage.clone();
+        move |_: ()| {
+            if busy.get_untracked() {
+                return;
+            }
+            let Some(storage) = boot_storage.borrow().clone() else {
+                set_status.set("Ablage noch nicht bereit.".to_string());
+                return;
+            };
+            let pw = backup_import_pw.get_untracked();
+            if pw.is_empty() {
+                set_status.set("Sicherungs-Passwort angeben.".to_string());
+                return;
+            }
+            let file = backup_file_ref
+                .get_untracked()
+                .and_then(|input| input.files())
+                .and_then(|files| files.get(0));
+            let Some(file) = file else {
+                set_status.set("Zuerst eine Sicherungsdatei wählen.".to_string());
+                return;
+            };
+            // Liegt schon ein (verschlüsseltes) Konto auf diesem Gerät (Locked),
+            // ersetzt der Import es unwiderruflich. Das darf nicht still
+            // geschehen: erst bestätigen lassen.
+            if storage.borrow().is_locked() {
+                let confirmed = web_sys::window()
+                    .and_then(|w| {
+                        w.confirm_with_message(
+                            "Auf diesem Gerät liegt bereits ein verschlüsseltes Konto. \
+                             Der Import ersetzt es endgültig. Fortfahren?",
+                        )
+                        .ok()
+                    })
+                    .unwrap_or(false);
+                if !confirmed {
+                    set_status.set("Import abgebrochen.".to_string());
+                    return;
+                }
+            }
+            set_busy.set(true);
+            set_status.set("Sicherung wird eingespielt ...".to_string());
+            spawn_local(async move {
+                match read_file_bytes(&file).await {
+                    Ok(bytes) => {
+                        let result = storage.borrow_mut().import_backup(&bytes, &pw, PROFILE_KEY);
+                        match result {
+                            Ok(()) => match load_profile(&storage) {
+                                Some(profile) => {
+                                    set_backup_import_pw.set(String::new());
+                                    set_status.set(
+                                        "Sicherung eingespielt. Jetzt mit dem Konto-Passwort \
+                                         anmelden."
+                                            .to_string(),
+                                    );
+                                    set_boot.set(Boot::Known(profile.handle));
+                                }
+                                None => {
+                                    set_status.set("Die Sicherung enthält kein Konto.".to_string())
+                                }
+                            },
+                            Err(error) => set_status.set(format!("Import fehlgeschlagen: {error}")),
+                        }
+                    }
+                    Err(error) => set_status.set(format!("Datei nicht lesbar: {error}")),
+                }
+                set_busy.set(false);
+            });
+        }
+    }));
+
+    // Die Import-Karte erscheint in ZWEI Boot-Zweigen (Fresh und Locked); als
+    // wiederverwendbarer Bausatz statt doppeltem Markup. Der Klon je Aufruf
+    // hält den Handler-Rc; die beiden Zweige sind exklusiv, das Datei-Feld
+    // bindet also nur einmal.
+    let import_card = {
+        let on_backup_import = on_backup_import.clone();
+        move || {
+            let on_backup_import = on_backup_import.clone();
+            view! {
+                <section class="sm-card" aria-label="Sicherung einspielen">
+                    <h2>"Aus einer Sicherung wiederherstellen"</h2>
+                    <p class="sm-status">
+                        "Eine früher erstellte Sicherungsdatei (.smbak) einspielen: Gerät, "
+                        "Sitzungen und Verlauf kommen zurück. Danach mit dem Konto-Passwort "
+                        "anmelden."
+                    </p>
+                    <div class="sm-field">
+                        <label for="sm-backup-file">"Sicherungsdatei (.smbak)"</label>
+                        <input id="sm-backup-file" type="file" node_ref=backup_file_ref />
+                    </div>
+                    <div class="sm-field">
+                        <label for="sm-backup-pw">"Sicherungs-Passwort"</label>
+                        <input
+                            id="sm-backup-pw"
+                            type="password"
+                            prop:value=backup_import_pw
+                            on:input=move |ev| {
+                                set_backup_import_pw.set(event_target_value(&ev))
+                            }
+                        />
+                    </div>
+                    <div class="sm-row">
+                        <button
+                            type="button"
+                            class="sm-secondary"
+                            on:click=move |_| on_backup_import(())
+                            disabled=busy
+                        >
+                            "Sicherung einspielen"
+                        </button>
+                    </div>
+                </section>
+            }
         }
     };
 
@@ -5595,6 +5803,7 @@ fn App() -> impl IntoView {
                     let on_sealed_default_toggle = on_sealed_default_toggle.clone();
                     let on_push_history = on_push_history.clone();
                     let on_change_password = on_change_password.clone();
+                    let on_backup_export = on_backup_export.clone();
                     let open_settings = open_settings.clone();
                     view! {
                         <div class="sm-shell">
@@ -5843,6 +6052,7 @@ fn App() -> impl IntoView {
                                     let on_sealed_default_toggle = on_sealed_default_toggle.clone();
                                     let on_push_history = on_push_history.clone();
                                     let on_change_password = on_change_password.clone();
+                                    let on_backup_export = on_backup_export.clone();
                                     let on_rotate_key = on_rotate_key.clone();
                                     move || {
                                         // Diese reaktive Closure läuft mehrfach
@@ -5855,6 +6065,7 @@ fn App() -> impl IntoView {
                                             let on_revoke = on_revoke.clone();
                                             let on_unblock = on_unblock.clone();
                                             let on_change_password = on_change_password.clone();
+                                            let on_backup_export = on_backup_export.clone();
                                             let on_rotate_key = on_rotate_key.clone();
                                             return view! {
                                                 <div class="sm-settings" aria-label="Einstellungen">
@@ -5975,6 +6186,32 @@ fn App() -> impl IntoView {
                                                                     disabled=busy
                                                                 >
                                                                     "Passwort ändern"
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                        <div class="sm-set-row sm-set-stack">
+                                                            <span class="sm-set-label">
+                                                                "Sicherung erstellen"
+                                                                <small>"Lädt Gerät, Sitzungen und Verlauf verschlüsselt als Datei herunter. Getrennt vom Gerät aufbewahren; nach dem Leeren des Browser-Speichers damit wiederherstellbar."</small>
+                                                            </span>
+                                                            <div class="sm-set-form">
+                                                                <input
+                                                                    type="password"
+                                                                    class="sm-set-input"
+                                                                    aria-label="Sicherungs-Passwort (mindestens 12 Zeichen)"
+                                                                    placeholder="Sicherungs-Passwort (min. 12)"
+                                                                    prop:value=backup_export_pw
+                                                                    on:input=move |ev| {
+                                                                        set_backup_export_pw.set(event_target_value(&ev))
+                                                                    }
+                                                                />
+                                                                <button
+                                                                    type="button"
+                                                                    class="sm-secondary"
+                                                                    on:click=on_backup_export
+                                                                    disabled=busy
+                                                                >
+                                                                    "Sicherung herunterladen"
                                                                 </button>
                                                             </div>
                                                         </div>
@@ -6995,6 +7232,7 @@ fn App() -> impl IntoView {
                                                     </button>
                                                 </div>
                                             </section>
+                                            {import_card()}
                                         }
                                             .into_any()
                                     }
@@ -7071,6 +7309,7 @@ fn App() -> impl IntoView {
                                                     </button>
                                                 </div>
                                             </section>
+                                            {import_card()}
                                         }
                                             .into_any()
                                     }

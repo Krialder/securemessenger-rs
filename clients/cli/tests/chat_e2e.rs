@@ -318,6 +318,65 @@ async fn edit_and_delete_reach_receiver() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Sicherungs-Datei: `sm export` schreibt Profil und Zustand
+/// passwort-geschützt, `sm import` stellt sie in einem FRISCHEN Profil wieder
+/// her, und der wiederhergestellte Client chattet ueber die RESTAURIERTE
+/// Sitzung weiter (der Beweis, dass Geraete-Identitaet und Ratchet-Zustand
+/// mitkommen). Ein falsches Sicherungs-Passwort scheitert.
+#[tokio::test(flavor = "multi_thread")]
+async fn backup_export_import_restores_a_working_device() {
+    let urls = start_stack().await;
+    let dir = std::env::temp_dir().join(format!("sm-backup-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("Testverzeichnis");
+
+    let alice = CliUser::new(&dir, "alice", &urls);
+    let bob = CliUser::new(&dir, "bob", &urls);
+    alice.run(&["register", "alice", "alices-langes-passwort"]);
+    alice.run(&["login", "alices-langes-passwort"]);
+    alice.run(&["publish-keys"]);
+    bob.run(&["register", "bob", "bobs-langes-passwort"]);
+    bob.run(&["login", "bobs-langes-passwort"]);
+    bob.run(&["publish-keys"]);
+
+    // Eine Nachricht baut die Sitzung auf: genau der Zustand, den die
+    // Sicherung tragen muss.
+    alice.run(&["send", "bob", "erste vor der sicherung"]);
+    let recv = bob.run(&["recv"]);
+    assert!(
+        recv.contains("[alice] erste vor der sicherung"),
+        "stdout: {recv}"
+    );
+
+    // alice sichert Profil + Zustand unter einem eigenen Sicherungs-Passwort.
+    let backup_file = dir.join("alice.smbak").display().to_string();
+    alice.run(&["export", &backup_file, "sicherungs-passwort"]);
+
+    // Frischer Client (andere Profil-/Zustandsdateien). Falsches
+    // Sicherungs-Passwort scheitert, richtiges spielt ein.
+    let alice2 = CliUser::new(&dir, "alice-restored", &urls);
+    let bad = alice2
+        .command(&["import", &backup_file, "falsches-passwort"])
+        .output()
+        .expect("sm-Binary startet");
+    assert!(
+        !bad.status.success(),
+        "ein falsches Sicherungs-Passwort darf nicht importieren"
+    );
+    alice2.run(&["import", &backup_file, "sicherungs-passwort"]);
+    // Anmeldung mit dem KONTO-Passwort (unabhaengig vom Sicherungs-Passwort).
+    alice2.run(&["login", "alices-langes-passwort"]);
+    // Der wiederhergestellte Client sendet ueber die RESTAURIERTE Sitzung
+    // (kein neuer Buendel-Abruf; die Kontakt-Sitzung kam aus der Sicherung).
+    alice2.run(&["send", "bob", "nach der wiederherstellung"]);
+    let recv = bob.run(&["recv"]);
+    assert!(
+        recv.contains("[alice] nach der wiederherstellung"),
+        "der wiederhergestellte Client muss ueber die alte Sitzung senden, stdout: {recv}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Verschlüsselte Ablage: mit SM_PASSPHRASE liegen Profil und Zustand als
 /// keystore-Envelope auf der Platte (nicht als lesbares JSON), der volle
 /// Chat-Rundlauf funktioniert trotzdem über Prozessgrenzen, und eine

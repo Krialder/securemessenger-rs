@@ -159,6 +159,22 @@ impl FileStorage {
         std::fs::rename(&tmp, &self.path)
             .map_err(|error| format!("Zustands-Datei nicht ersetzbar: {error}"))
     }
+
+    /// Der Klartext-Zustand als Map-JSON (Werte Base64), das gemeinsame
+    /// Format für die Sicherungs-Datei (`backup`-Modul). Unabhängig davon, ob
+    /// die Datei verschlüsselt liegt: die Sicherung bringt ihren eigenen
+    /// Schutz mit.
+    pub fn snapshot(&self) -> Result<Vec<u8>, String> {
+        encode_map(&self.values)
+    }
+
+    /// Ersetzt den gesamten Zustand aus einem Map-JSON (aus einer Sicherung)
+    /// und schreibt ihn sofort unter der aktuellen Betriebsart (verschlüsselt,
+    /// falls ein Sealer gesetzt ist).
+    pub fn replace_all(&mut self, snapshot: &[u8]) -> Result<(), String> {
+        self.values = decode_map(snapshot)?;
+        self.persist()
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
