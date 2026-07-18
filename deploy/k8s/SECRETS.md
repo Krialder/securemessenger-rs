@@ -53,6 +53,13 @@ Deterministische 32-Byte-Seeds (Base64) erzeugt man z. B. mit
 |--------|-----|--------|
 | `delivery-push` | `vapid-private-key` | P-256-Privatschluessel als base64url ohne Padding (32 Byte). Weckt geschlossene Browser bei neuen Nachrichten. OPTIONAL: fehlt das Secret, laeuft Web-Push still als Noop (der Chat-Kern haengt nicht daran). Stabil halten, sonst wechselt der oeffentliche Schluessel und alle bestehenden Browser-Abos werden ungueltig. |
 
+## delivery + coturn: 1:1-Anrufe (F2, TURN)
+
+| Secret | Key | Inhalt |
+|--------|-----|--------|
+| `delivery-turn` | `shared-secret` | Zufaelliges Geheimnis (use-auth-secret), DASSELBE fuer delivery und coturn. delivery gibt daraus kurzlebige TURN-Zugangsdaten aus, coturn prueft sie. OPTIONAL: fehlt das Secret, sind Anrufe aus. |
+| `delivery-turn` | `urls` | Komma-Liste der ICE-Server, die der Client bekommt, z. B. `stun:turn.example:3478,turn:turn.example:3478?transport=udp`. In echt die OEFFENTLICH erreichbare Adresse des coturn-Servers. |
+
 ## media: Objektspeicher (S3/MinIO)
 
 | Secret | Key | Inhalt |

@@ -952,6 +952,24 @@ button:disabled {
   color: var(--sm-on-surface);
 }
 
+/* Anruf-Balken (F2): ueber der ganzen App, weil ein Anruf unabhaengig vom
+   offenen Chat klingelt. Auffaellige Flaeche, Aktionen rechts. */
+.sm-call-bar {
+  display: flex;
+  gap: var(--sm-space-3);
+  align-items: center;
+  flex-wrap: wrap;
+  padding: var(--sm-space-2) var(--sm-space-4);
+  background: var(--sm-surface-container-high);
+  border-block-end: 1px solid var(--sm-divider);
+  color: var(--sm-on-surface);
+  font-weight: 600;
+}
+
+.sm-call-bar span {
+  margin-inline-end: auto;
+}
+
 /* Banner ueber dem Composer im Bearbeiten-Modus: sagt, dass das Senden
    jetzt ersetzt statt anhaengt, mit Abbrechen daneben. */
 .sm-edit-banner {

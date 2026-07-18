@@ -138,6 +138,11 @@ pub struct AppState {
     /// Web-Push-Versand; Noop, wenn kein VAPID-Schlüssel gesetzt ist. Weckt
     /// Geräte, die gerade keinen WebSocket halten.
     push: Arc<dyn PushSender>,
+    /// Geteiltes Geheimnis für kurzlebige TURN-Zugangsdaten (F2, coturn
+    /// use-auth-secret); None = Anrufe aus (der Client blendet sie dann aus).
+    turn_secret: Option<String>,
+    /// STUN-/TURN-URLs, die der Client als ICE-Server bekommt.
+    turn_urls: Vec<String>,
     /// SHA-256-Digest des Shared Secrets; None = interne Routen aus.
     internal_token_hash: Option<String>,
     /// Rate-Limits der anonymen Pfade (Sealed-Sender-Annahme).
@@ -158,6 +163,8 @@ impl AppState {
             handle_presence: HandlePresence::default(),
             integrations: Arc::new(NoopIntegrationsGateway),
             push: Arc::new(NoopPushSender),
+            turn_secret: None,
+            turn_urls: Vec::new(),
             internal_token_hash: None,
             limiter: Arc::new(common::rate::RateLimiter::default()),
         }
@@ -166,6 +173,15 @@ impl AppState {
     /// Setzt den Web-Push-Versand (VAPID); ohne diesen Aufruf ist Push aus.
     pub fn with_push(mut self, push: Arc<dyn PushSender>) -> Self {
         self.push = push;
+        self
+    }
+
+    /// Setzt das TURN-Geheimnis und die ICE-Server-URLs (F2). Ohne diesen
+    /// Aufruf sind 1:1-Anrufe aus (die /turn-credentials-Route meldet 503,
+    /// der Client blendet den Anruf-Knopf aus).
+    pub fn with_turn(mut self, secret: &str, urls: Vec<String>) -> Self {
+        self.turn_secret = Some(secret.to_string());
+        self.turn_urls = urls;
         self
     }
 
@@ -223,6 +239,8 @@ pub fn app(state: AppState) -> Router {
             "/push/subscription",
             post(push_subscribe).delete(push_unsubscribe),
         )
+        // 1:1-Anrufe (F2): kurzlebige TURN-Zugangsdaten je angemeldetem Gerät.
+        .route("/turn-credentials", get(turn_credentials))
         .route("/ws", get(websocket));
     // Wie bei identity: ohne konfiguriertes Secret existieren die
     // internen Routen nicht (echtes 404 statt 401-Raterei).
@@ -612,6 +630,31 @@ async fn vapid_key(State(st): State<AppState>) -> Response {
 #[derive(Serialize)]
 struct VapidKeyResponse {
     public_key: String,
+}
+
+/// `GET /turn-credentials`: kurzlebige TURN-Zugangsdaten für den ANGEMELDETEN
+/// Nutzer (F2, coturn use-auth-secret). Nur angemeldet, damit der Relay kein
+/// offener Bandbreiten-Proxy wird. 503, wenn Anrufe nicht konfiguriert sind
+/// (der Client blendet den Anruf-Knopf dann aus).
+async fn turn_credentials(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    match authenticate(&st, &headers).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return invalid_token(),
+        Err(()) => return internal(),
+    }
+    let Some(secret) = st.turn_secret.as_deref() else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "calls_disabled",
+            "1:1-Anrufe sind auf diesem Server nicht konfiguriert.",
+        );
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let creds = crate::turn::credentials(secret, &st.turn_urls, now, crate::turn::TURN_TTL_SECS);
+    Json(creds).into_response()
 }
 
 #[derive(Deserialize)]

@@ -63,6 +63,21 @@ spec:
                   optional: true
             - name: VAPID_SUBJECT
               value: "mailto:admin@securemessenger.local"
+            # 1:1-Anrufe (F2): dasselbe Geheimnis wie coturn (use-auth-secret).
+            # Optional -> fehlt das Secret, sind Anrufe aus. TURN_URLS zeigen
+            # auf den oeffentlich erreichbaren coturn-Endpunkt.
+            - name: TURN_SHARED_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: delivery-turn
+                  key: shared-secret
+                  optional: true
+            - name: TURN_URLS
+              valueFrom:
+                secretKeyRef:
+                  name: delivery-turn
+                  key: urls
+                  optional: true
           livenessProbe:
             httpGet:
               path: /live

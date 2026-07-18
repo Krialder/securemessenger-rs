@@ -30,6 +30,11 @@ reqwest.workspace = true
 # Push beim Browser-Push-Dienst. Nur Signatur, keine Payload-Verschlüsselung
 # (der Aufweck-Push ist inhaltslos).
 p256 = { version = "0.13", features = ["ecdsa"] }
+# Kurzlebige TURN-Zugangsdaten (F2, coturn use-auth-secret): username =
+# Ablaufzeit, password = base64(HMAC-SHA1(secret, username)). coturns
+# REST-API nutzt HMAC-SHA1.
+hmac = "0.12"
+sha1 = "0.10"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

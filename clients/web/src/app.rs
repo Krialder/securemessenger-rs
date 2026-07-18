@@ -929,6 +929,13 @@ enum Incoming {
         peer: String,
         lines: Vec<client_app::sync::HistLine>,
     },
+    /// Ein 1:1-Anruf-Signal (Offer/Answer/ICE/Hangup) des Peers (F2). Reist
+    /// verschlüsselt wie eine Nachricht, landet aber nicht im Verlauf, sondern
+    /// bei der Anruf-Steuerung.
+    Call {
+        peer: String,
+        signal: client_app::call::Signal,
+    },
     /// Eine MLS-Gruppennachricht; der Absender kommt aus der von MLS
     /// geprüften Credential, nicht aus der Transport-Hülle.
     Group {
@@ -2001,6 +2008,126 @@ async fn deliver_1to1(
     Ok(id)
 }
 
+/// Löst die Geräte eines Kontakts auf (aus dem Cache oder per Bündel-Abruf
+/// samt Sitzungsaufbau) und cacht sie. Geteilt von der Nachrichten- und der
+/// Anruf-Signalisierung.
+async fn resolve_peer_devices(
+    core: &mut Core,
+    token: ReadSignal<String>,
+    peer: &str,
+) -> Result<Vec<ContactDevice>, String> {
+    let contact_key = format!("contact/{peer}");
+    let known: Vec<ContactDevice> = match core
+        .storage
+        .borrow()
+        .get(&contact_key)
+        .map_err(|e| e.to_string())?
+    {
+        Some(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| format!("Kontakt unlesbar: {e}"))?
+        }
+        None => Vec::new(),
+    };
+    if !known.is_empty() {
+        return Ok(known);
+    }
+    let bundles = DirectoryClient::new(directory_url())
+        .bundles(&token.get_untracked(), peer)
+        .await
+        .map_err(|e| e.to_string())?;
+    if bundles.devices.is_empty() {
+        return Err(format!("'{peer}' hat keine gültigen Geräte"));
+    }
+    let mut contact = Vec::with_capacity(bundles.devices.len());
+    for bundle_json in &bundles.devices {
+        let (bundle, protocol_device_id) =
+            bundle_from_directory(bundle_json).map_err(|e| e.to_string())?;
+        let address = ProtocolAddress::new(
+            peer.to_string(),
+            device_id_from_u32(protocol_device_id).map_err(|e| e.to_string())?,
+        );
+        core.device
+            .establish_session(&address, &bundle)
+            .await
+            .map_err(|e| format!("Sitzungsaufbau: {e}"))?;
+        contact.push(ContactDevice {
+            server_device_id: bundle_json.device_id.clone(),
+            protocol_device_id,
+        });
+    }
+    let json = serde_json::to_vec(&contact).map_err(|e| e.to_string())?;
+    core.storage
+        .borrow_mut()
+        .put(&contact_key, &json)
+        .map_err(|e| e.to_string())?;
+    Ok(contact)
+}
+
+/// Sendet ein Anruf-Signal (F2) an alle Geräte des Peers: Ende-zu-Ende über
+/// den Ratchet verschlüsselt, aber NICHT gefrankt (flüchtige Steuerung, keine
+/// meldbare Nachricht) und ohne Self-Sync. Kurze Frist, weil ein Signal an ein
+/// abwesendes Gerät wertlos ist.
+async fn send_call_signal(
+    core: &mut Core,
+    token: ReadSignal<String>,
+    peer: &str,
+    signal: &client_app::call::Signal,
+) -> Result<(), String> {
+    let devices = resolve_peer_devices(core, token, peer).await?;
+    let plaintext = signal.encode();
+    let expires_at = Some(now_unix() + 120);
+    let mut envelopes = Vec::with_capacity(devices.len());
+    for target in &devices {
+        let address = ProtocolAddress::new(
+            peer.to_string(),
+            device_id_from_u32(target.protocol_device_id).map_err(|e| e.to_string())?,
+        );
+        let message = core
+            .device
+            .encrypt(&address, &plaintext)
+            .await
+            .map_err(|e| format!("Signal-Verschlüsselung: {e}"))?;
+        let envelope = wire::seal(&core.handle, own_device_number(core), &message)
+            .map_err(|e| e.to_string())?;
+        envelopes.push(OutgoingEnvelope {
+            id: new_uuid(),
+            recipient: peer.to_string(),
+            device_id: target.server_device_id.clone(),
+            envelope,
+            franking_tag: None,
+            expires_at,
+        });
+    }
+    DeliveryClient::new(delivery_url())
+        .submit(&token.get_untracked(), &envelopes)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Baut den Signal-Sink für eine `CallSession`: jedes ausgehende Signal wird
+/// verschlüsselt an den Peer gesendet. Nimmt den Core kurz aus dem RefCell
+/// (wie run_send), damit kein Borrow über das await gehalten wird; überlappt
+/// ein Signal mit einer anderen Core-Operation, geht es verloren (ICE hat
+/// Redundanz, dokumentierte Grenze der Referenz-Umsetzung).
+fn call_sink(core: SharedCore, token: ReadSignal<String>, peer: String) -> crate::call::SignalSink {
+    Rc::new(move |signal: client_app::call::Signal| {
+        let core = core.clone();
+        let peer = peer.clone();
+        spawn_local(async move {
+            let taken = core.borrow_mut().take();
+            if let Some(mut active) = taken {
+                if let Err(error) = send_call_signal(&mut active, token, &peer, &signal).await {
+                    leptos::logging::warn!("Anruf-Signal nicht gesendet: {error}");
+                }
+                *core.borrow_mut() = Some(active);
+            } else {
+                leptos::logging::warn!("Anruf-Signal übersprungen (Core gerade belegt)");
+            }
+        })
+    })
+}
+
 /// Sendet eine neue 1:1-Nachricht (roher Text) und liefert ihre ID (das
 /// Franking-Commitment) zurück, damit die eigene Verlaufszeile sie trägt und
 /// ein späteres Bearbeiten/Löschen sie trifft.
@@ -3041,6 +3168,19 @@ async fn fetch_messages(
                             leptos::logging::warn!("Sync-Hülle {} unlesbar: {error}", message.id)
                         }
                     }
+                } else if client_app::call::is_signal(&payload) {
+                    // Ein Anruf-Signal (F2): nicht in den Chat, sondern an die
+                    // Anruf-Steuerung. Reist ungefrankt, deshalb VOR
+                    // open_payload erkannt.
+                    match client_app::call::decode(&payload) {
+                        Ok(signal) => received.push(Incoming::Call {
+                            peer: opened.from.clone(),
+                            signal,
+                        }),
+                        Err(error) => {
+                            leptos::logging::warn!("Anruf-Signal {} unlesbar: {error}", message.id)
+                        }
+                    }
                 } else {
                     // sealed=false: unversiegelt, die Absenderadresse ist
                     // Klartext und fälschbar; ein Änderungsereignis daraus
@@ -3500,6 +3640,51 @@ enum Boot {
     Broken(String),
 }
 
+/// Zustand der Anruf-Oberfläche (F2). Die eigentliche Verbindung hält ein
+/// `call::CallSession` daneben; dieses Signal steuert nur die Anzeige.
+#[derive(Clone, PartialEq)]
+enum CallUi {
+    /// Kein Anruf.
+    Idle,
+    /// Anruf gestartet, wartet auf Annahme des Peers.
+    Outgoing { peer: String, call_id: String },
+    /// Ein eingehender Anruf klingelt; das Offer wartet bis zur Annahme.
+    Incoming {
+        peer: String,
+        call_id: String,
+        sdp: String,
+    },
+    /// Verbunden.
+    Active {
+        peer: String,
+        call_id: String,
+        muted: bool,
+    },
+}
+
+impl CallUi {
+    /// Der Peer des aktuellen Anrufs (für die Signal-Zuordnung).
+    fn peer(&self) -> Option<&str> {
+        match self {
+            CallUi::Idle => None,
+            CallUi::Outgoing { peer, .. }
+            | CallUi::Incoming { peer, .. }
+            | CallUi::Active { peer, .. } => Some(peer),
+        }
+    }
+
+    /// Die Kennung des aktuellen Anrufs (zum Abgleich später/doppelt
+    /// eintreffender Signale mit dem RICHTIGEN Anruf).
+    fn call_id(&self) -> Option<&str> {
+        match self {
+            CallUi::Idle => None,
+            CallUi::Outgoing { call_id, .. }
+            | CallUi::Incoming { call_id, .. }
+            | CallUi::Active { call_id, .. } => Some(call_id),
+        }
+    }
+}
+
 #[component]
 fn App() -> impl IntoView {
     let core: SharedCore = SendWrapper::new(Rc::new(RefCell::new(None)));
@@ -3599,6 +3784,17 @@ fn App() -> impl IntoView {
     // Web-Push (Benachrichtigungen bei geschlossenem Browser) für dieses
     // Gerät ein/aus; aus der Ablage geladen (Einstellungen).
     let (push_on, set_push_on) = signal(false);
+    // 1:1-Anruf (F2): der reaktive Anzeige-Zustand und die lebende
+    // WebRTC-Verbindung daneben (nicht reaktiv, hält Browser-Ressourcen).
+    let (call_ui, set_call_ui) = signal(CallUi::Idle);
+    let call_session: SendWrapper<Rc<RefCell<Option<Rc<crate::call::CallSession>>>>> =
+        SendWrapper::new(Rc::new(RefCell::new(None)));
+    // Antwort-/ICE-Signale, die eintreffen, BEVOR die Session steht (die
+    // Klingel-/Aufbauphase des Angerufenen): gepuffert und beim Session-Start
+    // nachgespielt, sonst gingen die früh getrickelten ICE-Kandidaten verloren
+    // und der Anruf hätte keinen Ton.
+    let call_pending: SendWrapper<Rc<RefCell<Vec<client_app::call::Signal>>>> =
+        SendWrapper::new(Rc::new(RefCell::new(Vec::new())));
     // Die globale Blockliste (alle blockierten Handles) für die
     // Einstellungen-Ansicht; `None`, solange nicht geladen.
     let (block_list, set_block_list) = signal(Option::<Vec<String>>::None);
@@ -4338,15 +4534,138 @@ fn App() -> impl IntoView {
         }
     };
 
+    // Ein eingehendes Anruf-Signal des Peers verarbeiten (aus dem Abholweg).
+    // Alle Zweige gleichen die call_id des Signals gegen den LAUFENDEN Anruf
+    // ab, damit ein spätes/doppeltes Signal eines alten Anrufs einen neuen
+    // nicht stört.
+    let apply_call_signal = SendWrapper::new(Rc::new({
+        let core = core.clone();
+        let call_session = call_session.clone();
+        let call_pending = call_pending.clone();
+        move |peer: String, signal: client_app::call::Signal| {
+            use client_app::call::Signal;
+            // Ob das Signal zum gerade laufenden/klingelnden Anruf gehört.
+            let current = call_ui.get_untracked();
+            let matches_current = current.peer() == Some(peer.as_str())
+                && current.call_id() == Some(signal.call_id());
+            // Einem Anrufer, dessen Offer wir nicht annehmen können, ein
+            // Hangup zurückgeben (besetzt/Glare-Verlierer).
+            let busy_reply = {
+                let core = core.clone();
+                move |call_id: String, reason: &'static str, peer: String| {
+                    spawn_local(async move {
+                        let taken = core.borrow_mut().take();
+                        if let Some(mut active) = taken {
+                            let _ = send_call_signal(
+                                &mut active,
+                                access_token,
+                                &peer,
+                                &Signal::Hangup {
+                                    call_id,
+                                    reason: reason.to_string(),
+                                },
+                            )
+                            .await;
+                            *core.borrow_mut() = Some(active);
+                        }
+                    });
+                }
+            };
+            match signal {
+                Signal::Offer { call_id, sdp } => match current {
+                    CallUi::Idle => {
+                        set_call_ui.set(CallUi::Incoming {
+                            peer: peer.clone(),
+                            call_id,
+                            sdp,
+                        });
+                        set_status.set(format!("{peer} ruft an ..."));
+                    }
+                    // Glare: ich rufe gerade DENSELBEN Peer an und bekomme sein
+                    // Offer. Deterministischer Tie-Break über die Handles: der
+                    // lexikografisch kleinere Handle bleibt Anrufer, der
+                    // größere gibt seinen Versuch auf und nimmt das Offer an.
+                    CallUi::Outgoing {
+                        peer: my_peer,
+                        call_id: my_call,
+                    } if my_peer == peer => {
+                        let own = me.get_untracked();
+                        if own < peer {
+                            // Ich bleibe Anrufer: das fremde Offer verwerfen
+                            // (der Peer nimmt meins an).
+                            busy_reply(call_id, "glare", peer.clone());
+                        } else {
+                            // Ich gebe auf: meinen Versuch schließen und das
+                            // Offer annehmen (Incoming), damit einer gewinnt.
+                            busy_reply(my_call, "glare", peer.clone());
+                            if let Some(session) = call_session.borrow_mut().take() {
+                                session.close();
+                            }
+                            call_pending.borrow_mut().clear();
+                            set_call_ui.set(CallUi::Incoming {
+                                peer: peer.clone(),
+                                call_id,
+                                sdp,
+                            });
+                            set_status.set(format!("{peer} ruft an ..."));
+                        }
+                    }
+                    // Sonst besetzt.
+                    _ => busy_reply(call_id, "besetzt", peer.clone()),
+                },
+                Signal::Answer { .. } | Signal::Ice { .. } => {
+                    if !matches_current {
+                        return; // Signal eines fremden/alten Anrufs.
+                    }
+                    let is_answer = matches!(signal, Signal::Answer { .. });
+                    let current_session = call_session.borrow().as_ref().cloned();
+                    if let Some(session) = current_session {
+                        spawn_local(async move {
+                            let _ = session.on_signal(signal).await;
+                        });
+                    } else {
+                        // Die Session steht noch nicht (Klingel-/Aufbauphase):
+                        // puffern und beim Session-Start nachspielen.
+                        call_pending.borrow_mut().push(signal);
+                    }
+                    if is_answer {
+                        if let CallUi::Outgoing { peer, call_id } = call_ui.get_untracked() {
+                            set_call_ui.set(CallUi::Active {
+                                peer,
+                                call_id,
+                                muted: false,
+                            });
+                            set_status.set(String::new());
+                        }
+                    }
+                }
+                Signal::Hangup { .. } => {
+                    if matches_current {
+                        if let Some(session) = call_session.borrow_mut().take() {
+                            session.close();
+                        }
+                        call_pending.borrow_mut().clear();
+                        set_call_ui.set(CallUi::Idle);
+                        set_status.set(format!("{peer} hat aufgelegt."));
+                    }
+                }
+            }
+        }
+    }));
+
     // Der Abhol-Ablauf, geteilt zwischen Knopf und Hinweis-Effect.
     let run_fetch = SendWrapper::new(Rc::new({
         let core = core.clone();
+        let apply_call_signal = apply_call_signal.clone();
         move || {
             if busy.get_untracked() {
                 return;
             }
             set_busy.set(true);
             let core = core.clone();
+            // Je Aufruf einen eigenen Klon des Anruf-Signal-Handlers, damit die
+            // äußere Closure Fn bleibt (der async-Block zieht ihn hinein).
+            let apply_call_signal = apply_call_signal.clone();
             spawn_local(async move {
                 // Herausnehmen statt Borrow über await halten, wie beim
                 // Senden (clippy await_holding_refcell_ref).
@@ -4365,6 +4684,12 @@ fn App() -> impl IntoView {
                                 let own = me.get_untracked();
                                 let mut summaries = None;
                                 for item in received {
+                                    // Ein Anruf-Signal (F2) geht nicht in den
+                                    // Chat, sondern an die Anruf-Steuerung.
+                                    if let Incoming::Call { peer, signal } = item {
+                                        apply_call_signal(peer, signal);
+                                        continue;
+                                    }
                                     // Ein Verlaufs-Nachzug (Koppeln) bringt
                                     // mehrere Zeilen für einen Chat; sie werden
                                     // in die Ablage gemischt statt einzeln
@@ -4540,13 +4865,14 @@ fn App() -> impl IntoView {
                                             false,
                                         ),
                                         // History, Gruppen-Ereignisse und
-                                        // Edit/Delete sind oben behandelt.
+                                        // Edit/Delete/Call sind oben behandelt.
                                         Incoming::SyncedHistory { .. }
                                         | Incoming::GroupUpdated { .. }
                                         | Incoming::GroupRemovedSelf { .. }
                                         | Incoming::GroupInvite { .. }
                                         | Incoming::Edit { .. }
-                                        | Incoming::Delete { .. } => unreachable!(),
+                                        | Incoming::Delete { .. }
+                                        | Incoming::Call { .. } => unreachable!(),
                                     };
                                     let for_open = open.as_deref() == Some(chat_peer.as_str());
                                     let bump = !outgoing && !for_open;
@@ -4822,6 +5148,254 @@ fn App() -> impl IntoView {
             set_messages.set(load_history(&storage, &peer));
         }
     };
+
+    // --- 1:1-Anrufe (F2) ---
+    // Holt die TURN-Zugangsdaten und baut eine CallSession; None, wenn Anrufe
+    // aus sind oder etwas scheitert (dann meldet der Aufrufer und geht auf
+    // Idle zurück).
+    let new_call_session = {
+        let core = core.clone();
+        move |call_id: String, peer: String| {
+            let core = core.clone();
+            async move {
+                let creds = DeliveryClient::new(delivery_url())
+                    .turn_credentials(&access_token.get_untracked())
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "Anrufe sind auf diesem Server nicht aktiv.".to_string())?;
+                let sink = call_sink(core.clone(), access_token, peer.clone());
+                crate::call::CallSession::new(&call_id, &creds, sink)
+            }
+        }
+    };
+
+    // Ein Hangup an den Peer schicken, ohne dass eine Session existiert
+    // (Ablehnen, Abbruch während des Klingelns, Annehmen-Fehler).
+    let hangup_peer = {
+        let core = core.clone();
+        move |peer: String, call_id: String, reason: &'static str| {
+            let core = core.clone();
+            spawn_local(async move {
+                let taken = core.borrow_mut().take();
+                if let Some(mut active) = taken {
+                    let _ = send_call_signal(
+                        &mut active,
+                        access_token,
+                        &peer,
+                        &client_app::call::Signal::Hangup {
+                            call_id,
+                            reason: reason.to_string(),
+                        },
+                    )
+                    .await;
+                    *core.borrow_mut() = Some(active);
+                }
+            });
+        }
+    };
+
+    // Nach dem Aufbau: die Session ablegen, aber nur, wenn der Anruf noch
+    // derselbe ist (sonst wurde er inzwischen abgebrochen -> Session schließen,
+    // Mikrofon freigeben). Verdrahtet on_closed (gescheiterte Verbindung räumt
+    // auf) und spielt die während des Aufbaus gepufferten Signale nach.
+    let finalize_call = {
+        let call_session = call_session.clone();
+        let call_pending = call_pending.clone();
+        move |call_id: String, session: Rc<crate::call::CallSession>| {
+            if call_ui.get_untracked().call_id() != Some(call_id.as_str()) {
+                session.close();
+                call_pending.borrow_mut().clear();
+                return;
+            }
+            let closed_session = call_session.clone();
+            let closed_id = call_id.clone();
+            session.set_on_closed(Rc::new(move || {
+                if call_ui.get_untracked().call_id() == Some(closed_id.as_str()) {
+                    if let Some(s) = closed_session.borrow_mut().take() {
+                        s.close();
+                    }
+                    set_call_ui.set(CallUi::Idle);
+                    set_status.set("Anruf beendet.".to_string());
+                }
+            }));
+            let pending: Vec<_> = call_pending.borrow_mut().drain(..).collect();
+            for signal in pending {
+                let session = session.clone();
+                spawn_local(async move {
+                    let _ = session.on_signal(signal).await;
+                });
+            }
+            *call_session.borrow_mut() = Some(session);
+        }
+    };
+
+    // Anruf starten (aus dem Chat-Kopf).
+    let on_call_start = SendWrapper::new(Rc::new({
+        let new_call_session = new_call_session.clone();
+        let finalize_call = finalize_call.clone();
+        let hangup_peer = hangup_peer.clone();
+        let call_session = call_session.clone();
+        let call_pending = call_pending.clone();
+        move |peer: String| {
+            if !matches!(call_ui.get_untracked(), CallUi::Idle) {
+                set_status.set("Es läuft schon ein Anruf.".to_string());
+                return;
+            }
+            let call_id = new_uuid();
+            set_call_ui.set(CallUi::Outgoing {
+                peer: peer.clone(),
+                call_id: call_id.clone(),
+            });
+            set_status.set("Anruf wird aufgebaut ...".to_string());
+            let build = new_call_session(call_id.clone(), peer.clone());
+            let finalize_call = finalize_call.clone();
+            let hangup_peer = hangup_peer.clone();
+            let call_session = call_session.clone();
+            let call_pending = call_pending.clone();
+            spawn_local(async move {
+                match build.await {
+                    Ok(session) => {
+                        if let Err(error) = session.start().await {
+                            set_status.set(format!("Anruf fehlgeschlagen: {error}"));
+                            session.close();
+                            call_pending.borrow_mut().clear();
+                            if call_ui.get_untracked().call_id() == Some(call_id.as_str()) {
+                                hangup_peer(peer, call_id, "fehler");
+                                set_call_ui.set(CallUi::Idle);
+                            }
+                            return;
+                        }
+                        finalize_call(call_id.clone(), session);
+                        // Klingelt der Anruf zu lange, selbst auflegen (Mikrofon
+                        // und Verbindung nicht endlos offen lassen).
+                        gloo_timers::future::TimeoutFuture::new(45_000).await;
+                        if matches!(call_ui.get_untracked(), CallUi::Outgoing { call_id: ref c, .. } if c == &call_id)
+                        {
+                            // Die abgelegte Session schließen (sonst bliebe das
+                            // Mikrofon offen); sie schickt dabei selbst das
+                            // Hangup. Steht sie ausnahmsweise nicht, das Hangup
+                            // direkt geben.
+                            if let Some(session) = call_session.borrow_mut().take() {
+                                session.hangup("keine-antwort");
+                            } else {
+                                hangup_peer(peer, call_id, "keine-antwort");
+                            }
+                            call_pending.borrow_mut().clear();
+                            set_call_ui.set(CallUi::Idle);
+                            set_status.set("Keine Antwort.".to_string());
+                        }
+                    }
+                    Err(error) => {
+                        set_status.set(error);
+                        call_pending.borrow_mut().clear();
+                        if call_ui.get_untracked().call_id() == Some(call_id.as_str()) {
+                            set_call_ui.set(CallUi::Idle);
+                        }
+                    }
+                }
+            });
+        }
+    }));
+
+    // Eingehenden Anruf annehmen.
+    let on_call_accept = SendWrapper::new(Rc::new({
+        let new_call_session = new_call_session.clone();
+        let finalize_call = finalize_call.clone();
+        let hangup_peer = hangup_peer.clone();
+        let call_pending = call_pending.clone();
+        move |_: ()| {
+            let CallUi::Incoming { peer, call_id, sdp } = call_ui.get_untracked() else {
+                return;
+            };
+            set_call_ui.set(CallUi::Active {
+                peer: peer.clone(),
+                call_id: call_id.clone(),
+                muted: false,
+            });
+            set_status.set(String::new());
+            let build = new_call_session(call_id.clone(), peer.clone());
+            let finalize_call = finalize_call.clone();
+            let hangup_peer = hangup_peer.clone();
+            let call_pending = call_pending.clone();
+            spawn_local(async move {
+                let failed = match build.await {
+                    Ok(session) => match session.accept(&sdp).await {
+                        Ok(()) => {
+                            finalize_call(call_id.clone(), session);
+                            None
+                        }
+                        Err(error) => {
+                            session.close();
+                            Some(format!("Annehmen fehlgeschlagen: {error}"))
+                        }
+                    },
+                    Err(error) => Some(error),
+                };
+                if let Some(message) = failed {
+                    set_status.set(message);
+                    call_pending.borrow_mut().clear();
+                    // Dem Anrufer Bescheid geben, sonst klingelt er weiter.
+                    if call_ui.get_untracked().call_id() == Some(call_id.as_str()) {
+                        hangup_peer(peer, call_id, "fehler");
+                        set_call_ui.set(CallUi::Idle);
+                    }
+                }
+            });
+        }
+    }));
+
+    // Eingehenden Anruf ablehnen: dem Anrufer ein Hangup schicken (ohne
+    // Session, das Offer war nur vorgemerkt).
+    let on_call_reject = SendWrapper::new(Rc::new({
+        let hangup_peer = hangup_peer.clone();
+        let call_pending = call_pending.clone();
+        move |_: ()| {
+            let CallUi::Incoming { peer, call_id, .. } = call_ui.get_untracked() else {
+                return;
+            };
+            set_call_ui.set(CallUi::Idle);
+            set_status.set(String::new());
+            call_pending.borrow_mut().clear();
+            hangup_peer(peer, call_id, "abgelehnt");
+        }
+    }));
+
+    // Auflegen (aus dem Anruf-Balken): steht schon eine Session, schickt sie
+    // selbst das Hangup und schließt; steht sie noch nicht (Klingeln/Aufbau),
+    // das Hangup direkt an den Peer geben, damit sein Klingeln endet.
+    let on_call_hangup = SendWrapper::new(Rc::new({
+        let call_session = call_session.clone();
+        let call_pending = call_pending.clone();
+        let hangup_peer = hangup_peer.clone();
+        move |_: ()| {
+            let current = call_ui.get_untracked();
+            if let Some(session) = call_session.borrow_mut().take() {
+                session.hangup("aufgelegt");
+            } else if let (Some(peer), Some(call_id)) = (current.peer(), current.call_id()) {
+                hangup_peer(peer.to_string(), call_id.to_string(), "aufgelegt");
+            }
+            call_pending.borrow_mut().clear();
+            set_call_ui.set(CallUi::Idle);
+            set_status.set(String::new());
+        }
+    }));
+
+    // Mikrofon stumm/frei.
+    let on_call_mute = SendWrapper::new(Rc::new({
+        let call_session = call_session.clone();
+        move |_: ()| {
+            if let Some(session) = call_session.borrow().as_ref() {
+                let muted = session.toggle_mute();
+                if let CallUi::Active { peer, call_id, .. } = call_ui.get_untracked() {
+                    set_call_ui.set(CallUi::Active {
+                        peer,
+                        call_id,
+                        muted,
+                    });
+                }
+            }
+        }
+    }));
 
     // Blendet die Sicherheitsnummer des offenen Chats ein oder aus. Beim
     // Öffnen wird sie für den ausgewählten Kontakt berechnet.
@@ -5877,6 +6451,11 @@ fn App() -> impl IntoView {
                     let run_report = run_report.clone();
                     let run_delete_all = run_delete_all.clone();
                     let on_delete_local = on_delete_local.clone();
+                    let on_call_start = on_call_start.clone();
+                    let on_call_accept = on_call_accept.clone();
+                    let on_call_reject = on_call_reject.clone();
+                    let on_call_hangup = on_call_hangup.clone();
+                    let on_call_mute = on_call_mute.clone();
                     let on_send = on_send.clone();
                     let on_fetch = on_fetch.clone();
                     let on_message_key = on_message_key.clone();
@@ -5893,6 +6472,82 @@ fn App() -> impl IntoView {
                     let on_backup_export = on_backup_export.clone();
                     let open_settings = open_settings.clone();
                     view! {
+                        // Anruf-Balken (F2): über allem, weil ein Anruf
+                        // unabhängig vom offenen Chat klingelt.
+                        {
+                            let on_call_accept = on_call_accept.clone();
+                            let on_call_reject = on_call_reject.clone();
+                            let on_call_hangup = on_call_hangup.clone();
+                            let on_call_mute = on_call_mute.clone();
+                            move || {
+                                let accept = on_call_accept.clone();
+                                let reject = on_call_reject.clone();
+                                let hangup = on_call_hangup.clone();
+                                let mute = on_call_mute.clone();
+                                match call_ui.get() {
+                                    CallUi::Idle => ().into_any(),
+                                    CallUi::Outgoing { peer, .. } => {
+                                        view! {
+                                            <div class="sm-call-bar" role="status">
+                                                <span>{format!("Anruf an {peer} \u{2013} klingelt ...")}</span>
+                                                <button
+                                                    type="button"
+                                                    class="sm-danger-btn"
+                                                    on:click=move |_| hangup(())
+                                                >
+                                                    "Auflegen"
+                                                </button>
+                                            </div>
+                                        }
+                                            .into_any()
+                                    }
+                                    CallUi::Incoming { peer, .. } => {
+                                        view! {
+                                            <div class="sm-call-bar" role="alert">
+                                                <span>{format!("{peer} ruft an")}</span>
+                                                <button
+                                                    type="button"
+                                                    class="sm-primary"
+                                                    on:click=move |_| accept(())
+                                                >
+                                                    "Annehmen"
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    class="sm-danger-btn"
+                                                    on:click=move |_| reject(())
+                                                >
+                                                    "Ablehnen"
+                                                </button>
+                                            </div>
+                                        }
+                                            .into_any()
+                                    }
+                                    CallUi::Active { peer, muted, .. } => {
+                                        view! {
+                                            <div class="sm-call-bar" role="status">
+                                                <span>{format!("Verbunden mit {peer}")}</span>
+                                                <button
+                                                    type="button"
+                                                    class="sm-secondary"
+                                                    on:click=move |_| mute(())
+                                                >
+                                                    {if muted { "Ton an" } else { "Stumm" }}
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    class="sm-danger-btn"
+                                                    on:click=move |_| hangup(())
+                                                >
+                                                    "Auflegen"
+                                                </button>
+                                            </div>
+                                        }
+                                            .into_any()
+                                    }
+                                }
+                            }
+                        }
                         <div class="sm-shell">
                             <nav class="sm-sidebar" aria-label="Konversationen">
                                 <div class="sm-sidebar-head">
@@ -6701,7 +7356,18 @@ fn App() -> impl IntoView {
                                                         .then(|| {
                                                             let on_safety = on_safety.clone();
                                                             let on_key_check = on_key_check.clone();
+                                                            let on_call_start = on_call_start.clone();
+                                                            let call_peer = peer.clone();
                                                             view! {
+                                                                <button
+                                                                    type="button"
+                                                                    class="sm-secondary"
+                                                                    title="Verschlüsselten Sprachanruf starten"
+                                                                    on:click=move |_| on_call_start(call_peer.clone())
+                                                                    disabled=busy
+                                                                >
+                                                                    "Anrufen"
+                                                                </button>
                                                                 <button
                                                                     type="button"
                                                                     class="sm-secondary"

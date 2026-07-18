@@ -1137,6 +1137,41 @@ async fn push_subscription_requires_auth_and_https() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// F2: /turn-credentials verlangt Anmeldung (sonst offener Relay-Proxy) und
+/// eine Konfiguration; angemeldet liefert es kurzlebige Zugangsdaten.
+#[tokio::test]
+async fn turn_credentials_require_auth_and_config() {
+    // Ohne with_turn: Anrufe aus -> 503.
+    let (status, _) = send(
+        &test_app(),
+        "GET",
+        "/turn-credentials",
+        None,
+        Some("token-bob"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    let app = app(AppState::new(
+        Arc::new(InMemoryMessageStore::default()),
+        Arc::new(fake_identity()),
+    )
+    .with_turn("turn-geheim", vec!["turn:turn.example:3478".to_string()]));
+
+    // Ohne Token: 401 (der Relay ist kein offener Proxy).
+    let (status, _) = send(&app, "GET", "/turn-credentials", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Angemeldet: kurzlebige Zugangsdaten (username = Ablaufzeit, credential
+    // = HMAC), plus die konfigurierten ICE-Server.
+    let (status, body) = send(&app, "GET", "/turn-credentials", None, Some("token-bob")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["urls"][0], "turn:turn.example:3478");
+    assert!(!body["username"].as_str().unwrap().is_empty());
+    assert!(!body["credential"].as_str().unwrap().is_empty());
+    assert_eq!(body["ttl"], 3600);
+}
+
 /// Der Kern von F1: eine Nachricht an ein OFFLINE-Gerät (kein WebSocket) weckt
 /// es per Web-Push; der oeffentliche Schluessel ist abrufbar, und das Abo
 /// laesst sich wieder entfernen.

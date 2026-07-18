@@ -23,6 +23,7 @@
 
 pub mod account;
 pub mod backup;
+pub mod call;
 pub mod delivery;
 pub mod directory;
 pub mod discovery;

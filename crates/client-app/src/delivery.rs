@@ -103,6 +103,20 @@ struct VapidKeyResponse {
     public_key: String,
 }
 
+/// ICE-Server samt kurzlebiger Zugangsdaten für einen 1:1-Anruf (F2). Vom
+/// Client als `RTCConfiguration.iceServers` gesetzt.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct TurnCredentials {
+    /// STUN-/TURN-URLs (`urls` je ICE-Server).
+    pub urls: Vec<String>,
+    /// Kurzlebiger Nutzername (Ablaufzeit); leer bei reinen STUN-URLs.
+    pub username: String,
+    /// Kurzlebiges Passwort (HMAC); leer bei reinen STUN-URLs.
+    pub credential: String,
+    /// Restgültigkeit in Sekunden.
+    pub ttl: u64,
+}
+
 #[derive(Serialize)]
 struct PushSubscribeRequest<'a> {
     endpoint: &'a str,
@@ -211,6 +225,26 @@ impl DeliveryClient {
         }
         let body: VapidKeyResponse = parse_json(response).await?;
         Ok(Some(body.public_key))
+    }
+
+    /// `GET /turn-credentials`: kurzlebige ICE-Server samt Zugangsdaten für
+    /// einen 1:1-Anruf (F2). `None`, wenn der Server Anrufe nicht anbietet
+    /// (503); dann blendet der Client den Anruf-Knopf aus.
+    pub async fn turn_credentials(
+        &self,
+        access_token: &str,
+    ) -> Result<Option<TurnCredentials>, ClientError> {
+        let response = self
+            .http
+            .get(format!("{}/turn-credentials", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(transport)?;
+        if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            return Ok(None);
+        }
+        Ok(Some(parse_json(response).await?))
     }
 
     /// `POST /push/subscription`: legt das Browser-Push-Abo dieses Geräts ab

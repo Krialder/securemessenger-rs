@@ -1,0 +1,69 @@
+# TURN-/STUN-Relay fuer die 1:1-Anrufe (F2). BEWUSST getrennt von der
+# Haupt-Kustomization (nicht in kustomization.yaml), weil coturn
+# cluster-spezifische Angaben braucht, die kein Rendering liefern kann: eine
+# oeffentlich erreichbare IP (external-ip) und einen offenen UDP-Portbereich.
+# Erst anpassen (EXTERNAL_IP, ggf. hostNetwork/LoadBalancer je nach Umgebung),
+# dann `kubectl apply -f deploy/k8s/coturn.yaml`.
+#
+# use-auth-secret teilt das Geheimnis mit dem delivery-Dienst; delivery gibt
+# daraus die kurzlebigen Zugangsdaten aus, coturn prueft sie. Das Geheimnis
+# liegt im Secret delivery-turn (siehe SECRETS.md), das AUCH delivery liest.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coturn
+  namespace: securemessenger
+  labels:
+    app: coturn
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: coturn
+  template:
+    metadata:
+      labels:
+        app: coturn
+    spec:
+      # coturn braucht den echten UDP-Portbereich am Host; hostNetwork ist der
+      # einfachste Weg. In einer Cloud stattdessen ein LoadBalancer-Service mit
+      # UDP und externalTrafficPolicy: Local, damit die Client-IP erhalten
+      # bleibt.
+      hostNetwork: true
+      containers:
+        - name: coturn
+          image: coturn/coturn:4.6
+          env:
+            # EXTERNAL_IP durch die oeffentliche IP des Knotens ersetzen.
+            - name: EXTERNAL_IP
+              value: "PLATZHALTER_OEFFENTLICHE_IP"
+            - name: STATIC_AUTH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: delivery-turn
+                  key: shared-secret
+          # Das Geheimnis in eine Konfigurationsdatei schreiben und turnserver
+          # mit -c starten, damit es NICHT in der Prozess-Kommandozeile
+          # (ps / /proc/PID/cmdline) steht.
+          command:
+            - /bin/sh
+            - -c
+            - >
+              umask 077 &&
+              printf '%s\n'
+              'listening-ip=0.0.0.0'
+              'use-auth-secret'
+              "static-auth-secret=$STATIC_AUTH_SECRET"
+              'realm=securemessenger'
+              'no-tls' 'no-dtls' 'no-cli'
+              'min-port=49160' 'max-port=49200'
+              "external-ip=$EXTERNAL_IP"
+              > /tmp/turnserver.conf &&
+              exec turnserver -n -c /tmp/turnserver.conf
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"

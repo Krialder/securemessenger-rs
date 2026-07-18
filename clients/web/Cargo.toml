@@ -29,7 +29,10 @@ console_error_panic_hook = "0.1"
 # Theme-Umschalter (data-theme am <html>, Wahl in localStorage);
 # KeyboardEvent fuer Enter-zum-Senden; HtmlUListElement fuer den
 # Auto-Scroll des Verlaufs (scrollTop/scrollHeight ueber den NodeRef).
-web-sys = { version = "0.3", features = ["Window", "Location", "Document", "Element", "Storage", "KeyboardEvent", "HtmlUListElement", "Blob", "BlobPropertyBag", "Url", "HtmlAnchorElement", "HtmlInputElement", "File", "FileList", "Navigator", "ServiceWorkerContainer", "ServiceWorkerRegistration", "PushManager", "PushSubscription", "PushSubscriptionOptionsInit", "PushEncryptionKeyName", "Notification", "NotificationPermission"] }
+web-sys = { version = "0.3", features = ["Window", "Location", "Document", "Element", "Storage", "KeyboardEvent", "HtmlUListElement", "Blob", "BlobPropertyBag", "Url", "HtmlAnchorElement", "HtmlInputElement", "File", "FileList", "Navigator", "ServiceWorkerContainer", "ServiceWorkerRegistration", "PushManager", "PushSubscription", "PushSubscriptionOptionsInit", "PushEncryptionKeyName", "Notification", "NotificationPermission",
+    # 1:1-Anrufe (F2, WebRTC): RTCPeerConnection samt Offer/Answer/ICE, ein
+    # Datenkanal (fuer Paket E Live-Tippen) und der Audio-Medienstrom.
+    "RtcPeerConnection", "RtcConfiguration", "RtcIceServer", "RtcSessionDescription", "RtcSessionDescriptionInit", "RtcSdpType", "RtcIceCandidate", "RtcIceCandidateInit", "RtcPeerConnectionIceEvent", "RtcDataChannel", "RtcDataChannelInit", "RtcDataChannelEvent", "RtcDataChannelState", "RtcRtpSender", "RtcTrackEvent", "RtcPeerConnectionState", "MediaStream", "MediaStreamConstraints", "MediaDevices", "MediaStreamTrack", "MessageEvent", "HtmlAudioElement", "HtmlMediaElement"] }
 # Uhrzeit fuer die Credential-Gueltigkeit (js_sys::Date), im Browser gibt es
 # kein std::time::SystemTime.
 js-sys = "0.3"

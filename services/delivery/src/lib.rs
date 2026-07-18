@@ -16,3 +16,4 @@ pub mod integrations_client;
 pub mod pg;
 pub mod push;
 pub mod store;
+pub mod turn;

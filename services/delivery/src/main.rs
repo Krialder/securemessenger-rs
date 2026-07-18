@@ -76,6 +76,26 @@ async fn main() {
         None => state,
     };
 
+    // Optional: 1:1-Anrufe (F2). Ohne TURN_SHARED_SECRET bleibt es aus (der
+    // Client blendet den Anruf-Knopf aus). TURN_URLS ist eine Komma-Liste der
+    // STUN-/TURN-URLs, die der Client als ICE-Server bekommt.
+    let state = match std::env::var("TURN_SHARED_SECRET")
+        .ok()
+        .filter(|secret| !secret.is_empty())
+    {
+        Some(secret) => {
+            let urls: Vec<String> = std::env::var("TURN_URLS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .collect();
+            tracing::info!(count = urls.len(), "1:1-Anrufe (TURN) aktiv");
+            state.with_turn(&secret, urls)
+        }
+        None => state,
+    };
+
     let router = app(state);
 
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr)
