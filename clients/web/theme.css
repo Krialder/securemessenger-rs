@@ -921,6 +921,50 @@ button:disabled {
   cursor: pointer;
 }
 
+/* Bearbeiten/Loeschen in der Blase: gleiche leise Text-Knopf-Sprache wie
+   Melden, damit die Aktionen den Verlauf nicht dominieren. */
+.sm-msg-action {
+  display: inline-block;
+  margin-inline-start: var(--sm-space-2);
+  padding: 0;
+  border: none;
+  background: transparent;
+  font-size: 0.72rem;
+  color: var(--sm-on-surface);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* Grabstein einer bei allen geloeschten Nachricht: kursiv, gleiche
+   --sm-on-surface-Farbe wie der Text (die Blase selbst unterscheidet schon
+   eigene/fremde; ein blasserer Ton fiele unter die 4.5:1-Schwelle). */
+.sm-msg-deleted {
+  font-style: italic;
+}
+
+/* Die "bearbeitet"-Marke neben der Zeit: klein wie die Zeit, mit title-
+   Erklaerung; kein reiner Farbtraeger (SC 1.4.1). */
+.sm-msg-edited {
+  display: inline-block;
+  margin-inline-start: var(--sm-space-2);
+  font-size: 0.72rem;
+  font-style: italic;
+  color: var(--sm-on-surface);
+}
+
+/* Banner ueber dem Composer im Bearbeiten-Modus: sagt, dass das Senden
+   jetzt ersetzt statt anhaengt, mit Abbrechen daneben. */
+.sm-edit-banner {
+  display: flex;
+  gap: var(--sm-space-2);
+  align-items: center;
+  padding: var(--sm-space-1) var(--sm-space-3);
+  border-block-start: 1px solid var(--sm-divider);
+  background: var(--sm-surface-container);
+  font-size: 0.85rem;
+  color: var(--sm-on-surface);
+}
+
 .sm-composer {
   position: sticky;
   inset-block-end: 0;

@@ -16,7 +16,23 @@
 //! Meldbarkeit (etwa Handshakes); dieses Modul rahmt nur, wo Franking
 //! gewünscht ist.]
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use franking::KEY_LEN;
+
+/// Die stabile 1:1-Nachrichten-ID: das Base64 des Franking-Commitments. Der
+/// Absender kennt es aus dem Franken (`FrankedMessage.commitment`), der
+/// Empfänger rechnet es mit [`message_id`] aus `K_f` und Text nach. Ein
+/// späteres Bearbeiten/Löschen bezieht sich auf diese ID (siehe `msg`-Modul).
+pub fn commitment_id(commitment: &[u8]) -> String {
+    BASE64.encode(commitment)
+}
+
+/// Bildet die 1:1-Nachrichten-ID auf der Empfangsseite: dasselbe Commitment
+/// wie beim Absender, aus dem entfrankten Schlüssel und Text.
+pub fn message_id(franking_key: &[u8], message: &[u8]) -> String {
+    BASE64.encode(franking::commit(franking_key, message))
+}
 
 /// Ein gerahmter Sende-Payload: der verschlüsselte Inhalt (`K_f` plus
 /// Nachricht) und das Commitment für den Franking-Tag.

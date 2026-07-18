@@ -213,6 +213,111 @@ async fn two_cli_users_chat_across_process_boundaries() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Liest die vom Absender vergebene Nachrichten-ID aus der stderr-Zeile
+/// `  (Nachrichten-ID: <uuid>)`, die send/group-send und recv ausgeben.
+fn extract_msg_id(stderr: &str) -> String {
+    stderr
+        .split("(Nachrichten-ID: ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .unwrap_or_else(|| panic!("keine Nachrichten-ID in stderr: {stderr}"))
+        .to_string()
+}
+
+/// Bearbeiten und Löschen bei allen: die smmsg-/smgpl-Ereignisse reisen
+/// Ende-zu-Ende auf die beim Senden vergebene Nachrichten-ID, im 1:1-Chat
+/// wie in der Gruppe. Jeder Befehl ist ein eigener Prozess.
+#[tokio::test(flavor = "multi_thread")]
+async fn edit_and_delete_reach_receiver() {
+    let urls = start_stack().await;
+    let dir = std::env::temp_dir().join(format!("sm-edit-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("Testverzeichnis");
+
+    let carla = CliUser::new(&dir, "carla", &urls);
+    let django = CliUser::new(&dir, "django", &urls);
+    carla.run(&["register", "carla", "carlas-langes-passwort"]);
+    carla.run(&["login", "carlas-langes-passwort"]);
+    carla.run(&["publish-keys"]);
+    django.run(&["register", "django", "djangos-langes-passwort"]);
+    django.run(&["login", "djangos-langes-passwort"]);
+    django.run(&["publish-keys"]);
+
+    // 1:1: Senden vergibt die ID; der Empfänger sieht sie beim Abholen.
+    let (_, sent_err) = carla.run_full(&["send", "django", "tipfehler enthaltn"]);
+    let msg_id = extract_msg_id(&sent_err);
+    let (received, recv_err) = django.run_full(&["recv"]);
+    assert!(
+        received.contains("[carla] tipfehler enthaltn"),
+        "stdout war: {received}"
+    );
+    assert_eq!(
+        extract_msg_id(&recv_err),
+        msg_id,
+        "die Nachrichten-ID muss unverändert beim Empfänger ankommen"
+    );
+
+    // Bearbeiten: das Edit trifft dieselbe ID.
+    carla.run(&["edit", "django", &msg_id, "tippfehler korrigiert"]);
+    let received = django.run(&["recv"]);
+    assert!(
+        received.contains(&format!(
+            "[carla] (bearbeitet {msg_id}) tippfehler korrigiert"
+        )),
+        "stdout war: {received}"
+    );
+
+    // Löschen bei allen: der Empfänger bekommt den Grabstein-Hinweis.
+    carla.run(&["delete", "django", &msg_id]);
+    let received = django.run(&["recv"]);
+    assert!(
+        received.contains(&format!("[carla] (Nachricht {msg_id} gelöscht)")),
+        "stdout war: {received}"
+    );
+
+    // Gruppe: derselbe Rundlauf über den MLS-Pfad.
+    let created = carla.run(&["group-create", "Korrekturen", "django"]);
+    let group_id = created
+        .split_whitespace()
+        .nth(1)
+        .expect("Gruppen-ID")
+        .to_string();
+    django.run(&["recv"]);
+    django.run(&["group-accept", &group_id]);
+
+    let (_, sent_err) = carla.run_full(&["group-send", &group_id, "gruppn-tipfehler"]);
+    let group_msg_id = extract_msg_id(&sent_err);
+    let received = django.run(&["recv"]);
+    assert!(
+        received.contains(&format!("[gruppe {group_id}] carla: gruppn-tipfehler")),
+        "stdout war: {received}"
+    );
+
+    carla.run(&[
+        "group-edit",
+        &group_id,
+        &group_msg_id,
+        "gruppen-text korrigiert",
+    ]);
+    let received = django.run(&["recv"]);
+    assert!(
+        received.contains(&format!(
+            "[gruppe {group_id}] carla (bearbeitet {group_msg_id}): gruppen-text korrigiert"
+        )),
+        "stdout war: {received}"
+    );
+
+    carla.run(&["group-delete", &group_id, &group_msg_id]);
+    let received = django.run(&["recv"]);
+    assert!(
+        received.contains(&format!(
+            "[gruppe {group_id}] carla hat Nachricht {group_msg_id} gelöscht"
+        )),
+        "stdout war: {received}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Verschlüsselte Ablage: mit SM_PASSPHRASE liegen Profil und Zustand als
 /// keystore-Envelope auf der Platte (nicht als lesbares JSON), der volle
 /// Chat-Rundlauf funktioniert trotzdem über Prozessgrenzen, und eine

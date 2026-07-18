@@ -153,6 +153,8 @@ async fn run() -> Result<(), String> {
         "group-create" => group_create(&args[1..]).await,
         "groups" => groups_list(),
         "group-send" => group_send(&args[1..]).await,
+        "group-edit" => group_edit(&args[1..]).await,
+        "group-delete" => group_delete(&args[1..]).await,
         "group-remove" => group_remove(&args[1..]).await,
         "group-leave" => group_leave(&args[1..]).await,
         "group-members" => group_members(&args[1..]).await,
@@ -163,6 +165,8 @@ async fn run() -> Result<(), String> {
         "group-accept" => group_accept(&args[1..]).await,
         "group-decline" => group_decline(&args[1..]),
         "send" => send(&args[1..]).await,
+        "edit" => edit(&args[1..]).await,
+        "delete" => delete(&args[1..]).await,
         "recv" => recv().await,
         "listen" => listen(&args[1..]).await,
         "verify" => verify().await,
@@ -395,6 +399,92 @@ async fn send(args: &[String]) -> Result<(), String> {
     let [recipient, text, flags @ ..] = args else {
         return Err(usage.to_string());
     };
+    let (expires_at, sealed) = parse_send_flags(flags, usage)?;
+    // Der Text reist unverändert als roher Klartext (rückwärtskompatibel);
+    // seine ID ist das Franking-Commitment, das deliver_1to1 zurückgibt und
+    // auf das sich ein späteres 'sm edit'/'sm delete' bezieht.
+    let (id, targets, outcome) = deliver_1to1(
+        recipient,
+        text.as_bytes(),
+        sealed,
+        SelfCopy::Text { text },
+        expires_at,
+    )
+    .await?;
+    println!(
+        "Zugestellt an {targets} Gerät(e) ({} angenommen, {} Duplikate{})",
+        outcome.accepted,
+        outcome.duplicates,
+        if sealed { ", versiegelt" } else { "" }
+    );
+    // Die Nachrichten-ID auf stderr, damit die Zustellzeile schlicht bleibt:
+    // 'sm edit <handle> <id> <text>' bzw. 'sm delete <handle> <id>'.
+    eprintln!("  (Nachrichten-ID: {id})");
+    Ok(())
+}
+
+/// `sm edit <handle> <id> <neuer-text>`: ersetzt den Text einer früher
+/// gesendeten 1:1-Nachricht (die ID gab `sm send` als Commitment aus). Reist
+/// als smmsg-Edit an alle Geräte des Empfängers und die eigenen. Änderungen
+/// gehen IMMER versiegelt: so bindet das Sealed-Zertifikat den Absender, und
+/// die Empfangsseite vertraut der Self-Sync-Kopie (eine unversiegelte,
+/// fälschbare Absenderadresse würde sie sonst zum Umschreiben fremder
+/// Verläufe missbrauchbar machen).
+async fn edit(args: &[String]) -> Result<(), String> {
+    let [recipient, target, text] = args else {
+        return Err("Aufruf: sm edit <handle> <nachrichten-id> <neuer-text>".to_string());
+    };
+    let event = client_app::msg::encode_edit(target, text);
+    let (_, targets, outcome) = deliver_1to1(
+        recipient,
+        &event,
+        true,
+        SelfCopy::Event { event: &event },
+        None,
+    )
+    .await?;
+    println!(
+        "Bearbeitung zugestellt an {targets} Gerät(e) ({} angenommen)",
+        outcome.accepted
+    );
+    Ok(())
+}
+
+/// `sm delete <handle> <id>`: löscht eine früher gesendete 1:1-Nachricht bei
+/// allen (ID = Commitment aus 'sm send'). Reist als smmsg-Delete, immer
+/// versiegelt (siehe `edit`); die Empfangsseite ersetzt die Nachricht durch
+/// einen Grabstein.
+async fn delete(args: &[String]) -> Result<(), String> {
+    let [recipient, target] = args else {
+        return Err("Aufruf: sm delete <handle> <nachrichten-id>".to_string());
+    };
+    let event = client_app::msg::encode_delete(target);
+    let (_, targets, outcome) = deliver_1to1(
+        recipient,
+        &event,
+        true,
+        SelfCopy::Event { event: &event },
+        None,
+    )
+    .await?;
+    println!(
+        "Löschung zugestellt an {targets} Gerät(e) ({} angenommen)",
+        outcome.accepted
+    );
+    Ok(())
+}
+
+/// Wie die Self-Sync-Kopie einer 1:1-Zustellung aussieht: eine gewöhnliche
+/// Nachricht (Text + ID) oder ein Änderungsereignis (rohe smmsg-Bytes).
+enum SelfCopy<'a> {
+    Text { text: &'a str },
+    Event { event: &'a [u8] },
+}
+
+/// Liest die gemeinsamen Sende-Flags `--ttl <sekunden>` und `--sealed` und
+/// liefert den Ablaufzeitpunkt (falls `--ttl`) und ob versiegelt gesendet
+/// wird.
+fn parse_send_flags(flags: &[String], usage: &str) -> Result<(Option<u64>, bool), String> {
     let mut ttl: Option<u64> = None;
     let mut sealed = false;
     let mut rest = flags.iter();
@@ -412,13 +502,18 @@ async fn send(args: &[String]) -> Result<(), String> {
             other => return Err(format!("unbekanntes Argument: {other}\n{usage}")),
         }
     }
-    let expires_at = ttl.map(|seconds| now_unix() + seconds);
-    let profile = load_profile()?;
-    let token = access_token(&profile)?;
-    let (mut device, storage) = open_device(&profile)?;
+    Ok((ttl.map(|seconds| now_unix() + seconds), sealed))
+}
 
-    // Kontakt auflösen: bekannt aus der Ablage, sonst Bündel holen und
-    // Sitzungen aufbauen (konsumiert Einmal-Prekeys des Gegenübers).
+/// Löst die Geräte eines Kontakts auf: bekannt aus der Ablage, sonst Bündel
+/// holen und Sitzungen aufbauen (konsumiert Einmal-Prekeys des Gegenübers).
+/// Gemeinsam genutzt von send/edit/delete.
+async fn resolve_contact_devices(
+    device: &mut Device<PersistentProtocolStore<FileStorage>>,
+    storage: &SharedStorage,
+    token: &str,
+    recipient: &str,
+) -> Result<Vec<ContactDevice>, String> {
     let contact_key = format!("contact/{recipient}");
     let devices: Vec<ContactDevice> = match storage
         .borrow()
@@ -430,49 +525,68 @@ async fn send(args: &[String]) -> Result<(), String> {
         }
         None => Vec::new(),
     };
-    let devices = if devices.is_empty() {
-        let bundles = DirectoryClient::new(directory_url())
-            .bundles(&token, recipient)
+    if !devices.is_empty() {
+        return Ok(devices);
+    }
+    let bundles = DirectoryClient::new(directory_url())
+        .bundles(token, recipient)
+        .await
+        .map_err(|e| e.to_string())?;
+    if bundles.devices.is_empty() {
+        return Err(format!("'{recipient}' hat keine gültigen Geräte"));
+    }
+    let mut contact = Vec::with_capacity(bundles.devices.len());
+    for bundle_json in &bundles.devices {
+        let (bundle, protocol_device_id) =
+            bundle_from_directory(bundle_json).map_err(|e| e.to_string())?;
+        let address = ProtocolAddress::new(
+            recipient.to_string(),
+            device_id_from_u32(protocol_device_id).map_err(|e| e.to_string())?,
+        );
+        device
+            .establish_session(&address, &bundle)
             .await
-            .map_err(|e| e.to_string())?;
-        if bundles.devices.is_empty() {
-            return Err(format!("'{recipient}' hat keine gültigen Geräte"));
-        }
-        let mut contact = Vec::with_capacity(bundles.devices.len());
-        for bundle_json in &bundles.devices {
-            let (bundle, protocol_device_id) =
-                bundle_from_directory(bundle_json).map_err(|e| e.to_string())?;
-            let address = ProtocolAddress::new(
-                recipient.to_string(),
-                device_id_from_u32(protocol_device_id).map_err(|e| e.to_string())?,
-            );
-            device
-                .establish_session(&address, &bundle)
-                .await
-                .map_err(|e| format!("Sitzungsaufbau: {e}"))?;
-            contact.push(ContactDevice {
-                server_device_id: bundle_json.device_id.clone(),
-                protocol_device_id,
-            });
-        }
-        let json = serde_json::to_vec(&contact).map_err(|e| e.to_string())?;
-        storage
-            .borrow_mut()
-            .put(&contact_key, &json)
-            .map_err(|e| e.to_string())?;
-        contact
-    } else {
-        devices
-    };
+            .map_err(|e| format!("Sitzungsaufbau: {e}"))?;
+        contact.push(ContactDevice {
+            server_device_id: bundle_json.device_id.clone(),
+            protocol_device_id,
+        });
+    }
+    let json = serde_json::to_vec(&contact).map_err(|e| e.to_string())?;
+    storage
+        .borrow_mut()
+        .put(&contact_key, &json)
+        .map_err(|e| e.to_string())?;
+    Ok(contact)
+}
+
+/// Gemeinsamer Kern von send/edit/delete: den Klartext franken, an alle
+/// Geräte des Empfängers verschlüsseln, eine Self-Sync-Kopie an die eigenen
+/// Geräte spiegeln und zustellen. `sealed` gilt für BEIDE Wege gleich (kein
+/// gemischter Stapel, eine Zustellroute); edit/delete rufen mit `sealed=true`.
+/// Liefert die Nachrichten-ID (Franking-Commitment, Base64), die Zahl der
+/// Zielgeräte und das Zustell-Ergebnis.
+async fn deliver_1to1(
+    recipient: &str,
+    plaintext: &[u8],
+    sealed: bool,
+    self_copy: SelfCopy<'_>,
+    expires_at: Option<u64>,
+) -> Result<(String, usize, client_app::delivery::SubmitOutcome), String> {
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    let (mut device, storage) = open_device(&profile)?;
+    let devices = resolve_contact_devices(&mut device, &storage, &token, recipient).await?;
 
     // Einmal je Nachricht franken: derselbe Franking-Schlüssel und dasselbe
     // Commitment für alle Zielgeräte, damit der Empfänger jede Kopie melden
-    // kann (specs/sealed-sender-und-abuse.md). Der Schlüssel reist im
-    // verschlüsselten Payload, das Commitment als Franking-Tag. Das gilt
-    // auch versiegelt: das Tag identifiziert niemanden.
-    let franked = client_app::franking::frank(text.as_bytes());
+    // kann (specs/sealed-sender-und-abuse.md). Das Commitment ist zugleich
+    // die stabile Nachrichten-ID (msg-Modul).
+    let franked = client_app::franking::frank(plaintext);
     let franking_tag = BASE64.encode(&franked.commitment);
-    // Für --sealed einmal das Absender-Zertifikat besorgen (gecacht).
+    let id = client_app::franking::commitment_id(&franked.commitment);
+    // Sealed braucht das Absender-Zertifikat (gecacht); dasselbe deckt die
+    // Self-Sync-Kopie ab.
     let certificate = if sealed {
         Some(
             sender_certificate_cached(&token, u32::from(profile.protocol_device_id), &storage)
@@ -520,9 +634,15 @@ async fn send(args: &[String]) -> Result<(), String> {
         });
     }
 
-    // Self-Sync: dieselbe Nachricht als Kopie an die eigenen Zweitgeräte,
-    // damit der gesendete Text auch dort im Verlauf steht. Best effort:
-    // scheitert das, ist die Nachricht beim Empfänger trotzdem raus.
+    // Self-Sync: die Kopie an die eigenen Zweitgeräte. Ein Text reist als
+    // gewöhnliche Nachricht mit seiner ID; ein Änderungsereignis als
+    // versiegeltes smmsg (nur so vertraut die Empfangsseite dem Ereignis).
+    // Best effort: scheitert es, ist die Nachricht beim Empfänger trotzdem
+    // raus.
+    let self_payload = match self_copy {
+        SelfCopy::Text { text } => client_app::sync::encode(recipient, text, &id),
+        SelfCopy::Event { event } => client_app::sync::encode_event(recipient, event),
+    };
     match build_sync_envelopes(
         &mut device,
         &storage,
@@ -530,8 +650,7 @@ async fn send(args: &[String]) -> Result<(), String> {
         &profile.handle,
         u32::from(profile.protocol_device_id),
         certificate.as_deref(),
-        recipient,
-        text,
+        &self_payload,
         expires_at,
     )
     .await
@@ -549,14 +668,7 @@ async fn send(args: &[String]) -> Result<(), String> {
         delivery.submit(&token, &envelopes).await
     }
     .map_err(|e| e.to_string())?;
-    println!(
-        "Zugestellt an {} Gerät(e) ({} angenommen, {} Duplikate{})",
-        devices.len(),
-        outcome.accepted,
-        outcome.duplicates,
-        if sealed { ", versiegelt" } else { "" }
-    );
-    Ok(())
+    Ok((id, devices.len(), outcome))
 }
 
 /// Löst die eigenen ANDEREN Geräte auf (für den Self-Sync) und baut je Gerät
@@ -567,7 +679,7 @@ async fn send(args: &[String]) -> Result<(), String> {
 /// Senden erneut auflöst und Prekeys verbraucht. Nach dem Koppeln eines
 /// neuen Geräts wird der Cache geleert (approve und die nächste Anmeldung).
 // Die Argumente sind alle unabhängig nötig (Gerät, Ablage, Token, eigene
-// Identität, Sealed-Zertifikat, Ziel-Nachricht); ein Sammel-Struct für einen
+// Identität, Sealed-Zertifikat, fertiger Payload); ein Sammel-Struct für einen
 // einzigen Aufrufer wäre nur Zeremonie.
 #[allow(clippy::too_many_arguments)]
 async fn build_sync_envelopes(
@@ -577,8 +689,7 @@ async fn build_sync_envelopes(
     handle: &str,
     own_protocol_id: u32,
     certificate: Option<&[u8]>,
-    peer: &str,
-    text: &str,
+    payload: &[u8],
     expires_at: Option<u64>,
 ) -> Result<Vec<OutgoingEnvelope>, String> {
     let cached = storage
@@ -625,7 +736,6 @@ async fn build_sync_envelopes(
     if siblings.is_empty() {
         return Ok(Vec::new());
     }
-    let payload = client_app::sync::encode(peer, text);
     let mut out = Vec::with_capacity(siblings.len());
     for sib in &siblings {
         let address = ProtocolAddress::new(
@@ -635,14 +745,14 @@ async fn build_sync_envelopes(
         let envelope = match certificate {
             Some(cert) => {
                 let blob = device
-                    .seal_message(&address, cert, &payload)
+                    .seal_message(&address, cert, payload)
                     .await
                     .map_err(|e| format!("Versiegeln (Sync): {e}"))?;
                 wire::seal_sealed(&blob).map_err(|e| e.to_string())?
             }
             None => {
                 let message = device
-                    .encrypt(&address, &payload)
+                    .encrypt(&address, payload)
                     .await
                     .map_err(|e| format!("Verschlüsselung (Sync): {e}"))?;
                 wire::seal(handle, own_protocol_id, &message).map_err(|e| e.to_string())?
@@ -770,10 +880,11 @@ fn print_and_remember(
     from: &str,
     payload: &[u8],
     own_handle: &str,
+    sealed: bool,
 ) -> Result<(), String> {
     if from == own_handle {
         match client_app::sync::decode(payload) {
-            Ok(client_app::sync::Synced::Message { peer, text }) => {
+            Ok(client_app::sync::Synced::Message { peer, text, .. }) => {
                 println!("[-> {peer}] {text}  (auf anderem Gerät gesendet)")
             }
             // Das CLI hält keinen persistenten Verlauf, deshalb ist ein
@@ -783,25 +894,88 @@ fn print_and_remember(
                 "[Verlaufs-Nachzug zu {peer}: {} Zeile(n) von einem anderen Gerät]",
                 lines.len()
             ),
+            // Ein Änderungsereignis eines anderen eigenen Geräts. Nur aus
+            // einer SEALED Hülle vertrauenswürdig: unversiegelt ist die
+            // Absenderadresse fälschbar, ein Dritter könnte sonst ein
+            // Bearbeiten/Löschen als „von mir selbst" unterschieben.
+            Ok(client_app::sync::Synced::Event { peer, event }) => {
+                if sealed {
+                    print_own_event(&peer, &client_app::msg::decode(&event));
+                } else {
+                    eprintln!(
+                        "Unversiegelte Self-Sync-Änderung {message_id} verworfen (nicht \
+                         authentisch)."
+                    );
+                }
+            }
             Err(error) => eprintln!("Sync-Hülle {message_id} unlesbar: {error}"),
         }
         return Ok(());
     }
     match client_app::franking::unfrank(payload) {
         Ok(opened_msg) => {
-            println!(
-                "[{}] {}",
-                from,
-                String::from_utf8_lossy(&opened_msg.message)
-            );
-            // Die Melde-ID auf stderr, damit die Nachrichtenzeile (stdout)
-            // schlicht bleibt: `sm report <id>`.
-            eprintln!("  (Melde-ID: {message_id})");
-            remember_franking(storage, message_id, &opened_msg)
+            match client_app::msg::decode(&opened_msg.message) {
+                client_app::msg::Msg::Text { text } => {
+                    println!("[{from}] {text}");
+                    // Die Melde-ID (Franking) auf stderr, damit die
+                    // Nachrichtenzeile schlicht bleibt: `sm report <id>`. Die
+                    // Nachrichten-ID (das Commitment, fürs Nachvollziehen von
+                    // Edits) eigene Zeile, beide maschinell greifbar.
+                    eprintln!("  (Melde-ID: {message_id})");
+                    eprintln!(
+                        "  (Nachrichten-ID: {})",
+                        client_app::franking::message_id(
+                            &opened_msg.franking_key,
+                            &opened_msg.message
+                        )
+                    );
+                    remember_franking(storage, message_id, &opened_msg)?;
+                }
+                // Eine Änderung wird nur aus einer VERSIEGELTEN Hülle als echt
+                // gezeigt: echte Änderungen gehen immer versiegelt, und nur
+                // dann bindet das Zertifikat den Absender. Unversiegelt ist
+                // die Absenderadresse fälschbar; ein Dritter könnte sonst eine
+                // Änderung unter fremdem Handle vortäuschen.
+                client_app::msg::Msg::Edit { target, text } if sealed => {
+                    println!("[{from}] (bearbeitet {target}) {text}");
+                    // Auch die Bearbeitung ist meldbar (ihr Franking-Material
+                    // deckt den NEUEN Text); die Melde-ID dazu ausgeben.
+                    eprintln!("  (Melde-ID: {message_id})");
+                    remember_franking(storage, message_id, &opened_msg)?;
+                }
+                client_app::msg::Msg::Delete { target } if sealed => {
+                    println!("[{from}] (Nachricht {target} gelöscht)");
+                }
+                client_app::msg::Msg::Edit { .. } | client_app::msg::Msg::Delete { .. } => {
+                    eprintln!(
+                        "Unversiegelte Änderung {message_id} von {from} verworfen (nicht \
+                         authentisch)."
+                    );
+                }
+            }
+            Ok(())
         }
         Err(_) => {
             println!("[{}] {}", from, String::from_utf8_lossy(payload));
             Ok(())
+        }
+    }
+}
+
+/// Gibt ein selbst (auf einem anderen Gerät) ausgelöstes smmsg-Ereignis aus.
+/// Das CLI hält keinen Verlauf, deshalb nur eine kurze Zeile je Art.
+fn print_own_event(peer: &str, event: &client_app::msg::Msg) {
+    match event {
+        // Ein Text käme hier nur bei einem Alt-Payload vor (Texte reisen
+        // sonst als Synced::Message, nicht als Ereignis).
+        client_app::msg::Msg::Text { text } => {
+            println!("[-> {peer}] {text}  (auf anderem Gerät gesendet)")
+        }
+        client_app::msg::Msg::Edit { target, text } => {
+            println!("[-> {peer}] (bearbeitet {target}) {text}  (auf anderem Gerät)")
+        }
+        client_app::msg::Msg::Delete { target } => {
+            println!("[-> {peer}] (Nachricht {target} gelöscht)  (auf anderem Gerät)")
         }
     }
 }
@@ -833,12 +1007,16 @@ async fn drain_waiting(
             let trust_root = sealed_trust_root_cached(storage).await?;
             match device.unseal_message(&trust_root, &blob).await {
                 Ok(unsealed) => {
+                    // sealed=true: die Absenderidentität kommt aus dem
+                    // geprüften Zertifikat, eine Self-Sync-Änderung ist hier
+                    // authentisch.
                     print_and_remember(
                         storage,
                         &message.id,
                         &unsealed.sender,
                         &unsealed.plaintext,
                         &own_handle,
+                        true,
                     )?;
                     acked.push(message.id.clone());
                 }
@@ -894,7 +1072,17 @@ async fn drain_waiting(
         );
         match device.decrypt(&address, &opened.message).await {
             Ok(payload) => {
-                print_and_remember(storage, &message.id, &opened.from, &payload, &own_handle)?;
+                // sealed=false: unversiegelt, die Absenderadresse ist
+                // Klartext und fälschbar; eine Self-Sync-Änderung daraus
+                // verwirft print_and_remember.
+                print_and_remember(
+                    storage,
+                    &message.id,
+                    &opened.from,
+                    &payload,
+                    &own_handle,
+                    false,
+                )?;
                 acked.push(message.id.clone());
             }
             Err(error) => {
@@ -2069,6 +2257,43 @@ async fn group_send(args: &[String]) -> Result<(), String> {
     let [group_id, text] = args else {
         return Err("Aufruf: sm group-send <gruppen-id> <text>".to_string());
     };
+    // Vom Absender vergebene Nachrichten-ID, damit ein späteres
+    // 'sm group-edit'/'sm group-delete' sie treffen kann.
+    let id = new_uuid();
+    let accepted = deliver_group_payload(group_id, &grouptext::encode_text(&id, text)).await?;
+    println!("An die Gruppe gesendet ({accepted} Gerät(e))");
+    eprintln!("  (Nachrichten-ID: {id})");
+    Ok(())
+}
+
+/// `sm group-edit <gruppen-id> <id> <neuer-text>`: ersetzt den Text einer
+/// früher gesendeten Gruppennachricht (ID aus 'sm group-send').
+async fn group_edit(args: &[String]) -> Result<(), String> {
+    let [group_id, target, text] = args else {
+        return Err("Aufruf: sm group-edit <gruppen-id> <nachrichten-id> <neuer-text>".to_string());
+    };
+    let accepted = deliver_group_payload(group_id, &grouptext::encode_edit(target, text)).await?;
+    println!("Bearbeitung an die Gruppe gesendet ({accepted} Gerät(e))");
+    Ok(())
+}
+
+/// `sm group-delete <gruppen-id> <id>`: löscht eine Gruppennachricht bei
+/// allen (ID aus 'sm group-send').
+async fn group_delete(args: &[String]) -> Result<(), String> {
+    let [group_id, target] = args else {
+        return Err("Aufruf: sm group-delete <gruppen-id> <nachrichten-id>".to_string());
+    };
+    let accepted = deliver_group_payload(group_id, &grouptext::encode_delete(target)).await?;
+    println!("Löschung an die Gruppe gesendet ({accepted} Gerät(e))");
+    Ok(())
+}
+
+/// Gemeinsamer Kern von group-send/edit/delete: den smgpl-Payload durch die
+/// MLS-Sitzung verschlüsseln, den Ratchet-Zustand VOR dem Versand sichern
+/// (sonst Ratchet-Wiederverwendung nach einem Abbruch, siehe group_create),
+/// an alle Gruppengeräte fächern und zustellen. Liefert die Zahl der
+/// angenommenen Hüllen.
+async fn deliver_group_payload(group_id: &str, payload: &[u8]) -> Result<u64, String> {
     let profile = load_profile()?;
     let token = access_token(&profile)?;
     let storage = open_storage()?;
@@ -2079,9 +2304,7 @@ async fn group_send(args: &[String]) -> Result<(), String> {
         ));
     };
     let roster = load_roster(&storage, group_id)?;
-    let blob = session.create_message(&grouptext::encode_text(text))?;
-    // Zustand sichern, BEVOR der Chiffretext das Gerät verlässt (siehe
-    // group_create: sonst Ratchet-Wiederverwendung nach einem Abbruch).
+    let blob = session.create_message(payload)?;
     save_member_state(&storage, &session.export_state()?)?;
     let fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &profile.device_id)
         .map(|device| {
@@ -2096,8 +2319,7 @@ async fn group_send(args: &[String]) -> Result<(), String> {
         .group_messages(&token, group_id, &fanout)
         .await
         .map_err(|e| e.to_string())?;
-    println!("An die Gruppe gesendet ({} Gerät(e))", sent.accepted);
-    Ok(())
+    Ok(sent.accepted)
 }
 
 fn delivery_client() -> DeliveryClient {
@@ -2338,8 +2560,13 @@ async fn group_accept(args: &[String]) -> Result<(), String> {
                 let sender = String::from_utf8_lossy(&application.sender_identity).to_string();
                 match grouptext::decode(&application.plaintext) {
                     Ok(GroupPayload::Roster { devices }) => roster_devices = Some(devices),
-                    Ok(GroupPayload::Text { text }) => pending_texts.push((sender, text)),
-                    Ok(GroupPayload::Leave) | Err(_) => {}
+                    Ok(GroupPayload::Text { text, .. }) => pending_texts.push((sender, text)),
+                    // Vor dem Beitritt eingetroffene Bearbeitungen/Löschungen
+                    // und Verlassen-Ansagen ignoriert das zustandslose CLI.
+                    Ok(GroupPayload::Edit { .. })
+                    | Ok(GroupPayload::Delete { .. })
+                    | Ok(GroupPayload::Leave)
+                    | Err(_) => {}
                 }
             }
             Ok(GroupInbound::RemovedSelf) => {
@@ -2458,8 +2685,19 @@ fn handle_group_envelope(
                     save_member_state(storage, &session.export_state()?)?;
                     let sender = String::from_utf8_lossy(&application.sender_identity).to_string();
                     match grouptext::decode(&application.plaintext).map_err(|e| e.to_string())? {
-                        GroupPayload::Text { text } => {
+                        GroupPayload::Text { id, text } => {
                             println!("[gruppe {group_id}] {sender}: {text}");
+                            if !id.is_empty() {
+                                eprintln!("  (Nachrichten-ID: {id})");
+                            }
+                        }
+                        GroupPayload::Edit { target, text } => {
+                            println!("[gruppe {group_id}] {sender} (bearbeitet {target}): {text}");
+                        }
+                        GroupPayload::Delete { target } => {
+                            println!(
+                                "[gruppe {group_id}] {sender} hat Nachricht {target} gelöscht"
+                            );
                         }
                         GroupPayload::Roster { devices } => {
                             save_roster(storage, group_id, &devices)?;
@@ -2623,6 +2861,8 @@ fn print_usage() {
          \x20 group-create <name> <mitglied>...  MLS-Gruppe mit Namen gruenden\n\
          \x20 groups                         lokale Gruppenliste (ID + Mitglieder)\n\
          \x20 group-send <id> <text>         E2EE-Gruppennachricht senden\n\
+         \x20 group-edit <id> <msg-id> <text>  Gruppennachricht bearbeiten\n\
+         \x20 group-delete <id> <msg-id>     Gruppennachricht bei allen loeschen\n\
          \x20 group-members <id>             Name, Einstellungen und Rollen zeigen\n\
          \x20 group-role <id> <handle> <admin|member>  befoerdern/degradieren\n\
          \x20 group-transfer <id> <handle>   Besitz uebergeben (nur Owner)\n\
@@ -2633,6 +2873,8 @@ fn print_usage() {
          \x20 group-accept <id>              Einladung annehmen (beitreten)\n\
          \x20 group-decline <id>             Einladung ablehnen\n\
          \x20 send <handle> <text> [--ttl s] [--sealed]  E2EE senden (--ttl: verschwindet; --sealed: ohne Absender-Klartext)\n\
+         \x20 edit <handle> <msg-id> <text>  gesendete Nachricht bearbeiten\n\
+         \x20 delete <handle> <msg-id>       gesendete Nachricht bei allen loeschen\n\
          \x20 recv                           wartende Nachrichten abholen und entschlüsseln\n\
          \x20 listen [--once]                Hinweiskanal halten und bei Hinweisen abholen\n\
          \x20 verify                         eigenen KT-Eintrag pruefen (Selbstpruefung)\n\

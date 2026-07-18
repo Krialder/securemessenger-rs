@@ -31,6 +31,7 @@ pub mod grouptext;
 mod http;
 pub mod identity;
 pub mod kt;
+pub mod msg;
 pub mod policy;
 pub mod prekeys;
 pub mod protocol_store;

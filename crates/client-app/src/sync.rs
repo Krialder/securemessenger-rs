@@ -21,6 +21,8 @@
 //! überall); ein vollständiges Multi-Device-Sync mit Verlaufs-Nachzug beim
 //! Koppeln und Löschungen bleibt die größere, teils externe Stufe.]
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ClientError;
@@ -43,12 +45,23 @@ struct SyncBlob {
     /// Handle des Chat-Partners (Empfänger der Original-Nachricht bzw. der
     /// Chat, zu dem der Verlauf gehört).
     peer: String,
-    /// message: Klartext der Original-Nachricht (bei history leer).
+    /// message: Klartext der Original-Nachricht (bei history/event leer).
     #[serde(default)]
     text: String,
-    /// history: die nachgelieferten Verlaufszeilen (bei message leer).
+    /// message: die Nachrichten-ID (Franking-Commitment, Base64), damit die
+    /// eigene ausgehende Zeile auf dem anderen Gerät dieselbe ID trägt und
+    /// ein späteres Bearbeiten/Löschen sie trifft. Alte Payloads ohne Feld
+    /// bleiben lesbar (leere ID, dann nicht bearbeitbar).
+    #[serde(default)]
+    id: String,
+    /// history: die nachgelieferten Verlaufszeilen (sonst leer).
     #[serde(default)]
     lines: Vec<HistLine>,
+    /// event: das komplette smmsg-Ereignis (edit/delete) als Base64, damit
+    /// ein selbst gesendetes Bearbeiten oder Löschen die eigenen anderen
+    /// Geräte erreicht und dort dieselbe Nachricht trifft (sonst leer).
+    #[serde(default)]
+    event: String,
 }
 
 /// Eine Verlaufszeile im Nachzug: Absender-Handle, Klartext und Zeitpunkt.
@@ -63,22 +76,36 @@ pub struct HistLine {
 
 /// Das entschlüsselte Ergebnis eines Self-Sync-Payloads.
 pub enum Synced {
-    /// Eine gerade auf einem anderen Gerät gesendete Nachricht.
-    Message { peer: String, text: String },
+    /// Eine gerade auf einem anderen Gerät gesendete Nachricht mit ihrer ID
+    /// (Franking-Commitment; leer bei Alt-Payloads, dann nicht bearbeitbar).
+    Message {
+        peer: String,
+        text: String,
+        id: String,
+    },
     /// Ein nachgelieferter Verlauf eines Chats (Koppeln).
     History { peer: String, lines: Vec<HistLine> },
+    /// Ein smmsg-Änderungsereignis (Bearbeitung oder Löschung), das ein
+    /// anderes eigenes Gerät ausgelöst hat. Der Payload sind die rohen
+    /// smmsg-Bytes; der Aufrufer deutet sie mit `msg::decode`. Nur aus einer
+    /// SEALED Self-Sync-Hülle vertrauenswürdig (der Aufrufer prüft das): das
+    /// Sealed-Zertifikat bindet den Absender, die Klartext-Absenderadresse
+    /// einer unversiegelten Hülle ist fälschbar.
+    Event { peer: String, event: Vec<u8> },
 }
 
 /// Baut den Klartext-Payload einer Self-Sync-Kopie einer LIVE-Nachricht
 /// (wird anschließend wie jeder andere Payload über den Ratchet
 /// verschlüsselt).
-pub fn encode(peer: &str, text: &str) -> Vec<u8> {
+pub fn encode(peer: &str, text: &str, id: &str) -> Vec<u8> {
     let blob = SyncBlob {
         v: SYNC_VERSION.to_string(),
         kind: "message".to_string(),
         peer: peer.to_string(),
         text: text.to_string(),
+        id: id.to_string(),
         lines: Vec::new(),
+        event: String::new(),
     };
     serde_json::to_vec(&blob).expect("SyncBlob ist immer serialisierbar")
 }
@@ -90,7 +117,26 @@ pub fn encode_history(peer: &str, lines: &[HistLine]) -> Vec<u8> {
         kind: "history".to_string(),
         peer: peer.to_string(),
         text: String::new(),
+        id: String::new(),
         lines: lines.to_vec(),
+        event: String::new(),
+    };
+    serde_json::to_vec(&blob).expect("SyncBlob ist immer serialisierbar")
+}
+
+/// Baut den Klartext-Payload einer Ereignis-Kopie an die eigenen Geräte: der
+/// Chat-Partner plus die rohen smmsg-Bytes (neue Nachricht, Bearbeitung oder
+/// Löschung), damit die anderen Geräte dasselbe Ereignis auf dieselbe
+/// Nachrichten-ID anwenden.
+pub fn encode_event(peer: &str, event: &[u8]) -> Vec<u8> {
+    let blob = SyncBlob {
+        v: SYNC_VERSION.to_string(),
+        kind: "event".to_string(),
+        peer: peer.to_string(),
+        text: String::new(),
+        id: String::new(),
+        lines: Vec::new(),
+        event: BASE64.encode(event),
     };
     serde_json::to_vec(&blob).expect("SyncBlob ist immer serialisierbar")
 }
@@ -109,11 +155,21 @@ pub fn decode(payload: &[u8]) -> Result<Synced, ClientError> {
         "message" => Ok(Synced::Message {
             peer: blob.peer,
             text: blob.text,
+            id: blob.id,
         }),
         "history" => Ok(Synced::History {
             peer: blob.peer,
             lines: blob.lines,
         }),
+        "event" => {
+            let event = BASE64
+                .decode(&blob.event)
+                .map_err(|_| ClientError::Protocol("Sync-Ereignis ist kein Base64".to_string()))?;
+            Ok(Synced::Event {
+                peer: blob.peer,
+                event,
+            })
+        }
         other => Err(ClientError::Protocol(format!(
             "unbekannter Sync-Typ {other}"
         ))),
@@ -126,13 +182,27 @@ mod tests {
 
     #[test]
     fn message_roundtrip() {
-        let payload = encode("bob", "hallo mit umlaut ä");
+        let payload = encode("bob", "hallo mit umlaut ä", "Yzox");
         match decode(&payload).unwrap() {
-            Synced::Message { peer, text } => {
+            Synced::Message { peer, text, id } => {
                 assert_eq!(peer, "bob");
                 assert_eq!(text, "hallo mit umlaut ä");
+                assert_eq!(id, "Yzox");
             }
-            Synced::History { .. } => panic!("message erwartet"),
+            _ => panic!("message erwartet"),
+        }
+    }
+
+    #[test]
+    fn event_roundtrip_carries_raw_bytes() {
+        let event = crate::msg::encode_edit("Yzox", "neu ä");
+        let payload = encode_event("bob", &event);
+        match decode(&payload).unwrap() {
+            Synced::Event { peer, event: got } => {
+                assert_eq!(peer, "bob");
+                assert_eq!(got, event);
+            }
+            _ => panic!("event erwartet"),
         }
     }
 
@@ -156,7 +226,7 @@ mod tests {
                 assert_eq!(peer, "bob");
                 assert_eq!(got, lines);
             }
-            Synced::Message { .. } => panic!("history erwartet"),
+            _ => panic!("history erwartet"),
         }
     }
 
@@ -167,11 +237,12 @@ mod tests {
         let old = serde_json::json!({ "v": "smsync.v1", "peer": "bob", "text": "alt" });
         let payload = serde_json::to_vec(&old).unwrap();
         match decode(&payload).unwrap() {
-            Synced::Message { peer, text } => {
+            Synced::Message { peer, text, id } => {
                 assert_eq!(peer, "bob");
                 assert_eq!(text, "alt");
+                assert!(id.is_empty());
             }
-            Synced::History { .. } => panic!("message erwartet"),
+            _ => panic!("message erwartet"),
         }
     }
 

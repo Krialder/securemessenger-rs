@@ -28,6 +28,13 @@ struct PayloadBlob {
     /// roster: die Zielgeräte der Gruppe (bei text leer).
     #[serde(default)]
     devices: Vec<RosterDevice>,
+    /// text: die vom Absender vergebene Nachrichten-ID, damit ein späteres
+    /// edit/delete sie treffen kann (bei alten Payloads ohne Feld leer).
+    #[serde(default)]
+    id: String,
+    /// edit/delete: die ID der betroffenen Nachricht (sonst leer).
+    #[serde(default)]
+    target: String,
 }
 
 /// Ein Zielgerät der Gruppe: Handle des Halters plus die Server-Geräte-ID,
@@ -40,8 +47,13 @@ pub struct RosterDevice {
 
 /// Der entschlüsselte Inhalt einer Gruppen-Anwendungsnachricht.
 pub enum GroupPayload {
-    /// Ein Gesprächstext.
-    Text { text: String },
+    /// Ein Gesprächstext mit seiner Nachrichten-ID (bei alten Payloads
+    /// ohne ID leer, dann nicht bearbeitbar).
+    Text { id: String, text: String },
+    /// Der Absender ersetzt den Text der Nachricht `target`.
+    Edit { target: String, text: String },
+    /// Der Absender löscht die Nachricht `target` bei allen.
+    Delete { target: String },
     /// Der Geräte-Roster der Gruppe (vom Gründer bzw. letzten Committer).
     Roster { devices: Vec<RosterDevice> },
     /// Die Ansage des Absenders, dass er die Gruppe verlässt. Nur eine
@@ -51,37 +63,68 @@ pub enum GroupPayload {
     Leave,
 }
 
-/// Baut den Klartext-Payload eines Gesprächstexts (wird anschließend von
-/// MLS verschlüsselt).
-pub fn encode_text(text: &str) -> Vec<u8> {
-    let blob = PayloadBlob {
+/// Baut den Klartext-Payload eines Gesprächstexts mit ID (wird anschließend
+/// von MLS verschlüsselt).
+pub fn encode_text(id: &str, text: &str) -> Vec<u8> {
+    to_bytes(PayloadBlob {
         v: GROUP_PAYLOAD_VERSION.to_string(),
         kind: "text".to_string(),
         text: text.to_string(),
         devices: Vec::new(),
-    };
-    serde_json::to_vec(&blob).expect("PayloadBlob ist immer serialisierbar")
+        id: id.to_string(),
+        target: String::new(),
+    })
+}
+
+/// Baut den Payload einer Bearbeitung: neuer Text für Nachricht `target`.
+pub fn encode_edit(target: &str, text: &str) -> Vec<u8> {
+    to_bytes(PayloadBlob {
+        v: GROUP_PAYLOAD_VERSION.to_string(),
+        kind: "edit".to_string(),
+        text: text.to_string(),
+        devices: Vec::new(),
+        id: String::new(),
+        target: target.to_string(),
+    })
+}
+
+/// Baut den Payload einer Löschung bei allen für Nachricht `target`.
+pub fn encode_delete(target: &str) -> Vec<u8> {
+    to_bytes(PayloadBlob {
+        v: GROUP_PAYLOAD_VERSION.to_string(),
+        kind: "delete".to_string(),
+        text: String::new(),
+        devices: Vec::new(),
+        id: String::new(),
+        target: target.to_string(),
+    })
 }
 
 /// Baut den Klartext-Payload des Geräte-Rosters.
 pub fn encode_roster(devices: &[RosterDevice]) -> Vec<u8> {
-    let blob = PayloadBlob {
+    to_bytes(PayloadBlob {
         v: GROUP_PAYLOAD_VERSION.to_string(),
         kind: "roster".to_string(),
         text: String::new(),
         devices: devices.to_vec(),
-    };
-    serde_json::to_vec(&blob).expect("PayloadBlob ist immer serialisierbar")
+        id: String::new(),
+        target: String::new(),
+    })
 }
 
 /// Baut den Klartext-Payload der Verlassen-Ansage.
 pub fn encode_leave() -> Vec<u8> {
-    let blob = PayloadBlob {
+    to_bytes(PayloadBlob {
         v: GROUP_PAYLOAD_VERSION.to_string(),
         kind: "leave".to_string(),
         text: String::new(),
         devices: Vec::new(),
-    };
+        id: String::new(),
+        target: String::new(),
+    })
+}
+
+fn to_bytes(blob: PayloadBlob) -> Vec<u8> {
     serde_json::to_vec(&blob).expect("PayloadBlob ist immer serialisierbar")
 }
 
@@ -96,7 +139,17 @@ pub fn decode(payload: &[u8]) -> Result<GroupPayload, ClientError> {
         )));
     }
     match blob.kind.as_str() {
-        "text" => Ok(GroupPayload::Text { text: blob.text }),
+        "text" => Ok(GroupPayload::Text {
+            id: blob.id,
+            text: blob.text,
+        }),
+        "edit" => Ok(GroupPayload::Edit {
+            target: blob.target,
+            text: blob.text,
+        }),
+        "delete" => Ok(GroupPayload::Delete {
+            target: blob.target,
+        }),
         "roster" => Ok(GroupPayload::Roster {
             devices: blob.devices,
         }),
@@ -113,8 +166,43 @@ mod tests {
 
     #[test]
     fn text_roundtrip() {
-        match decode(&encode_text("hallo gruppe ä")).unwrap() {
-            GroupPayload::Text { text } => assert_eq!(text, "hallo gruppe ä"),
+        match decode(&encode_text("g-1", "hallo gruppe ä")).unwrap() {
+            GroupPayload::Text { id, text } => {
+                assert_eq!(id, "g-1");
+                assert_eq!(text, "hallo gruppe ä");
+            }
+            _ => panic!("text erwartet"),
+        }
+    }
+
+    #[test]
+    fn edit_roundtrip() {
+        match decode(&encode_edit("g-1", "korrigiert ö")).unwrap() {
+            GroupPayload::Edit { target, text } => {
+                assert_eq!(target, "g-1");
+                assert_eq!(text, "korrigiert ö");
+            }
+            _ => panic!("edit erwartet"),
+        }
+    }
+
+    #[test]
+    fn delete_roundtrip() {
+        match decode(&encode_delete("g-1")).unwrap() {
+            GroupPayload::Delete { target } => assert_eq!(target, "g-1"),
+            _ => panic!("delete erwartet"),
+        }
+    }
+
+    /// Ein Text-Payload aus der Zeit vor dem id-Feld bleibt lesbar (leere ID).
+    #[test]
+    fn old_text_without_id_is_readable() {
+        let old = serde_json::json!({ "v": "smgpl.v1", "kind": "text", "text": "alt" });
+        match decode(&serde_json::to_vec(&old).unwrap()).unwrap() {
+            GroupPayload::Text { id, text } => {
+                assert!(id.is_empty());
+                assert_eq!(text, "alt");
+            }
             _ => panic!("text erwartet"),
         }
     }

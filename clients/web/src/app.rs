@@ -97,6 +97,19 @@ struct StoredLine {
     at: u64,
     #[serde(default)]
     report_id: Option<String>,
+    /// Die vom Absender vergebene Nachrichten-ID (`smmsg`/`smgpl`). Sie
+    /// verbindet eine Zeile mit späteren Bearbeitungen/Löschungen. Alte
+    /// Verläufe und History-Nachzüge ohne ID sind nicht bearbeitbar.
+    #[serde(default)]
+    id: String,
+    /// Wahr, wenn der Absender den Text nachträglich bearbeitet hat; die
+    /// Oberfläche zeigt dann „bearbeitet".
+    #[serde(default)]
+    edited: bool,
+    /// Wahr, wenn der Absender die Nachricht bei allen gelöscht hat; die
+    /// Zeile bleibt als Grabstein stehen.
+    #[serde(default)]
+    deleted: bool,
 }
 
 /// Die Zusammenfassung einer Unterhaltung für die Seitenleiste: mit wem,
@@ -247,7 +260,13 @@ fn record_message(
     bump_unread: bool,
 ) -> Vec<ChatSummary> {
     let mut history = load_history(storage, peer);
-    let snippet = line.text.clone();
+    // Ein Grabstein hat leeren Text; die Seitenleiste zeigt dann einen
+    // lesbaren Platzhalter statt einer leeren Zeile (wie apply_event).
+    let snippet = if line.deleted {
+        "(Nachricht gelöscht)".to_string()
+    } else {
+        line.text.clone()
+    };
     history.push(line);
     save_history(storage, peer, &history);
 
@@ -270,6 +289,99 @@ fn record_message(
         );
     }
     save_summaries(storage, &summaries);
+    summaries
+}
+
+/// Wendet eine empfangene Bearbeitung oder Löschung auf den Verlauf eines
+/// Chats an: die Zeile mit der Ziel-ID bekommt neuen Text (und die Marke
+/// „bearbeitet") bzw. wird zum Grabstein. Nur Zeilen DES ABSENDERS des
+/// Ereignisses sind betroffen (`event_from`): niemand kann fremde Nachrichten
+/// bearbeiten oder löschen, auch nicht mit geratener ID (die 1:1-ID ist das
+/// nicht erratbare Franking-Commitment). Ein Grabstein bleibt Grabstein (ein
+/// nachlaufendes Edit weckt ihn nicht wieder).
+///
+/// Regel fürs Melden: die Zeile beweist stets den ZULETZT lesbaren Inhalt.
+/// Bei einer Bearbeitung folgt die Melde-ID dem neuen Text (`edit_report_id`);
+/// bei einer Löschung bleibt die alte Melde-ID, damit ein Absender Missbrauch
+/// nicht durch Nachträgliches Löschen tilgen kann (der letzte gezeigte Inhalt
+/// bleibt meldbar).
+/// [ANNAHME: Jede so gemeldete Fassung ist ein echter, beweisbarer Versand;
+/// eine bewusst überschriebene FRÜHERE Fassung ist danach nicht mehr mit
+/// einem Klick meldbar (ihr Franking-Material liegt aber weiter lokal unter
+/// `franking/<zustell-id>`, eine spätere Versions-Melde-Oberfläche könnte es
+/// erreichen). Das deckt sich mit der offenen Frage in
+/// specs/sealed-sender-und-abuse.md: welche Fassung eine bearbeitete
+/// Nachricht belegt, ist eine Politik-Entscheidung, keine
+/// Krypto-Eigenschaft.]
+///
+/// Aktualisiert den Seitenleisten-Auszug, falls die letzte Zeile betroffen
+/// war, und liefert die neue Liste; ohne Treffer ändert sich nichts.
+fn apply_event(
+    storage: &SharedStorage,
+    peer: &str,
+    event_from: &str,
+    target: &str,
+    new_text: Option<&str>,
+    edit_report_id: Option<String>,
+) -> Option<Vec<ChatSummary>> {
+    if target.is_empty() {
+        return None;
+    }
+    let mut history = load_history(storage, peer);
+    let line = history
+        .iter_mut()
+        .find(|l| l.id == target && l.from == event_from && !l.deleted)?;
+    match new_text {
+        Some(text) => {
+            line.text = text.to_string();
+            line.edited = true;
+            // Die Meldbarkeit folgt dem gezeigten (neuen) Text; ohne
+            // Melde-Material (Selbst-Edit, Gruppe) bleibt sie unverändert.
+            if edit_report_id.is_some() {
+                line.report_id = edit_report_id;
+            }
+        }
+        None => {
+            line.text = String::new();
+            line.deleted = true;
+            // report_id bleibt: der letzte gezeigte Inhalt bleibt meldbar.
+        }
+    }
+    save_history(storage, peer, &history);
+
+    // Der Auszug in der Seitenleiste zeigt die letzte Zeile; war GENAU die
+    // (nach ID und Autor) die betroffene, zieht er nach.
+    let last_changed = history
+        .last()
+        .is_some_and(|l| l.id == target && l.from == event_from);
+    let mut summaries = load_summaries(storage);
+    if last_changed {
+        if let Some(summary) = summaries.iter_mut().find(|s| s.peer == peer) {
+            summary.snippet = match new_text {
+                Some(text) => text.to_string(),
+                None => "(Nachricht gelöscht)".to_string(),
+            };
+            save_summaries(storage, &summaries);
+        }
+    }
+    Some(summaries)
+}
+
+/// Entfernt eine Zeile nur LOKAL aus dem Verlauf („für mich löschen"): kein
+/// Ereignis reist über die Leitung, andere Geräte und der Empfänger behalten
+/// ihre Kopie. Aktualisiert den Seitenleisten-Auszug und liefert die neue
+/// Liste.
+fn remove_line_local(storage: &SharedStorage, peer: &str, target: &str) -> Vec<ChatSummary> {
+    let mut history = load_history(storage, peer);
+    history.retain(|l| l.id.is_empty() || l.id != target);
+    save_history(storage, peer, &history);
+
+    let snippet = history.last().map(|l| l.text.clone()).unwrap_or_default();
+    let mut summaries = load_summaries(storage);
+    if let Some(summary) = summaries.iter_mut().find(|s| s.peer == peer) {
+        summary.snippet = snippet;
+        save_summaries(storage, &summaries);
+    }
     summaries
 }
 
@@ -296,6 +408,11 @@ fn merge_history(
                 text: hl.text.clone(),
                 at: hl.at,
                 report_id: None,
+                // Der Verlaufs-Nachzug trägt keine Nachrichten-IDs; diese
+                // Zeilen sind nachträglich nicht bearbeitbar (siehe HistLine).
+                id: String::new(),
+                edited: false,
+                deleted: false,
             });
         }
     }
@@ -781,10 +898,14 @@ enum Incoming {
         from: String,
         text: String,
         report_id: Option<String>,
+        /// Die Nachrichten-ID (Franking-Commitment; leer bei einer
+        /// ungefrankten Alt-Nachricht, dann nicht bearbeitbar).
+        id: String,
     },
     Synced {
         peer: String,
         text: String,
+        id: String,
     },
     SyncedHistory {
         peer: String,
@@ -796,6 +917,29 @@ enum Incoming {
         group_id: String,
         from: String,
         text: String,
+        id: String,
+    },
+    /// Eine Bearbeitung: die Zeile mit `target` im Chat `chat_peer` (ein
+    /// Handle oder `grp:<id>`) bekommt neuen Text. Vereint 1:1, Gruppe und
+    /// Self-Sync, weil die Anwendung überall dieselbe ist. `from` ist der
+    /// Urheber des Ereignisses (1:1: der Absender; Gruppe: die MLS-geprüfte
+    /// Credential; Self-Sync: das eigene Handle): nur SEINE Zeilen darf das
+    /// Ereignis treffen. `report_id` ist das Melde-Material der Bearbeitung
+    /// (deckt den NEUEN Text), damit eine bearbeitete Zeile weiter meldbar
+    /// bleibt und nicht den alten Text beweist.
+    Edit {
+        chat_peer: String,
+        from: String,
+        target: String,
+        text: String,
+        report_id: Option<String>,
+    },
+    /// Eine Löschung bei allen: die Zeile mit `target` im Chat `chat_peer`
+    /// wird zum Grabstein. `from` wie bei `Edit`.
+    Delete {
+        chat_peer: String,
+        from: String,
+        target: String,
     },
     /// Ein fremder Commit hat die Mitgliederliste geändert (Entfernung
     /// durch ein anderes Mitglied); Label nachführen.
@@ -805,9 +949,7 @@ enum Incoming {
     },
     /// Ein fremder Commit hat DIESES Mitglied entfernt; der lokale
     /// Zustand ist schon aufgeräumt, die UI sagt es an.
-    GroupRemovedSelf {
-        group_id: String,
-    },
+    GroupRemovedSelf { group_id: String },
     /// Eine Einladung in eine Gruppe (Welcome vorgemerkt, noch nicht
     /// beigetreten); die UI bietet Annehmen/Ablehnen an. Name und Einlader
     /// (vom Einladenden bezeugt) fürs Banner.
@@ -819,11 +961,106 @@ enum Incoming {
 }
 
 /// Übersetzt ein entschlüsseltes Self-Sync-Ergebnis in einen `Incoming`.
-fn incoming_from_sync(synced: client_app::sync::Synced) -> Incoming {
+/// `own` ist das eigene Handle (Urheber der Ereignisse aus dem Self-Sync).
+/// `sealed` sagt, ob die Hülle versiegelt ankam: ein Änderungsereignis
+/// (Bearbeitung/Löschung) wird NUR aus einer versiegelten Hülle angewandt,
+/// weil nur dann das Zertifikat den Absender bindet; eine unversiegelte
+/// Absenderadresse ist fälschbar und würde das Umschreiben/Löschen des
+/// eigenen Verlaufs durch einen Dritten erlauben. Liefert `None`, wenn nichts
+/// anzuwenden ist (unversiegeltes, also unglaubwürdiges Ereignis).
+fn incoming_from_sync(
+    own: &str,
+    sealed: bool,
+    synced: client_app::sync::Synced,
+) -> Option<Incoming> {
     match synced {
-        client_app::sync::Synced::Message { peer, text } => Incoming::Synced { peer, text },
+        client_app::sync::Synced::Message { peer, text, id } => {
+            Some(Incoming::Synced { peer, text, id })
+        }
         client_app::sync::Synced::History { peer, lines } => {
-            Incoming::SyncedHistory { peer, lines }
+            Some(Incoming::SyncedHistory { peer, lines })
+        }
+        // Ein auf einem anderen eigenen Gerät ausgelöstes Änderungsereignis.
+        client_app::sync::Synced::Event { peer, event } => {
+            if !sealed {
+                leptos::logging::warn!(
+                    "Unversiegelte Self-Sync-Änderung verworfen (nicht authentisch)."
+                );
+                return None;
+            }
+            match client_app::msg::decode(&event) {
+                // Ein Text käme hier nur aus einem Alt-Payload; als
+                // ausgehende Zeile ohne ID deuten.
+                client_app::msg::Msg::Text { text } => Some(Incoming::Synced {
+                    peer,
+                    text,
+                    id: String::new(),
+                }),
+                client_app::msg::Msg::Edit { target, text } => Some(Incoming::Edit {
+                    chat_peer: peer,
+                    from: own.to_string(),
+                    target,
+                    text,
+                    // Die eigene Bearbeitung ist nicht zu melden (kein
+                    // fremder Missbrauch); report_id bleibt leer.
+                    report_id: None,
+                }),
+                client_app::msg::Msg::Delete { target } => Some(Incoming::Delete {
+                    chat_peer: peer,
+                    from: own.to_string(),
+                    target,
+                }),
+            }
+        }
+    }
+}
+
+/// Übersetzt eine entschlüsselte 1:1-`smmsg`-Deutung in einen `Incoming`. Der
+/// Chat ist der Absender (`from`); ein Text bekommt seine Nachrichten-ID aus
+/// dem Franking-Commitment (`id`), eine Bearbeitung/Löschung trifft die Zeile
+/// mit der Ziel-ID.
+///
+/// `sealed` sagt, ob die Hülle versiegelt ankam. Eine Bearbeitung/Löschung
+/// wird NUR aus einer versiegelten Hülle angewandt: echte Änderungen gehen
+/// immer versiegelt (`edit_message`/`delete_message`), und nur dann bindet
+/// das Zertifikat den Absender. Eine unversiegelte Hülle trägt die
+/// Absenderadresse im Klartext (fälschbar, Trust-on-first-use); ohne diese
+/// Schranke könnte ein Dritter (etwa ein neugieriger Dienst, der das
+/// Commitment als Franking-Tag kennt) ein Löschen/Umschreiben einer echten
+/// Nachricht unter dem Handle des Absenders unterschieben. Ein Text bleibt
+/// auch unversiegelt zulässig (das war schon immer so; eine gefälschte
+/// EINGEHENDE Zeile ist die Alt-Eigenschaft des unversiegelten Kanals, das
+/// NEUE Risiko ist nur das Verändern bestehenden Verlaufs). Liefert `None`,
+/// wenn ein unversiegeltes Änderungsereignis verworfen wird.
+fn incoming_from_msg(
+    from: String,
+    msg: client_app::msg::Msg,
+    report_id: Option<String>,
+    id: String,
+    sealed: bool,
+) -> Option<Incoming> {
+    match msg {
+        client_app::msg::Msg::Text { text } => Some(Incoming::Message {
+            from,
+            text,
+            report_id,
+            id,
+        }),
+        client_app::msg::Msg::Edit { target, text } if sealed => Some(Incoming::Edit {
+            chat_peer: from.clone(),
+            from,
+            target,
+            text,
+            report_id,
+        }),
+        client_app::msg::Msg::Delete { target } if sealed => Some(Incoming::Delete {
+            chat_peer: from.clone(),
+            from,
+            target,
+        }),
+        client_app::msg::Msg::Edit { .. } | client_app::msg::Msg::Delete { .. } => {
+            leptos::logging::warn!("Unversiegelte 1:1-Änderung verworfen (nicht authentisch).");
+            None
         }
     }
 }
@@ -850,10 +1087,25 @@ fn handle_group_envelope(
                     save_member_state(storage, &session.export_state()?)?;
                     let sender = String::from_utf8_lossy(&application.sender_identity).to_string();
                     match grouptext::decode(&application.plaintext).map_err(|e| e.to_string())? {
-                        GroupPayload::Text { text } => Ok(Some(Incoming::Group {
+                        GroupPayload::Text { id, text } => Ok(Some(Incoming::Group {
                             group_id: group_id.to_string(),
                             from: sender,
                             text,
+                            id,
+                        })),
+                        GroupPayload::Edit { target, text } => Ok(Some(Incoming::Edit {
+                            chat_peer: group_chat_key(group_id),
+                            from: sender,
+                            target,
+                            text,
+                            // Gruppen-Hüllen tragen kein Franking; nichts zu
+                            // melden.
+                            report_id: None,
+                        })),
+                        GroupPayload::Delete { target } => Ok(Some(Incoming::Delete {
+                            chat_peer: group_chat_key(group_id),
+                            from: sender,
+                            target,
                         })),
                         GroupPayload::Roster { devices } => {
                             save_roster(storage, group_id, &devices)?;
@@ -866,6 +1118,7 @@ fn handle_group_envelope(
                             group_id: group_id.to_string(),
                             from: sender,
                             text: "(verlässt die Gruppe)".to_string(),
+                            id: String::new(),
                         })),
                     }
                 }
@@ -1540,14 +1793,22 @@ fn own_device_number(core: &Core) -> u32 {
 /// Zustellung kann die Erneuerung rotieren, und der Dienst entwertet das
 /// alte Token dabei sofort. Jeder Request liest deshalb unmittelbar vorher
 /// den aktuellen Stand.
-async fn send_message(
+/// Wie die Self-Sync-Kopie einer 1:1-Zustellung aussieht: eine gewöhnliche
+/// Nachricht (Text + ID) oder ein Änderungsereignis (rohe smmsg-Bytes).
+enum SelfCopy<'a> {
+    Text { text: &'a str },
+    Event { event: &'a [u8] },
+}
+
+async fn deliver_1to1(
     core: &mut Core,
     token: ReadSignal<String>,
     peer: &str,
-    text: &str,
-    expires_at: Option<u64>,
+    plaintext: &[u8],
     sealed: bool,
-) -> Result<(), String> {
+    self_copy: SelfCopy<'_>,
+    expires_at: Option<u64>,
+) -> Result<String, String> {
     let contact_key = format!("contact/{peer}");
     let known: Vec<ContactDevice> = match core
         .storage
@@ -1596,12 +1857,13 @@ async fn send_message(
     };
 
     // Einmal je Nachricht franken (specs/sealed-sender-und-abuse.md): der
-    // Franking-Schlüssel reist im verschlüsselten Payload, das Commitment
-    // als Tag an der Hülle. Dieselben Werte für alle Zielgeräte.
-    let franked = client_app::franking::frank(text.as_bytes());
+    // Franking-Schlüssel reist im verschlüsselten Payload, das Commitment als
+    // Tag an der Hülle und ist zugleich die stabile Nachrichten-ID.
+    let franked = client_app::franking::frank(plaintext);
     let franking_tag = BASE64.encode(&franked.commitment);
-    // Für versiegelten Versand einmal das Absender-Zertifikat besorgen
-    // (gecacht in der Ablage, siehe sender_certificate_cached).
+    let id = client_app::franking::commitment_id(&franked.commitment);
+    // Sealed braucht das Absender-Zertifikat (gecacht); dasselbe deckt die
+    // Self-Sync-Kopie ab.
     let certificate = if sealed {
         let number = own_device_number(core);
         Some(sender_certificate_cached(token, number, &core.storage).await?)
@@ -1642,10 +1904,24 @@ async fn send_message(
             expires_at,
         });
     }
-    // Self-Sync: dieselbe Nachricht als Kopie an die eigenen Zweitgeräte,
-    // damit der gesendete Text auch dort im Verlauf steht. Best effort:
-    // scheitert das, ist die Nachricht beim Empfänger trotzdem raus.
-    match build_sync_envelopes(core, token, certificate.as_deref(), peer, text, expires_at).await {
+    // Self-Sync: die Kopie an die eigenen Zweitgeräte. Ein Text reist als
+    // gewöhnliche Nachricht mit seiner ID; ein Änderungsereignis als
+    // versiegeltes smmsg (nur so vertraut die Empfangsseite dem Ereignis).
+    // Best effort: scheitert das, ist die Nachricht beim Empfänger trotzdem
+    // raus.
+    let self_payload = match self_copy {
+        SelfCopy::Text { text } => client_app::sync::encode(peer, text, &id),
+        SelfCopy::Event { event } => client_app::sync::encode_event(peer, event),
+    };
+    match build_sync_envelopes(
+        core,
+        token,
+        certificate.as_deref(),
+        &self_payload,
+        expires_at,
+    )
+    .await
+    {
         Ok(mut sync) => envelopes.append(&mut sync),
         Err(error) => leptos::logging::warn!("Self-Sync übersprungen: {error}"),
     }
@@ -1662,6 +1938,77 @@ async fn send_message(
             .await
             .map_err(|e| e.to_string())?;
     }
+    Ok(id)
+}
+
+/// Sendet eine neue 1:1-Nachricht (roher Text) und liefert ihre ID (das
+/// Franking-Commitment) zurück, damit die eigene Verlaufszeile sie trägt und
+/// ein späteres Bearbeiten/Löschen sie trifft.
+async fn send_message(
+    core: &mut Core,
+    token: ReadSignal<String>,
+    peer: &str,
+    text: &str,
+    expires_at: Option<u64>,
+    sealed: bool,
+) -> Result<String, String> {
+    deliver_1to1(
+        core,
+        token,
+        peer,
+        text.as_bytes(),
+        sealed,
+        SelfCopy::Text { text },
+        expires_at,
+    )
+    .await
+}
+
+/// Bearbeitet eine früher gesendete 1:1-Nachricht bei allen. Reist IMMER
+/// versiegelt: so bindet das Zertifikat den Absender, und die Empfangsseite
+/// vertraut der Self-Sync-Kopie (eine unversiegelte, fälschbare Absender-
+/// adresse würde das Umschreiben fremder Verläufe erlauben).
+async fn edit_message(
+    core: &mut Core,
+    token: ReadSignal<String>,
+    peer: &str,
+    target: &str,
+    text: &str,
+) -> Result<(), String> {
+    let event = client_app::msg::encode_edit(target, text);
+    deliver_1to1(
+        core,
+        token,
+        peer,
+        &event,
+        true,
+        SelfCopy::Event { event: &event },
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Löscht eine früher gesendete 1:1-Nachricht bei allen (immer versiegelt,
+/// siehe `edit_message`); die Empfangsseite ersetzt sie durch einen
+/// Grabstein.
+async fn delete_message(
+    core: &mut Core,
+    token: ReadSignal<String>,
+    peer: &str,
+    target: &str,
+) -> Result<(), String> {
+    let event = client_app::msg::encode_delete(target);
+    deliver_1to1(
+        core,
+        token,
+        peer,
+        &event,
+        true,
+        SelfCopy::Event { event: &event },
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1728,15 +2075,13 @@ async fn build_sync_envelopes(
     core: &mut Core,
     token: ReadSignal<String>,
     certificate: Option<&[u8]>,
-    peer: &str,
-    text: &str,
+    payload: &[u8],
     expires_at: Option<u64>,
 ) -> Result<Vec<OutgoingEnvelope>, String> {
     let siblings = own_siblings(core, token).await?;
     if siblings.is_empty() {
         return Ok(Vec::new());
     }
-    let payload = client_app::sync::encode(peer, text);
     let mut out = Vec::with_capacity(siblings.len());
     for sib in &siblings {
         let address = ProtocolAddress::new(
@@ -1747,7 +2092,7 @@ async fn build_sync_envelopes(
             Some(cert) => {
                 let blob = core
                     .device
-                    .seal_message(&address, cert, &payload)
+                    .seal_message(&address, cert, payload)
                     .await
                     .map_err(|e| format!("Versiegeln (Sync): {e}"))?;
                 wire::seal_sealed(&blob).map_err(|e| e.to_string())?
@@ -1755,7 +2100,7 @@ async fn build_sync_envelopes(
             None => {
                 let message = core
                     .device
-                    .encrypt(&address, &payload)
+                    .encrypt(&address, payload)
                     .await
                     .map_err(|e| format!("Verschlüsselung (Sync): {e}"))?;
                 wire::seal(&core.handle, own_device_number(core), &message)
@@ -1815,14 +2160,22 @@ async fn push_history(core: &mut Core, token: ReadSignal<String>) -> Result<usiz
             if hist.is_empty() {
                 return None;
             }
-            let lines = hist
+            // Bei allen gelöschte Zeilen NICHT nachliefern: der Nachzug trägt
+            // keine Grabstein-Marke (HistLine hat nur from/text/at), sie
+            // kämen sonst als leere Zeilen an. Ein frisch gekoppeltes Gerät
+            // sieht schon gelöschte Nachrichten schlicht nicht.
+            let lines: Vec<_> = hist
                 .iter()
+                .filter(|l| !l.deleted)
                 .map(|l| client_app::sync::HistLine {
                     from: l.from.clone(),
                     text: l.text.clone(),
                     at: l.at,
                 })
                 .collect();
+            if lines.is_empty() {
+                return None;
+            }
             Some((s.peer.clone(), lines))
         })
         .collect();
@@ -1956,14 +2309,15 @@ async fn sender_certificate_cached(
 
 /// Entrahmt einen entschlüsselten Payload (K_f vorangestellt, Message
 /// Franking), legt das Melde-Material ab (`franking/<id>`, Format wie im
-/// CLI) und liefert (Klartext, Melde-ID). Ältere, ungefrankte Nachrichten
-/// fallen auf die rohe Anzeige zurück, ohne Melde-ID; schlägt das Ablegen
-/// fehl, bleibt die Nachricht lesbar, nur das Melden fällt für sie aus.
+/// CLI) und liefert (smmsg-Deutung, Melde-ID, Nachrichten-ID). Die
+/// Nachrichten-ID ist das Franking-Commitment (Basis fürs Bearbeiten/Löschen)
+/// und leer bei einer ungefrankten Alt-Nachricht; schlägt das Ablegen fehl,
+/// bleibt die Nachricht lesbar, nur das Melden fällt für sie aus.
 fn open_payload(
     storage: &SharedStorage,
     message_id: &str,
     payload: &[u8],
-) -> (String, Option<String>) {
+) -> (client_app::msg::Msg, Option<String>, String) {
     match client_app::franking::unfrank(payload) {
         Ok(opened) => {
             let record = serde_json::json!({
@@ -1986,12 +2340,11 @@ fn open_payload(
                     None
                 }
             };
-            (
-                String::from_utf8_lossy(&opened.message).to_string(),
-                report_id,
-            )
+            let id = client_app::franking::message_id(&opened.franking_key, &opened.message);
+            (client_app::msg::decode(&opened.message), report_id, id)
         }
-        Err(_) => (String::from_utf8_lossy(payload).to_string(), None),
+        // Ungefrankt (Alt-Nachricht): roher Text, keine Melde-/Nachrichten-ID.
+        Err(_) => (client_app::msg::decode(payload), None, String::new()),
     }
 }
 
@@ -2169,16 +2522,17 @@ async fn create_group_web(
     Ok(group_id)
 }
 
-/// Sendet einen Text in eine Gruppe: MLS verschlüsselt, der Zustand wird
-/// VOR dem Versand gesichert (sonst nutzte ein Neuladen dieselbe
-/// Ratchet-Position erneut), die Hüllen gehen an alle Roster-Geräte außer
-/// den eigenen.
-async fn send_group_message(
+/// Verschlüsselt einen `smgpl`-Payload (Text, Bearbeitung oder Löschung)
+/// durch die MLS-Sitzung und fächert ihn an alle Roster-Geräte außer den
+/// eigenen. Der Zustand wird VOR dem Versand gesichert (sonst nutzte ein
+/// Neuladen dieselbe Ratchet-Position erneut). Gemeinsamer Kern von
+/// send/edit/delete in Gruppen.
+async fn send_group_payload(
     storage: &SharedStorage,
     token: &str,
     own_handle: &str,
     group_id: &str,
-    text: &str,
+    payload: &[u8],
 ) -> Result<(), String> {
     let own_device_id = load_profile(storage)
         .map(|p| p.device_id)
@@ -2188,7 +2542,7 @@ async fn send_group_message(
         return Err("Diese Gruppe ist in der lokalen Ablage unbekannt.".to_string());
     };
     let roster = load_roster(storage, group_id)?;
-    let blob = session.create_message(&grouptext::encode_text(text))?;
+    let blob = session.create_message(payload)?;
     save_member_state(storage, &session.export_state()?)?;
     let fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &own_device_id)
         .map(|device| {
@@ -2204,6 +2558,65 @@ async fn send_group_message(
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Sendet einen Text in eine Gruppe und liefert dessen neue Nachrichten-ID
+/// (für die eigene Verlaufszeile, damit ein späteres Bearbeiten/Löschen sie
+/// trifft).
+async fn send_group_message(
+    storage: &SharedStorage,
+    token: &str,
+    own_handle: &str,
+    group_id: &str,
+    text: &str,
+) -> Result<String, String> {
+    let id = new_uuid();
+    send_group_payload(
+        storage,
+        token,
+        own_handle,
+        group_id,
+        &grouptext::encode_text(&id, text),
+    )
+    .await?;
+    Ok(id)
+}
+
+/// Bearbeitet eine früher gesendete Gruppennachricht bei allen.
+async fn edit_group_message(
+    storage: &SharedStorage,
+    token: &str,
+    own_handle: &str,
+    group_id: &str,
+    target: &str,
+    text: &str,
+) -> Result<(), String> {
+    send_group_payload(
+        storage,
+        token,
+        own_handle,
+        group_id,
+        &grouptext::encode_edit(target, text),
+    )
+    .await
+}
+
+/// Löscht eine früher gesendete Gruppennachricht bei allen.
+async fn delete_group_message(
+    storage: &SharedStorage,
+    token: &str,
+    own_handle: &str,
+    group_id: &str,
+    target: &str,
+) -> Result<(), String> {
+    send_group_payload(
+        storage,
+        token,
+        own_handle,
+        group_id,
+        &grouptext::encode_delete(target),
+    )
+    .await
 }
 
 /// Entfernt ein Mitglied mit MLS-Neuschlüsseln (wie `sm group-remove`):
@@ -2317,9 +2730,13 @@ fn accept_invite(
 
     // Gepufferten Verkehr nachspielen: Roster (zum Senden nötig),
     // Gesprächs-Texte (sonst verloren) und fremde Commits. Ein Commit, der
-    // uns schon wieder entfernt, macht die Einladung wertlos.
+    // uns schon wieder entfernt, macht die Einladung wertlos. Auch vor dem
+    // Beitritt eingetroffene Bearbeitungen/Löschungen werden schon HIER auf
+    // die gepufferten Texte angewandt (nach ID und Absender), damit eine vor
+    // dem Beitritt bei allen gelöschte Nachricht nicht als Grabstein-loser
+    // Text wieder auftaucht.
     let mut roster_devices = None;
-    let mut pending_texts: Vec<(String, String)> = Vec::new();
+    let mut pending: Vec<StoredLine> = Vec::new();
     let mut removed_before_join = false;
     for buffered in load_invite_buffer(storage, group_id)? {
         match session.process(&buffered) {
@@ -2327,7 +2744,33 @@ fn accept_invite(
                 let sender = String::from_utf8_lossy(&application.sender_identity).to_string();
                 match grouptext::decode(&application.plaintext) {
                     Ok(GroupPayload::Roster { devices }) => roster_devices = Some(devices),
-                    Ok(GroupPayload::Text { text }) => pending_texts.push((sender, text)),
+                    Ok(GroupPayload::Text { id, text }) => pending.push(StoredLine {
+                        from: sender,
+                        text,
+                        at: now_unix(),
+                        report_id: None,
+                        id,
+                        edited: false,
+                        deleted: false,
+                    }),
+                    Ok(GroupPayload::Edit { target, text }) => {
+                        if let Some(line) = pending
+                            .iter_mut()
+                            .find(|l| l.id == target && l.from == sender && !l.deleted)
+                        {
+                            line.text = text;
+                            line.edited = true;
+                        }
+                    }
+                    Ok(GroupPayload::Delete { target }) => {
+                        if let Some(line) = pending
+                            .iter_mut()
+                            .find(|l| l.id == target && l.from == sender && !l.deleted)
+                        {
+                            line.text = String::new();
+                            line.deleted = true;
+                        }
+                    }
                     Ok(GroupPayload::Leave) | Err(_) => {}
                 }
             }
@@ -2354,21 +2797,12 @@ fn accept_invite(
     if let Some(devices) = roster_devices {
         save_roster(storage, group_id, &devices)?;
     }
-    // Vor der Annahme gesendete Texte in den Verlauf legen (der Reihe nach),
-    // damit sie im Chat erscheinen statt verloren zu gehen.
+    // Vor der Annahme gesendete Zeilen in den Verlauf legen (der Reihe nach),
+    // damit sie im Chat erscheinen statt verloren zu gehen; Bearbeitungen und
+    // Löschungen sind oben schon eingearbeitet.
     let chat_key = group_chat_key(group_id);
-    for (sender, text) in pending_texts {
-        record_message(
-            storage,
-            &chat_key,
-            StoredLine {
-                from: sender,
-                text,
-                at: now_unix(),
-                report_id: None,
-            },
-            false,
-        );
+    for line in pending {
+        record_message(storage, &chat_key, line, false);
     }
 
     let members = unique_handles(session.member_identities());
@@ -2454,8 +2888,13 @@ async fn fetch_messages(
             match core.device.unseal_message(&trust_root, &blob).await {
                 Ok(unsealed) => {
                     if unsealed.sender == core.handle {
+                        // sealed=true: die Absenderidentität ist zertifikats-
+                        // geprüft, ein Self-Sync-Änderungsereignis ist hier
+                        // authentisch.
                         match client_app::sync::decode(&unsealed.plaintext) {
-                            Ok(synced) => received.push(incoming_from_sync(synced)),
+                            Ok(synced) => {
+                                received.extend(incoming_from_sync(&core.handle, true, synced))
+                            }
                             Err(error) => {
                                 leptos::logging::warn!(
                                     "Sync-Hülle {} unlesbar: {error}",
@@ -2464,13 +2903,17 @@ async fn fetch_messages(
                             }
                         }
                     } else {
-                        let (text, report_id) =
+                        // sealed=true: die Absenderidentität ist zertifikats-
+                        // geprüft, eine Änderung ist hier authentisch.
+                        let (msg, report_id, id) =
                             open_payload(&core.storage, &message.id, &unsealed.plaintext);
-                        received.push(Incoming::Message {
-                            from: unsealed.sender.clone(),
-                            text,
+                        received.extend(incoming_from_msg(
+                            unsealed.sender.clone(),
+                            msg,
                             report_id,
-                        });
+                            id,
+                            true,
+                        ));
                     }
                     acked.push(message.id.clone());
                 }
@@ -2527,19 +2970,29 @@ async fn fetch_messages(
         match core.device.decrypt(&address, &opened.message).await {
             Ok(payload) => {
                 if opened.from == core.handle {
+                    // sealed=false: unversiegelt, die Absenderadresse ist
+                    // Klartext und fälschbar; ein Self-Sync-Änderungsereignis
+                    // daraus verwirft incoming_from_sync.
                     match client_app::sync::decode(&payload) {
-                        Ok(synced) => received.push(incoming_from_sync(synced)),
+                        Ok(synced) => {
+                            received.extend(incoming_from_sync(&core.handle, false, synced))
+                        }
                         Err(error) => {
                             leptos::logging::warn!("Sync-Hülle {} unlesbar: {error}", message.id)
                         }
                     }
                 } else {
-                    let (text, report_id) = open_payload(&core.storage, &message.id, &payload);
-                    received.push(Incoming::Message {
-                        from: opened.from.clone(),
-                        text,
+                    // sealed=false: unversiegelt, die Absenderadresse ist
+                    // Klartext und fälschbar; ein Änderungsereignis daraus
+                    // verwirft incoming_from_msg (nur Text ist zulässig).
+                    let (msg, report_id, id) = open_payload(&core.storage, &message.id, &payload);
+                    received.extend(incoming_from_msg(
+                        opened.from.clone(),
+                        msg,
                         report_id,
-                    });
+                        id,
+                        false,
+                    ));
                 }
                 acked.push(message.id.clone());
             }
@@ -3005,6 +3458,10 @@ fn App() -> impl IntoView {
     // der technische Handle; leer heißt Rückfall auf den Handle.
     let (reg_name_input, set_reg_name_input) = signal(String::new());
     let (text_input, set_text_input) = signal(String::new());
+    // Bearbeiten-Modus des Composers: die Nachrichten-ID der eigenen Zeile,
+    // deren Text gerade ersetzt wird (None = normale neue Nachricht). Beim
+    // Senden geht dann ein smmsg-Edit statt eines Texts raus.
+    let (editing, set_editing) = signal(Option::<String>::None);
     // Die Unterhaltungen der Seitenleiste (jüngste zuerst) und der offene
     // Chat. Der Verlauf des offenen Chats liegt in `messages`.
     let (chats, set_chats) = signal(Vec::<ChatSummary>::new());
@@ -3496,6 +3953,55 @@ fn App() -> impl IntoView {
                     Some(mut active) => {
                         let storage = active.storage.clone();
                         let who = active.handle.clone();
+                        // Bearbeiten-Modus: statt einer neuen Nachricht geht
+                        // ein Edit auf die gemerkte ID raus; lokal wird
+                        // dieselbe Regel angewandt wie bei einem empfangenen
+                        // Edit (eine Quelle der Wahrheit, apply_event).
+                        if let Some(target) = editing.get_untracked() {
+                            let result = if let Some(group_id) =
+                                group_id_of(&peer).map(str::to_string)
+                            {
+                                edit_group_message(
+                                    &storage,
+                                    &access_token.get_untracked(),
+                                    &who,
+                                    &group_id,
+                                    &target,
+                                    &text,
+                                )
+                                .await
+                            } else {
+                                edit_message(&mut active, access_token, &peer, &target, &text).await
+                            };
+                            *core.borrow_mut() = Some(active);
+                            match result {
+                                Ok(()) => {
+                                    // Eigenes Edit: kein fremdes Melde-Material
+                                    // (None); die eigene Zeile behält ihre.
+                                    if let Some(s) = apply_event(
+                                        &storage,
+                                        &peer,
+                                        &who,
+                                        &target,
+                                        Some(&text),
+                                        None,
+                                    ) {
+                                        set_chats.set(s);
+                                    }
+                                    if selected.get_untracked().as_deref() == Some(peer.as_str()) {
+                                        set_messages.set(load_history(&storage, &peer));
+                                        set_text_input.set(String::new());
+                                    }
+                                    set_editing.set(None);
+                                    set_status.set(String::new());
+                                }
+                                Err(error) => {
+                                    set_status.set(format!("Bearbeiten fehlgeschlagen: {error}"))
+                                }
+                            }
+                            set_busy.set(false);
+                            return;
+                        }
                         // Gruppen-Chats gehen über den MLS-Pfad; Frist und
                         // Sealed sind 1:1-Mechanik (der Gruppen-Fanout kennt
                         // kein expires_at, und Sealed versteckt den Absender
@@ -3536,12 +4042,15 @@ fn App() -> impl IntoView {
                         };
                         *core.borrow_mut() = Some(active);
                         match result {
-                            Ok(()) => {
+                            Ok(id) => {
                                 let line = StoredLine {
                                     from: who,
                                     text: text.clone(),
                                     at: now_unix(),
                                     report_id: None,
+                                    id,
+                                    edited: false,
+                                    deleted: false,
                                 };
                                 let summaries =
                                     record_message(&storage, &peer, line.clone(), false);
@@ -3682,6 +4191,49 @@ fn App() -> impl IntoView {
                                         );
                                         continue;
                                     }
+                                    // Eine Bearbeitung oder Löschung trifft
+                                    // eine BESTEHENDE Zeile statt eine neue
+                                    // anzuhängen; ohne Treffer (unbekannte
+                                    // ID) passiert nichts.
+                                    if let Incoming::Edit {
+                                        chat_peer,
+                                        from,
+                                        target,
+                                        text,
+                                        report_id,
+                                    } = &item
+                                    {
+                                        if let Some(s) = apply_event(
+                                            &storage,
+                                            chat_peer,
+                                            from,
+                                            target,
+                                            Some(text),
+                                            report_id.clone(),
+                                        ) {
+                                            summaries = Some(s);
+                                            if open.as_deref() == Some(chat_peer.as_str()) {
+                                                set_messages.set(load_history(&storage, chat_peer));
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    if let Incoming::Delete {
+                                        chat_peer,
+                                        from,
+                                        target,
+                                    } = &item
+                                    {
+                                        if let Some(s) = apply_event(
+                                            &storage, chat_peer, from, target, None, None,
+                                        ) {
+                                            summaries = Some(s);
+                                            if open.as_deref() == Some(chat_peer.as_str()) {
+                                                set_messages.set(load_history(&storage, chat_peer));
+                                            }
+                                        }
+                                        continue;
+                                    }
                                     // Ausgehend (Self-Sync) gehört in den Chat
                                     // mit dem Empfänger und zählt nie ungelesen;
                                     // eingehend zählt ungelesen, wenn der Chat
@@ -3691,6 +4243,7 @@ fn App() -> impl IntoView {
                                             from,
                                             text,
                                             report_id,
+                                            id,
                                         } => (
                                             from.clone(),
                                             StoredLine {
@@ -3698,16 +4251,22 @@ fn App() -> impl IntoView {
                                                 text,
                                                 at: now_unix(),
                                                 report_id,
+                                                id,
+                                                edited: false,
+                                                deleted: false,
                                             },
                                             false,
                                         ),
-                                        Incoming::Synced { peer, text } => (
+                                        Incoming::Synced { peer, text, id } => (
                                             peer,
                                             StoredLine {
                                                 from: own.clone(),
                                                 text,
                                                 at: now_unix(),
                                                 report_id: None,
+                                                id,
+                                                edited: false,
+                                                deleted: false,
                                             },
                                             true,
                                         ),
@@ -3719,6 +4278,7 @@ fn App() -> impl IntoView {
                                             group_id,
                                             from,
                                             text,
+                                            id,
                                         } => (
                                             group_chat_key(&group_id),
                                             StoredLine {
@@ -3726,15 +4286,20 @@ fn App() -> impl IntoView {
                                                 text,
                                                 at: now_unix(),
                                                 report_id: None,
+                                                id,
+                                                edited: false,
+                                                deleted: false,
                                             },
                                             false,
                                         ),
-                                        // History und Gruppen-Ereignisse sind
-                                        // oben behandelt.
+                                        // History, Gruppen-Ereignisse und
+                                        // Edit/Delete sind oben behandelt.
                                         Incoming::SyncedHistory { .. }
                                         | Incoming::GroupUpdated { .. }
                                         | Incoming::GroupRemovedSelf { .. }
-                                        | Incoming::GroupInvite { .. } => unreachable!(),
+                                        | Incoming::GroupInvite { .. }
+                                        | Incoming::Edit { .. }
+                                        | Incoming::Delete { .. } => unreachable!(),
                                     };
                                     let for_open = open.as_deref() == Some(chat_peer.as_str());
                                     let bump = !outgoing && !for_open;
@@ -3926,6 +4491,91 @@ fn App() -> impl IntoView {
         }
     }));
 
+    // Startet den Bearbeiten-Modus: Composer mit dem alten Text füllen, die
+    // Ziel-ID merken; das Senden geht dann als Edit raus (siehe run_send).
+    let on_edit_start = move |(target, old_text): (String, String)| {
+        set_editing.set(Some(target));
+        set_text_input.set(old_text);
+    };
+    let on_edit_cancel = move |_| {
+        set_editing.set(None);
+        set_text_input.set(String::new());
+    };
+
+    // Löscht eine eigene Nachricht BEI ALLEN: das Delete-Ereignis reist an
+    // alle Geräte (Empfänger und eigene), lokal wird dieselbe Grabstein-Regel
+    // angewandt wie bei einem empfangenen Delete.
+    let run_delete_all = SendWrapper::new(Rc::new({
+        let core = core.clone();
+        move |target: String| {
+            if busy.get_untracked() {
+                return;
+            }
+            let Some(peer) = selected.get_untracked() else {
+                return;
+            };
+            set_busy.set(true);
+            set_status.set("Wird gelöscht ...".to_string());
+            let core = core.clone();
+            spawn_local(async move {
+                let taken = core.borrow_mut().take();
+                match taken {
+                    Some(mut active) => {
+                        let storage = active.storage.clone();
+                        let who = active.handle.clone();
+                        let result = if let Some(group_id) = group_id_of(&peer).map(str::to_string)
+                        {
+                            delete_group_message(
+                                &storage,
+                                &access_token.get_untracked(),
+                                &who,
+                                &group_id,
+                                &target,
+                            )
+                            .await
+                        } else {
+                            delete_message(&mut active, access_token, &peer, &target).await
+                        };
+                        *core.borrow_mut() = Some(active);
+                        match result {
+                            Ok(()) => {
+                                if let Some(s) =
+                                    apply_event(&storage, &peer, &who, &target, None, None)
+                                {
+                                    set_chats.set(s);
+                                }
+                                if selected.get_untracked().as_deref() == Some(peer.as_str()) {
+                                    set_messages.set(load_history(&storage, &peer));
+                                }
+                                set_status.set(String::new());
+                            }
+                            Err(error) => {
+                                set_status.set(format!("Löschen fehlgeschlagen: {error}"))
+                            }
+                        }
+                    }
+                    None => set_status.set("Nicht angemeldet.".to_string()),
+                }
+                set_busy.set(false);
+            });
+        }
+    }));
+
+    // Löscht eine Zeile nur für mich: rein lokal, nichts reist.
+    let on_delete_local = {
+        let current_storage = current_storage.clone();
+        move |target: String| {
+            let Some(peer) = selected.get_untracked() else {
+                return;
+            };
+            let Some(storage) = current_storage() else {
+                return;
+            };
+            set_chats.set(remove_line_local(&storage, &peer, &target));
+            set_messages.set(load_history(&storage, &peer));
+        }
+    };
+
     // Blendet die Sicherheitsnummer des offenen Chats ein oder aus. Beim
     // Öffnen wird sie für den ausgewählten Kontakt berechnet.
     let on_safety = {
@@ -3989,6 +4639,16 @@ fn App() -> impl IntoView {
             set_messages.set(load_history(&storage, &peer));
             set_chats.set(mark_read(&storage, &peer));
             set_safety_open.set(false);
+            // Ein angefangenes Bearbeiten gehört zum vorigen Chat; beim
+            // Wechsel verwerfen. Der vorbefüllte Composer-Text (die alte
+            // Nachricht) muss MIT weg, sonst schickte ein Enter im neuen Chat
+            // ihn als neue Nachricht dorthin (Textleck über Chats). Nur der
+            // Bearbeiten-Entwurf wird geleert, ein selbst getippter Entwurf
+            // ohne Bearbeiten-Modus bleibt erhalten.
+            if editing.get_untracked().is_some() {
+                set_text_input.set(String::new());
+            }
+            set_editing.set(None);
             set_safety_info.set(None);
             set_key_info.set(None);
             set_blocked.set(None);
@@ -4921,6 +5581,8 @@ fn App() -> impl IntoView {
                     let on_invite_accept = on_invite_accept.clone();
                     let on_invite_decline = on_invite_decline.clone();
                     let run_report = run_report.clone();
+                    let run_delete_all = run_delete_all.clone();
+                    let on_delete_local = on_delete_local.clone();
                     let on_send = on_send.clone();
                     let on_fetch = on_fetch.clone();
                     let on_message_key = on_message_key.clone();
@@ -5968,6 +6630,8 @@ fn App() -> impl IntoView {
                                                 >
                                                     {
                                                         let run_report = run_report.clone();
+                                                        let run_delete_all = run_delete_all.clone();
+                                                        let on_delete_local = on_delete_local.clone();
                                                         move || {
                                                             let own = me.get();
                                                             let msgs = messages.get();
@@ -5981,6 +6645,9 @@ fn App() -> impl IntoView {
                                                                 }
                                                                     .into_any()
                                                             } else {
+                                                                let run_report = run_report.clone();
+                                                                let run_delete_all = run_delete_all.clone();
+                                                                let on_delete_local = on_delete_local.clone();
                                                                 msgs.into_iter()
                                                                     .map(|line| {
                                                                         let mine = line.from == own;
@@ -5989,21 +6656,66 @@ fn App() -> impl IntoView {
                                                                         } else {
                                                                             "sm-msg"
                                                                         };
-                                                                        // Melden nur für empfangene Nachrichten
-                                                                        // mit abgelegtem Franking-Material.
+                                                                        // Melden nur für EMPFANGENE Nachrichten
+                                                                        // mit abgelegtem Franking-Material. Auch
+                                                                        // eine bei allen gelöschte Zeile bleibt
+                                                                        // meldbar (der letzte gezeigte Inhalt),
+                                                                        // damit ein Absender Missbrauch nicht
+                                                                        // durch Nachträgliches Löschen tilgt.
                                                                         let report_id = if mine {
                                                                             None
                                                                         } else {
                                                                             line.report_id.clone()
                                                                         };
                                                                         let report_click = run_report.clone();
+                                                                        // Bearbeiten nur für eigene, nicht
+                                                                        // gelöschte Zeilen mit ID, binnen 24
+                                                                        // Stunden (danach ist die Korrektur-
+                                                                        // Erwartung vorbei; empfangene Edits
+                                                                        // werden trotzdem angewandt). Löschen
+                                                                        // bei allen ohne Frist.
+                                                                        let editable = mine
+                                                                            && !line.deleted
+                                                                            && !line.id.is_empty()
+                                                                            && now_unix() < line.at.saturating_add(86_400);
+                                                                        let deletable =
+                                                                            mine && !line.deleted && !line.id.is_empty();
+                                                                        let edit_id = line.id.clone();
+                                                                        let edit_text = line.text.clone();
+                                                                        let del_all_id = line.id.clone();
+                                                                        let del_all = run_delete_all.clone();
+                                                                        let del_local_id = line.id.clone();
+                                                                        let del_local = on_delete_local.clone();
                                                                         view! {
                                                                             <li class=class>
                                                                                 <span class="sm-msg-from">{line.from}</span>
-                                                                                <span class="sm-msg-text">{line.text}</span>
+                                                                                {if line.deleted {
+                                                                                    view! {
+                                                                                        <span class="sm-msg-text sm-msg-deleted">
+                                                                                            "(Nachricht gelöscht)"
+                                                                                        </span>
+                                                                                    }
+                                                                                        .into_any()
+                                                                                } else {
+                                                                                    view! {
+                                                                                        <span class="sm-msg-text">{line.text}</span>
+                                                                                    }
+                                                                                        .into_any()
+                                                                                }}
                                                                                 <span class="sm-msg-time">
                                                                                     {format_time(line.at)}
                                                                                 </span>
+                                                                                {(line.edited && !line.deleted)
+                                                                                    .then(|| {
+                                                                                        view! {
+                                                                                            <span
+                                                                                                class="sm-msg-edited"
+                                                                                                title="Der Absender hat den Text nachträglich geändert"
+                                                                                            >
+                                                                                                "bearbeitet"
+                                                                                            </span>
+                                                                                        }
+                                                                                    })}
                                                                                 {report_id
                                                                                     .map(|id| {
                                                                                         view! {
@@ -6020,6 +6732,55 @@ fn App() -> impl IntoView {
                                                                                             </button>
                                                                                         }
                                                                                     })}
+                                                                                {editable
+                                                                                    .then(|| {
+                                                                                        view! {
+                                                                                            <button
+                                                                                                type="button"
+                                                                                                class="sm-msg-action"
+                                                                                                title="Text dieser Nachricht bei allen ersetzen (bis 24 Stunden nach dem Senden)"
+                                                                                                on:click=move |_| on_edit_start((
+                                                                                                    edit_id.clone(),
+                                                                                                    edit_text.clone(),
+                                                                                                ))
+                                                                                                disabled=busy
+                                                                                            >
+                                                                                                "Bearbeiten"
+                                                                                            </button>
+                                                                                        }
+                                                                                    })}
+                                                                                {deletable
+                                                                                    .then(|| {
+                                                                                        view! {
+                                                                                            <button
+                                                                                                type="button"
+                                                                                                class="sm-msg-action"
+                                                                                                title="Bei allen löschen: die Nachricht wird überall zum Grabstein"
+                                                                                                on:click=move |_| del_all(
+                                                                                                    del_all_id.clone(),
+                                                                                                )
+                                                                                                disabled=busy
+                                                                                            >
+                                                                                                "Löschen"
+                                                                                            </button>
+                                                                                        }
+                                                                                    })}
+                                                                                {(!line.id.is_empty())
+                                                                                    .then(|| {
+                                                                                        view! {
+                                                                                            <button
+                                                                                                type="button"
+                                                                                                class="sm-msg-action"
+                                                                                                title="Nur aus dem eigenen Verlauf entfernen; bei anderen bleibt sie"
+                                                                                                on:click=move |_| del_local(
+                                                                                                    del_local_id.clone(),
+                                                                                                )
+                                                                                                disabled=busy
+                                                                                            >
+                                                                                                "Für mich"
+                                                                                            </button>
+                                                                                        }
+                                                                                    })}
                                                                             </li>
                                                                         }
                                                                     })
@@ -6029,6 +6790,27 @@ fn App() -> impl IntoView {
                                                         }
                                                     }
                                                 </ul>
+
+                                                {move || {
+                                                    editing
+                                                        .get()
+                                                        .map(|_| {
+                                                            view! {
+                                                                <div class="sm-edit-banner">
+                                                                    <span>
+                                                                        "Bearbeiten: der gesendete Text wird bei allen ersetzt."
+                                                                    </span>
+                                                                    <button
+                                                                        type="button"
+                                                                        class="sm-msg-action"
+                                                                        on:click=on_edit_cancel
+                                                                    >
+                                                                        "Abbrechen"
+                                                                    </button>
+                                                                </div>
+                                                            }
+                                                        })
+                                                }}
 
                                                 <div class="sm-composer">
                                                     <div class="sm-field">
