@@ -120,6 +120,10 @@ if (-not (Test-Path $envFile)) {
     function New-RandBytes { $b = New-Object byte[] 32; $rng.GetBytes($b); return $b }
     function New-Seed { return [Convert]::ToBase64String((New-RandBytes)) }
     function New-Hex  { return -join ((New-RandBytes) | ForEach-Object { $_.ToString('x2') }) }
+    # base64url ohne Padding: das Format des VAPID-Privatschluessels (delivery
+    # liest ihn per URL_SAFE_NO_PAD). 32 zufaellige Bytes sind mit
+    # ueberwaeltigender Wahrscheinlichkeit ein gueltiger P-256-Skalar.
+    function New-SeedUrl { return (New-Seed).TrimEnd('=').Replace('+', '-').Replace('/', '_') }
     @(
         "POSTGRES_PASSWORD=$(New-Hex)"
         "INTERNAL_TOKEN=$(New-Hex)"
@@ -128,6 +132,8 @@ if (-not (Test-Path $envFile)) {
         "KT_SIGNING_KEY=$(New-Seed)"
         "KT_VRF_KEY=$(New-Seed)"
         "INTEGRATIONS_WEBHOOK_SIGNING_KEY=$(New-Seed)"
+        "VAPID_PRIVATE_KEY=$(New-SeedUrl)"
+        "VAPID_SUBJECT=mailto:admin@securemessenger.local"
         "MEDIA_S3_ACCESS_KEY=sm-media"
         "MEDIA_S3_SECRET_KEY=$(New-Hex)"
         "KEYCLOAK_ADMIN_PASSWORD=$(New-Hex)"

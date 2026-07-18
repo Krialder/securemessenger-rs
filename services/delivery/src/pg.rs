@@ -22,7 +22,7 @@ use crate::groups::{
     apply_set_role, apply_transfer, apply_update_info, authorize_commit, dedup, CommitContext,
     GroupError, GroupMeta, GroupRecord, GroupSettings, GroupState, GroupStore, NewGroup, Role,
 };
-use crate::store::{MessageStore, StoreError};
+use crate::store::{MessageStore, PushSubscription, StoreError};
 
 /// Verbindet und führt die eingebetteten Migrationen aus. Scheitert das,
 /// bricht der Start ab (main.rs), statt still ohne Persistenz zu laufen.
@@ -332,6 +332,71 @@ impl MessageStore for PgMessageStore {
         .await
         .map_err(backend)?;
         Ok(rows.iter().map(|r| r.get("blocked_handle")).collect())
+    }
+
+    async fn save_push_subscription(
+        &self,
+        device_id: &str,
+        subscription: &PushSubscription,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO push_subscriptions (device_id, endpoint, p256dh, auth) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (device_id) DO UPDATE SET \
+               endpoint = EXCLUDED.endpoint, p256dh = EXCLUDED.p256dh, \
+               auth = EXCLUDED.auth, created_at = now()",
+        )
+        .bind(device_id)
+        .bind(&subscription.endpoint)
+        .bind(&subscription.p256dh)
+        .bind(&subscription.auth)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn remove_push_subscription(&self, device_id: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM push_subscriptions WHERE device_id = $1")
+            .bind(device_id)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn remove_push_subscription_if_endpoint(
+        &self,
+        device_id: &str,
+        endpoint: &str,
+    ) -> Result<(), StoreError> {
+        // Bedingtes Löschen in einer Anweisung (atomar): nur wenn der Endpoint
+        // noch der gemeldete ist, sonst bleibt ein erneuertes Abo stehen.
+        sqlx::query("DELETE FROM push_subscriptions WHERE device_id = $1 AND endpoint = $2")
+            .bind(device_id)
+            .bind(endpoint)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn push_subscription(
+        &self,
+        device_id: &str,
+    ) -> Result<Option<PushSubscription>, StoreError> {
+        let row = sqlx::query(
+            "SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE device_id = $1",
+        )
+        .bind(device_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(row.map(|r| PushSubscription {
+            endpoint: r.get("endpoint"),
+            p256dh: r.get("p256dh"),
+            auth: r.get("auth"),
+        }))
     }
 }
 

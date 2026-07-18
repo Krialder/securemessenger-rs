@@ -13,6 +13,11 @@ tracing-subscriber.workspace = true
 # den directory und delivery teilen.
 async-trait.workspace = true
 reqwest.workspace = true
+# SSRF-Host-Filter (ssrf-Modul): DIESELBE URL-Zerlegung wie reqwest (das
+# url-Crate, WHATWG-konform), damit der geprüfte Host mit dem tatsächlich
+# angesprochenen übereinstimmt und kein Parser-Unterschied das Filter
+# aushebelt (dezimale/hex IP-Literale, Backslash-Autorität).
+url = "2"
 # Fuer das Shutdown-Signal (SIGTERM/Ctrl-C) des Graceful-Shutdown-Helfers.
 tokio.workspace = true
 serde.workspace = true

@@ -64,6 +64,46 @@ pub trait MessageStore: Send + Sync {
 
     /// Die Blockliste von `owner` (die blockierten Handles).
     async fn list_blocks(&self, owner: &str) -> Result<Vec<String>, StoreError>;
+
+    /// Legt (oder ersetzt) das Web-Push-Abo eines Geräts ab. Je Gerät genau
+    /// eines; ein erneutes Abonnieren überschreibt das alte (der Browser gibt
+    /// bei Erneuerung einen neuen Endpoint aus).
+    async fn save_push_subscription(
+        &self,
+        device_id: &str,
+        subscription: &PushSubscription,
+    ) -> Result<(), StoreError>;
+
+    /// Entfernt das Web-Push-Abo eines Geräts (Abmelden).
+    async fn remove_push_subscription(&self, device_id: &str) -> Result<(), StoreError>;
+
+    /// Entfernt das Abo eines Geräts NUR, wenn sein Endpoint noch der
+    /// angegebene ist. Fürs Aufräumen eines vom Push-Dienst als abgelaufen
+    /// (404/410) gemeldeten Endpoints: hat sich das Gerät inzwischen mit einem
+    /// NEUEN Endpoint neu abonniert, bleibt das gültige Abo stehen (sonst
+    /// löschte das späte Aufräumen des alten Endpoints das frische).
+    async fn remove_push_subscription_if_endpoint(
+        &self,
+        device_id: &str,
+        endpoint: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Das Web-Push-Abo eines Geräts, `None` wenn keins vorliegt.
+    async fn push_subscription(
+        &self,
+        device_id: &str,
+    ) -> Result<Option<PushSubscription>, StoreError>;
+}
+
+/// Ein Browser-Push-Abo (RFC 8291): der Endpoint des Push-Dienstes und die
+/// Client-Schlüssel. Für den inhaltslosen Aufweck-Push wird nur der Endpoint
+/// gebraucht; `p256dh`/`auth` liegen bereit, falls später ein
+/// verschlüsselter Payload dazukommt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushSubscription {
+    pub endpoint: String,
+    pub p256dh: String,
+    pub auth: String,
 }
 
 struct StoredEntry {
@@ -83,6 +123,8 @@ struct Inner {
     franking: HashMap<String, Vec<u8>>,
     /// Blocklisten je Eigentümer-Handle (Spiegel der blocks-Tabelle).
     blocks: HashMap<String, HashSet<String>>,
+    /// Web-Push-Abo je Gerät (Spiegel der push_subscriptions-Tabelle).
+    push: HashMap<String, PushSubscription>,
 }
 
 /// Prozesslokale Ablage für Entwicklung und Tests (Daten enden mit dem
@@ -223,6 +265,57 @@ impl MessageStore for InMemoryMessageStore {
         blocked.sort();
         Ok(blocked)
     }
+
+    async fn save_push_subscription(
+        &self,
+        device_id: &str,
+        subscription: &PushSubscription,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .lock()
+            .expect("Lock nicht vergiftet")
+            .push
+            .insert(device_id.to_string(), subscription.clone());
+        Ok(())
+    }
+
+    async fn remove_push_subscription(&self, device_id: &str) -> Result<(), StoreError> {
+        self.inner
+            .lock()
+            .expect("Lock nicht vergiftet")
+            .push
+            .remove(device_id);
+        Ok(())
+    }
+
+    async fn remove_push_subscription_if_endpoint(
+        &self,
+        device_id: &str,
+        endpoint: &str,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().expect("Lock nicht vergiftet");
+        if inner
+            .push
+            .get(device_id)
+            .is_some_and(|s| s.endpoint == endpoint)
+        {
+            inner.push.remove(device_id);
+        }
+        Ok(())
+    }
+
+    async fn push_subscription(
+        &self,
+        device_id: &str,
+    ) -> Result<Option<PushSubscription>, StoreError> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("Lock nicht vergiftet")
+            .push
+            .get(device_id)
+            .cloned())
+    }
 }
 
 #[cfg(test)]
@@ -349,5 +442,54 @@ mod tests {
         assert_eq!(store.fetch("dev-1", 1).await.unwrap().len(), 1);
         assert!(store.fetch("dev-3", 100).await.unwrap().is_empty());
         assert!(!store.has_waiting("dev-3").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn push_subscription_is_per_device_and_replaceable() {
+        let store = InMemoryMessageStore::default();
+        assert_eq!(store.push_subscription("dev-1").await.unwrap(), None);
+
+        let sub = PushSubscription {
+            endpoint: "https://push.example/abc".to_string(),
+            p256dh: "p".to_string(),
+            auth: "a".to_string(),
+        };
+        store.save_push_subscription("dev-1", &sub).await.unwrap();
+        assert_eq!(store.push_subscription("dev-1").await.unwrap(), Some(sub));
+        // Anderes Geraet ist unberuehrt.
+        assert_eq!(store.push_subscription("dev-2").await.unwrap(), None);
+
+        // Ein erneutes Abonnieren ersetzt (neuer Endpoint).
+        let renewed = PushSubscription {
+            endpoint: "https://push.example/xyz".to_string(),
+            p256dh: "p2".to_string(),
+            auth: "a2".to_string(),
+        };
+        store
+            .save_push_subscription("dev-1", &renewed)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.push_subscription("dev-1").await.unwrap(),
+            Some(renewed.clone())
+        );
+
+        // Bedingtes Entfernen: mit dem ALTEN Endpoint (der gerade als
+        // abgelaufen gemeldet wurde) darf das inzwischen erneuerte Abo NICHT
+        // verschwinden.
+        store
+            .remove_push_subscription_if_endpoint("dev-1", "https://push.example/abc")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.push_subscription("dev-1").await.unwrap(),
+            Some(renewed.clone())
+        );
+        // Mit dem passenden Endpoint entfernt es.
+        store
+            .remove_push_subscription_if_endpoint("dev-1", &renewed.endpoint)
+            .await
+            .unwrap();
+        assert_eq!(store.push_subscription("dev-1").await.unwrap(), None);
     }
 }

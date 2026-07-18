@@ -23,8 +23,13 @@ sha2.workspace = true
 # (specs/sealed-sender-und-abuse.md), geteilt mit dem Client.
 franking.workspace = true
 # Ausgehender Aufruf an integrations: delivery meldet Präsenz-Änderungen
-# für die Webhooks (best effort, optional per INTEGRATIONS_URL).
+# für die Webhooks (best effort, optional per INTEGRATIONS_URL). Derselbe
+# Client stellt den inhaltslosen Web-Push-Aufruf an den Browser-Push-Dienst.
 reqwest.workspace = true
+# VAPID-Signatur des Web-Push (ES256 über P-256): der JWT autorisiert den
+# Push beim Browser-Push-Dienst. Nur Signatur, keine Payload-Verschlüsselung
+# (der Aufweck-Push ist inhaltslos).
+p256 = { version = "0.13", features = ["ecdsa"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

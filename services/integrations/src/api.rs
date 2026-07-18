@@ -15,7 +15,6 @@
 //! POST /internal/tenants an (Shared Secret wie überall); eine
 //! Admin-Oberfläche ist nicht Teil dieser Etappe. Token-Laufzeit 1 Stunde.]
 
-use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -572,76 +571,8 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
-/// Den Host aus einer http(s)-URL ziehen (ohne den `url`-Crate): alles nach
-/// `://` bis zum ersten `/?#`, ohne Userinfo und Port, IPv6 in Klammern.
-fn webhook_host(url: &str) -> Option<String> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let authority = authority.rsplit('@').next()?; // Userinfo weg
-    if let Some(v6) = authority.strip_prefix('[') {
-        return v6.split(']').next().map(str::to_string);
-    }
-    authority
-        .split(':')
-        .next()
-        .map(str::to_string)
-        .filter(|host| !host.is_empty())
-}
-
-/// Zeigt die URL auf ein internes/gefaehrliches Ziel (SSRF)? Loopback,
-/// private/Link-lokale/ULA-Bereiche, Multicast, unspezifiziert, `localhost`
-/// und Cloud-Metadaten-Namen. Ein DNS-Name, der erst intern aufloest
-/// (DNS-Rebinding), faellt hier durch; dagegen schuetzt die Egress-Policy
-/// des Netzes (deploy/k8s, siehe ADR-Folgepunkt).
-fn is_blocked_webhook_host(url: &str) -> bool {
-    let Some(host) = webhook_host(url) else {
-        return true; // unparsebar: lieber blocken
-    };
-    let lower = host.to_ascii_lowercase();
-    if lower == "localhost" || lower.ends_with(".localhost") {
-        return true;
-    }
-    if lower == "metadata" || lower.ends_with(".internal") {
-        return true;
-    }
-    if let Ok(ip) = lower.parse::<IpAddr>() {
-        return is_internal_ip(ip);
-    }
-    false
-}
-
-fn is_internal_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || v4.octets()[0] == 0 // 0.0.0.0/8
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || is_ipv6_link_local(v6)
-                || is_ipv6_unique_local(v6)
-                || v6
-                    .to_ipv4_mapped()
-                    .is_some_and(|m| is_internal_ip(IpAddr::V4(m)))
-        }
-    }
-}
-
-fn is_ipv6_link_local(v6: Ipv6Addr) -> bool {
-    (v6.segments()[0] & 0xffc0) == 0xfe80
-}
-
-fn is_ipv6_unique_local(v6: Ipv6Addr) -> bool {
-    (v6.segments()[0] & 0xfe00) == 0xfc00
-}
+// Der SSRF-Host-Filter (Loopback/privat/Cloud-Metadaten) liegt jetzt in
+// common::ssrf, geteilt mit dem Web-Push-Endpoint der Zustellung.
 
 /// `GET /integrations/webhook-key`: der oeffentliche Ed25519-Schluessel, mit
 /// dem ein Fremdprojekt die Signatur eingehender Webhooks prueft. Oeffentlich
@@ -715,7 +646,7 @@ async fn create_webhook(
     // SSRF-Schutz: die URL darf nicht auf ein internes/Loopback-Ziel zeigen
     // (der Dienst wuerde sonst im internen Netz oder auf die Cloud-Metadaten
     // POSTen). Nur der lokale Lauf schaltet das fuer localhost frei.
-    if !st.allow_private_webhooks && is_blocked_webhook_host(url) {
+    if !st.allow_private_webhooks && common::ssrf::is_blocked_host(url) {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_url",

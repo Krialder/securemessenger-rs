@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::ClientError;
-use crate::http::{parse_json, transport};
+use crate::http::{expect_success, parse_json, transport};
 
 #[derive(Clone)]
 pub struct DeliveryClient {
@@ -98,6 +98,23 @@ struct AckResponse {
     removed: u64,
 }
 
+#[derive(Deserialize)]
+struct VapidKeyResponse {
+    public_key: String,
+}
+
+#[derive(Serialize)]
+struct PushSubscribeRequest<'a> {
+    endpoint: &'a str,
+    keys: PushKeys<'a>,
+}
+
+#[derive(Serialize)]
+struct PushKeys<'a> {
+    p256dh: &'a str,
+    auth: &'a str,
+}
+
 impl DeliveryClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
@@ -173,6 +190,62 @@ impl DeliveryClient {
     /// Die WebSocket-URL des Hinweiskanals zu dieser Basis-URL.
     pub fn ws_url(&self) -> String {
         ws_url(&self.base_url)
+    }
+
+    /// `GET /push/vapid-key`: der öffentliche VAPID-Schlüssel fürs Abonnieren
+    /// (`applicationServerKey`). `None`, wenn der Server Web-Push nicht
+    /// anbietet (404); dann blendet der Client die Funktion aus.
+    pub async fn vapid_public_key(
+        &self,
+        access_token: &str,
+    ) -> Result<Option<String>, ClientError> {
+        let response = self
+            .http
+            .get(format!("{}/push/vapid-key", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(transport)?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let body: VapidKeyResponse = parse_json(response).await?;
+        Ok(Some(body.public_key))
+    }
+
+    /// `POST /push/subscription`: legt das Browser-Push-Abo dieses Geräts ab
+    /// (Endpoint plus die Abo-Schlüssel des Browsers).
+    pub async fn push_subscribe(
+        &self,
+        access_token: &str,
+        endpoint: &str,
+        p256dh: &str,
+        auth: &str,
+    ) -> Result<(), ClientError> {
+        let response = self
+            .http
+            .post(format!("{}/push/subscription", self.base_url))
+            .bearer_auth(access_token)
+            .json(&PushSubscribeRequest {
+                endpoint,
+                keys: PushKeys { p256dh, auth },
+            })
+            .send()
+            .await
+            .map_err(transport)?;
+        expect_success(response).await
+    }
+
+    /// `DELETE /push/subscription`: entfernt das Push-Abo dieses Geräts.
+    pub async fn push_unsubscribe(&self, access_token: &str) -> Result<(), ClientError> {
+        let response = self
+            .http
+            .delete(format!("{}/push/subscription", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(transport)?;
+        expect_success(response).await
     }
 
     /// `POST /reports`: meldet eine Nachricht, indem der Empfänger Klartext

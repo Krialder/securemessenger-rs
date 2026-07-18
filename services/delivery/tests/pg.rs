@@ -10,7 +10,7 @@ use std::sync::Arc;
 use delivery::domain::NewMessage;
 use delivery::groups::{CommitContext, GroupError, GroupStore, NewGroup};
 use delivery::pg::{connect_and_migrate, PgGroupStore, PgMessageStore};
-use delivery::store::MessageStore;
+use delivery::store::{MessageStore, PushSubscription};
 use uuid::Uuid;
 
 async fn store() -> Option<PgMessageStore> {
@@ -213,6 +213,42 @@ async fn franking_and_blocks_over_postgres() {
     store.set_block(&owner, "spammer", false).await.unwrap();
     assert!(!store.is_blocked(&owner, "spammer").await.unwrap());
     assert!(store.list_blocks(&owner).await.unwrap().is_empty());
+}
+
+/// Web-Push-Abos über echtes PostgreSQL: anlegen, lesen, per erneutem
+/// Abonnieren ersetzen (ON CONFLICT-Upsert) und entfernen.
+#[tokio::test]
+async fn push_subscriptions_over_postgres() {
+    let Some(store) = store().await else { return };
+    let device = format!("dev-{}", Uuid::new_v4());
+
+    assert!(store.push_subscription(&device).await.unwrap().is_none());
+
+    let sub = PushSubscription {
+        endpoint: "https://push.example/abc".to_string(),
+        p256dh: "p256".to_string(),
+        auth: "authsecret".to_string(),
+    };
+    store.save_push_subscription(&device, &sub).await.unwrap();
+    assert_eq!(store.push_subscription(&device).await.unwrap(), Some(sub));
+
+    // Erneutes Abonnieren ersetzt (neuer Endpoint) statt zu doppeln.
+    let renewed = PushSubscription {
+        endpoint: "https://push.example/xyz".to_string(),
+        p256dh: "neu".to_string(),
+        auth: "neu-auth".to_string(),
+    };
+    store
+        .save_push_subscription(&device, &renewed)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.push_subscription(&device).await.unwrap(),
+        Some(renewed)
+    );
+
+    store.remove_push_subscription(&device).await.unwrap();
+    assert!(store.push_subscription(&device).await.unwrap().is_none());
 }
 
 /// Konkurrierende Commits gegen dieselbe Epoche über echtes PostgreSQL:

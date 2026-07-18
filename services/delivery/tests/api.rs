@@ -16,7 +16,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use common::identity_client::{AccountDevices, CallerIdentity, DeviceInfo, IdentityGateway};
 use delivery::api::{app, AppState};
-use delivery::store::InMemoryMessageStore;
+use delivery::push::{PushDelivery, PushSender};
+use delivery::store::{InMemoryMessageStore, PushSubscription};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
@@ -100,6 +101,24 @@ fn test_app() -> Router {
         Arc::new(InMemoryMessageStore::default()),
         Arc::new(fake_identity()),
     ))
+}
+
+/// Ein Push-Versender fürs Testen: meldet jeden geweckten Endpoint über den
+/// Kanal und bietet einen (Test-)VAPID-Schlüssel an, damit der Offline-Wecker
+/// nicht früh aussteigt.
+struct FakePush {
+    woken: tokio::sync::mpsc::UnboundedSender<String>,
+}
+
+#[async_trait]
+impl PushSender for FakePush {
+    async fn wake(&self, subscription: &PushSubscription) -> Result<PushDelivery, String> {
+        let _ = self.woken.send(subscription.endpoint.clone());
+        Ok(PushDelivery::Delivered)
+    }
+    fn public_key(&self) -> Option<String> {
+        Some("test-vapid-public-key".to_string())
+    }
 }
 
 /// Wie test_app, aber mit freigeschalteten /internal-Routen.
@@ -1059,4 +1078,137 @@ async fn group_routes_require_authentication() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+const MSG_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+#[tokio::test]
+async fn vapid_key_is_absent_without_push() {
+    // Ohne with_push (NoopPushSender): kein oeffentlicher Schluessel -> 404.
+    let (status, _) = send(&test_app(), "GET", "/push/vapid-key", None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn push_subscription_requires_auth_and_https() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let app = app(AppState::new(
+        Arc::new(InMemoryMessageStore::default()),
+        Arc::new(fake_identity()),
+    )
+    .with_push(Arc::new(FakePush { woken: tx })));
+
+    // Ohne Token: 401.
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/push/subscription",
+        Some(
+            json!({ "endpoint": "https://push.example/x", "keys": { "p256dh": "p", "auth": "a" } }),
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Kein https-Endpoint: 400.
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/push/subscription",
+        Some(
+            json!({ "endpoint": "http://push.example/x", "keys": { "p256dh": "p", "auth": "a" } }),
+        ),
+        Some("token-bob"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // SSRF: ein internes/Loopback-Ziel wird abgewiesen (der Wake-POST duerfte
+    // sonst ins interne Netz gehen).
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/push/subscription",
+        Some(json!({ "endpoint": "https://127.0.0.1/x", "keys": { "p256dh": "p", "auth": "a" } })),
+        Some("token-bob"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Der Kern von F1: eine Nachricht an ein OFFLINE-Gerät (kein WebSocket) weckt
+/// es per Web-Push; der oeffentliche Schluessel ist abrufbar, und das Abo
+/// laesst sich wieder entfernen.
+#[tokio::test]
+async fn offline_device_is_woken_by_push() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let app = app(AppState::new(
+        Arc::new(InMemoryMessageStore::default()),
+        Arc::new(fake_identity()),
+    )
+    .with_push(Arc::new(FakePush { woken: tx })));
+
+    // Der oeffentliche VAPID-Schluessel ist da.
+    let (status, body) = send(&app, "GET", "/push/vapid-key", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["public_key"], "test-vapid-public-key");
+
+    // bobs Geraet abonniert.
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/push/subscription",
+        Some(json!({
+            "endpoint": "https://push.example/bob-endpoint",
+            "keys": { "p256dh": "p", "auth": "a" }
+        })),
+        Some("token-bob"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // alice schickt an bobs (offline) Geraet DEV_BOB.
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/messages",
+        Some(json!({ "envelopes": [ envelope(MSG_ID, "bob", DEV_BOB) ] })),
+        Some("token-alice"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Der Web-Push weckt genau bobs Geraet ueber seinen Endpoint.
+    let woken = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("Push innerhalb 2s")
+        .expect("Wake-Endpoint");
+    assert_eq!(woken, "https://push.example/bob-endpoint");
+
+    // Abmelden: danach weckt eine weitere Nachricht nicht mehr.
+    let (status, _) = send(
+        &app,
+        "DELETE",
+        "/push/subscription",
+        None,
+        Some("token-bob"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/messages",
+        Some(json!({ "envelopes": [ envelope("22222222-2222-4222-8222-222222222222", "bob", DEV_BOB) ] })),
+        Some("token-alice"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Kurzes Fenster: es darf KEIN weiterer Wake kommen.
+    let none = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await;
+    assert!(
+        none.is_err(),
+        "nach dem Abmelden darf kein Push mehr wecken"
+    );
 }

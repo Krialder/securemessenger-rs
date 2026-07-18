@@ -39,7 +39,8 @@ use crate::domain::NewMessage;
 use crate::groups::{GroupError, GroupStore, InMemoryGroupStore};
 use crate::hub::{HubEvent, RealtimeHub};
 use crate::integrations_client::{IntegrationsGateway, NoopIntegrationsGateway};
-use crate::store::MessageStore;
+use crate::push::{NoopPushSender, PushDelivery, PushSender};
+use crate::store::{MessageStore, PushSubscription};
 use common::identity_client::{CallerIdentity, IdentityGateway};
 
 /// Obergrenze je Annahme-Stapel: ein Fächer über alle Zielgeräte einer
@@ -134,6 +135,9 @@ pub struct AppState {
     /// Anbindung an integrations für Präsenz-Webhooks; Noop, wenn keine
     /// INTEGRATIONS_URL gesetzt ist.
     integrations: Arc<dyn IntegrationsGateway>,
+    /// Web-Push-Versand; Noop, wenn kein VAPID-Schlüssel gesetzt ist. Weckt
+    /// Geräte, die gerade keinen WebSocket halten.
+    push: Arc<dyn PushSender>,
     /// SHA-256-Digest des Shared Secrets; None = interne Routen aus.
     internal_token_hash: Option<String>,
     /// Rate-Limits der anonymen Pfade (Sealed-Sender-Annahme).
@@ -153,9 +157,16 @@ impl AppState {
             presence: Arc::new(Mutex::new(HashMap::new())),
             handle_presence: HandlePresence::default(),
             integrations: Arc::new(NoopIntegrationsGateway),
+            push: Arc::new(NoopPushSender),
             internal_token_hash: None,
             limiter: Arc::new(common::rate::RateLimiter::default()),
         }
+    }
+
+    /// Setzt den Web-Push-Versand (VAPID); ohne diesen Aufruf ist Push aus.
+    pub fn with_push(mut self, push: Arc<dyn PushSender>) -> Self {
+        self.push = push;
+        self
     }
 
     /// Setzt die persistente Gruppen-Ablage (PG-Betrieb).
@@ -205,6 +216,13 @@ pub fn app(state: AppState) -> Router {
         .route("/groups/{group_id}/roles", post(group_set_role))
         .route("/groups/{group_id}/transfer", post(group_transfer))
         .route("/groups/{group_id}/info", post(group_update_info))
+        // Web-Push: der öffentliche VAPID-Schlüssel (offen, das ist ein
+        // öffentlicher Schlüssel), Abo anlegen/entfernen (Bearer je Gerät).
+        .route("/push/vapid-key", get(vapid_key))
+        .route(
+            "/push/subscription",
+            post(push_subscribe).delete(push_unsubscribe),
+        )
         .route("/ws", get(websocket));
     // Wie bei identity: ohne konfiguriertes Secret existieren die
     // internen Routen nicht (echtes 404 statt 401-Raterei).
@@ -506,11 +524,13 @@ async fn accept_envelopes(st: &AppState, req: &SubmitRequest, sender: Option<&st
             // billig und trägt keinen Inhalt, das Gerät holt und sieht
             // selbst, ob etwas wartet.
             let mut seen = std::collections::HashSet::new();
-            for device in devices {
+            for device in &devices {
                 if seen.insert(device.clone()) {
-                    st.hub.notify(&device);
+                    st.hub.notify(device);
                 }
             }
+            // Offline-Geräte (kein WebSocket) zusätzlich per Web-Push wecken.
+            wake_offline_devices(st, &devices);
             (
                 StatusCode::OK,
                 Json(SubmitResponse {
@@ -572,6 +592,149 @@ async fn fetch(State(st): State<AppState>, headers: HeaderMap) -> Response {
             tracing::error!(%error, "Abholen fehlgeschlagen");
             internal()
         }
+    }
+}
+
+/// `GET /push/vapid-key`: der öffentliche VAPID-Schlüssel, den der Client als
+/// `applicationServerKey` fürs Abo braucht. 404, wenn Push aus ist (kein
+/// VAPID-Schlüssel konfiguriert) — der Client blendet die Funktion dann aus.
+async fn vapid_key(State(st): State<AppState>) -> Response {
+    match st.push.public_key() {
+        Some(public_key) => Json(VapidKeyResponse { public_key }).into_response(),
+        None => api_error(
+            StatusCode::NOT_FOUND,
+            "push_disabled",
+            "Web-Push ist auf diesem Server nicht konfiguriert.",
+        ),
+    }
+}
+
+#[derive(Serialize)]
+struct VapidKeyResponse {
+    public_key: String,
+}
+
+#[derive(Deserialize)]
+struct PushSubscribeRequest {
+    endpoint: String,
+    keys: PushKeys,
+}
+
+#[derive(Deserialize)]
+struct PushKeys {
+    p256dh: String,
+    auth: String,
+}
+
+/// `POST /push/subscription`: legt das Browser-Push-Abo des ANGEMELDETEN
+/// Geräts ab (je Gerät eines; ein erneutes Abonnieren ersetzt das alte).
+async fn push_subscribe(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<PushSubscribeRequest>,
+) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(who)) => who,
+        Ok(None) => return invalid_token(),
+        Err(()) => return internal(),
+    };
+    // Nur https-Endpoints (die Push-Dienste sind alle https); das weist ein
+    // offensichtlich falsches Feld früh ab.
+    if !req.endpoint.starts_with("https://") {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_endpoint",
+            "Der Push-Endpoint muss eine https-URL sein.",
+        );
+    }
+    // SSRF-Schutz: der Endpoint kommt vom Client; er darf nicht auf ein
+    // internes/Loopback-Ziel zeigen, sonst würde der spätere Wake-POST den
+    // Dienst ins interne Netz oder auf die Cloud-Metadaten schicken (dieselbe
+    // Abwehr wie bei den Webhooks, common::ssrf).
+    if common::ssrf::is_blocked_host(&req.endpoint) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_endpoint",
+            "Der Push-Endpoint darf nicht auf ein internes oder Loopback-Ziel zeigen.",
+        );
+    }
+    let subscription = PushSubscription {
+        endpoint: req.endpoint,
+        p256dh: req.keys.p256dh,
+        auth: req.keys.auth,
+    };
+    match st
+        .store
+        .save_push_subscription(&who.device_id, &subscription)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "Push-Abo nicht ablegbar");
+            internal()
+        }
+    }
+}
+
+/// `DELETE /push/subscription`: entfernt das Push-Abo des angemeldeten Geräts.
+async fn push_unsubscribe(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let who = match authenticate(&st, &headers).await {
+        Ok(Some(who)) => who,
+        Ok(None) => return invalid_token(),
+        Err(()) => return internal(),
+    };
+    match st.store.remove_push_subscription(&who.device_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "Push-Abo nicht entfernbar");
+            internal()
+        }
+    }
+}
+
+/// Weckt per Web-Push die Geräte aus `devices`, die gerade KEINEN WebSocket
+/// halten (offline): ein verbundenes Gerät bekommt seinen Hinweis schon über
+/// die Nabe. Nebenläufig und best effort; ein vom Push-Dienst als abgelaufen
+/// gemeldetes Abo (`Gone`) wird entfernt. Ohne konfiguriertes VAPID (Noop)
+/// passiert nichts.
+fn wake_offline_devices(st: &AppState, devices: &[String]) {
+    if st.push.public_key().is_none() {
+        return;
+    }
+    let offline: Vec<String> = {
+        let presence = st.presence.lock().expect("Presence-Lock nicht vergiftet");
+        let mut seen = std::collections::HashSet::new();
+        devices
+            .iter()
+            .filter(|d| seen.insert((*d).clone()) && !presence.contains_key(*d))
+            .cloned()
+            .collect()
+    };
+    for device in offline {
+        let st = st.clone();
+        tokio::spawn(async move {
+            match st.store.push_subscription(&device).await {
+                Ok(Some(subscription)) => match st.push.wake(&subscription).await {
+                    Ok(PushDelivery::Delivered) => {}
+                    Ok(PushDelivery::Gone) => {
+                        // Endpoint tot: Abo wegräumen, sonst wecken wir ewig
+                        // ins Leere. Aber NUR, wenn der Endpoint noch der
+                        // gemeldete ist (sonst löschten wir ein inzwischen
+                        // erneuertes, gültiges Abo).
+                        if let Err(error) = st
+                            .store
+                            .remove_push_subscription_if_endpoint(&device, &subscription.endpoint)
+                            .await
+                        {
+                            tracing::error!(%error, "Abgelaufenes Push-Abo nicht entfernbar");
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, %device, "Push-Wecken fehlgeschlagen"),
+                },
+                Ok(None) => {}
+                Err(error) => tracing::error!(%error, "Push-Abo nicht lesbar"),
+            }
+        });
     }
 }
 
@@ -930,11 +1093,13 @@ async fn fanout(
     match st.store.store_batch(messages).await {
         Ok(outcome) => {
             let mut seen = std::collections::HashSet::new();
-            for device in devices {
+            for device in &devices {
                 if seen.insert(device.clone()) {
-                    st.hub.notify(&device);
+                    st.hub.notify(device);
                 }
             }
+            // Offline-Mitglieder (kein WebSocket) zusätzlich per Web-Push wecken.
+            wake_offline_devices(st, &devices);
             Ok(outcome)
         }
         Err(error) => {

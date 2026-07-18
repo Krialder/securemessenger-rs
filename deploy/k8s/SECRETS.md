@@ -47,6 +47,12 @@ Deterministische 32-Byte-Seeds (Base64) erzeugt man z. B. mit
 |--------|-----|--------|
 | `integrations-webhook` | `signing-key` | Base64-32-Byte-Seed, Ed25519-Signaturschluessel der Praesenz-Webhooks (stabil, sonst wechselt der oeffentliche Schluessel je Replik/Neustart) |
 
+## delivery: Web-Push (VAPID)
+
+| Secret | Key | Inhalt |
+|--------|-----|--------|
+| `delivery-push` | `vapid-private-key` | P-256-Privatschluessel als base64url ohne Padding (32 Byte). Weckt geschlossene Browser bei neuen Nachrichten. OPTIONAL: fehlt das Secret, laeuft Web-Push still als Noop (der Chat-Kern haengt nicht daran). Stabil halten, sonst wechselt der oeffentliche Schluessel und alle bestehenden Browser-Abos werden ungueltig. |
+
 ## media: Objektspeicher (S3/MinIO)
 
 | Secret | Key | Inhalt |

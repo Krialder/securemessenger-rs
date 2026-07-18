@@ -614,6 +614,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -938,6 +939,7 @@ dependencies = [
  "franking",
  "futures-util",
  "http-body-util",
+ "p256",
  "reqwest",
  "serde",
  "serde_json",

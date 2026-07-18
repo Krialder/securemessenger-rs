@@ -235,6 +235,8 @@ Der Dienst kennt keine Passwörter und keine Sessions: Bearer-Tokens prüft er �
 | `POST /reports` | Missbrauchs-Meldung prüfen: aufgedeckten Klartext und Franking-Schlüssel gegen das aufbewahrte Commitment; 200 mit `verified`, 400, 401, 404 |
 | `GET /blocks`, `POST /blocks`, `DELETE /blocks/{handle}` | eigene Blockliste lesen, blockieren, aufheben; blockierte Absender werden bei `POST /messages` still verworfen; 200/204, 400, 401 |
 | `GET /ws` | WebSocket für Echtzeit-Hinweise; erster Frame `{"token":"..."}` binnen 10 s, danach `{"event":"message.waiting"}`-Hinweise und `integration.notification`-Events; Close 4401 bei Auth-Fehlern, 1011 bei internen Fehlern |
+| `GET /push/vapid-key` | öffentlicher VAPID-Schlüssel fürs Web-Push-Abo (`applicationServerKey`); 200 mit `public_key`, 404 wenn Push nicht konfiguriert |
+| `POST /push/subscription`, `DELETE /push/subscription` | Browser-Push-Abo des Geräts anlegen/entfernen (Bearer, je Gerät eines; nur https-Endpoints, SSRF-gefiltert); 204, 400, 401 |
 | `POST /internal/events` | Dienst-zu-Dienst (integrations): Event an verbundene Geräte verteilen; nur mit `INTERNAL_TOKEN` |
 | `POST /internal/presence/query` | Dienst-zu-Dienst: welche Geräte sind gerade verbunden (Grundlage von F080) |
 | `GET /live`, `/ready`, `/metrics` | Betriebs-Endpunkte |

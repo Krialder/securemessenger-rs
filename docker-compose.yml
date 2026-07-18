@@ -137,6 +137,11 @@ services:
       DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/delivery
       IDENTITY_URL: http://identity:8080
       INTEGRATIONS_URL: http://integrations:8080
+      # Web-Push (F1): mit gesetztem VAPID_PRIVATE_KEY weckt der Dienst
+      # geschlossene Browser. Leer = Push aus (der Chat-Kern haengt nicht
+      # daran). sm.ps1 erzeugt den Schluessel beim ersten Start in die .env.
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
+      VAPID_SUBJECT: ${VAPID_SUBJECT:-mailto:admin@securemessenger.local}
     depends_on:
       postgres:
         condition: service_healthy

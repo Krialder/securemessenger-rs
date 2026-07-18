@@ -217,6 +217,24 @@ fn save_sealed_default(storage: &SharedStorage, on: bool) {
         .put(SEALED_DEFAULT_KEY, &[u8::from(on)]);
 }
 
+/// Ob Web-Push (Benachrichtigungen bei geschlossenem Browser) für dieses
+/// Gerät eingeschaltet ist. Persistiert, damit die App das Abo beim Start
+/// still auffrischen kann (der Push-Endpoint des Browsers kann rotieren).
+const PUSH_ON_KEY: &str = "settings/push_on";
+
+fn load_push_on(storage: &SharedStorage) -> bool {
+    storage
+        .borrow()
+        .get(PUSH_ON_KEY)
+        .ok()
+        .flatten()
+        .is_some_and(|bytes| bytes.first() == Some(&1))
+}
+
+fn save_push_on(storage: &SharedStorage, on: bool) {
+    let _ = storage.borrow_mut().put(PUSH_ON_KEY, &[u8::from(on)]);
+}
+
 fn load_history(storage: &SharedStorage, peer: &str) -> Vec<StoredLine> {
     storage
         .borrow()
@@ -3578,6 +3596,9 @@ fn App() -> impl IntoView {
     // "Versiegelt senden als Vorgabe": persistierte Startwahl des
     // Composer-Sealed-Hakens für neue Sitzungen (Einstellungen).
     let (sealed_default, set_sealed_default) = signal(false);
+    // Web-Push (Benachrichtigungen bei geschlossenem Browser) für dieses
+    // Gerät ein/aus; aus der Ablage geladen (Einstellungen).
+    let (push_on, set_push_on) = signal(false);
     // Die globale Blockliste (alle blockierten Handles) für die
     // Einstellungen-Ansicht; `None`, solange nicht geladen.
     let (block_list, set_block_list) = signal(Option::<Vec<String>>::None);
@@ -3746,7 +3767,24 @@ fn App() -> impl IntoView {
             let sealed = load_sealed_default(&storage);
             set_sealed_default.set(sealed);
             set_sealed_choice.set(sealed);
+            let push_enabled = load_push_on(&storage);
+            set_push_on.set(push_enabled);
             set_logged_in.set(true);
+            // Ein aktives Push-Abo beim Start still auffrischen: der Endpoint
+            // des Browsers kann rotieren, sonst bliebe Push danach lautlos
+            // aus (das Abo beim Dienst zeigte ins Leere). Best effort, ohne
+            // neuen Erlaubnis-Dialog (bei erteilter Erlaubnis liefert der
+            // Browser sofort).
+            if push_enabled {
+                let token = access_token.get_untracked();
+                spawn_local(async move {
+                    if let Err(error) =
+                        crate::push::enable(&DeliveryClient::new(delivery_url()), &token).await
+                    {
+                        leptos::logging::warn!("Push-Abo nicht aufgefrischt: {error}");
+                    }
+                });
+            }
         }))
     };
 
@@ -4121,6 +4159,7 @@ fn App() -> impl IntoView {
             set_device_rows.set(Vec::new());
             set_block_list.set(None);
             set_sealed_default.set(false);
+            set_push_on.set(false);
             set_notifications.set(Vec::new());
             set_password_input.set(String::new());
             set_text_input.set(String::new());
@@ -5629,6 +5668,53 @@ fn App() -> impl IntoView {
         }
     };
 
+    // Web-Push ein-/ausschalten: registriert (bzw. kündigt) das Browser-Abo
+    // und hinterlegt es beim Dienst. Braucht die Browser-Erlaubnis; scheitert
+    // das, kehrt der Haken zurück. Der Zustand wird optimistisch gesetzt und
+    // bei Fehler zurückgenommen.
+    let on_push_toggle = {
+        let current_storage = current_storage.clone();
+        move |ev: web_sys::Event| {
+            let want_on = event_target_checked(&ev);
+            set_push_on.set(want_on);
+            set_busy.set(true);
+            set_status.set(if want_on {
+                "Benachrichtigungen werden eingerichtet ...".to_string()
+            } else {
+                "Benachrichtigungen werden abgeschaltet ...".to_string()
+            });
+            let current_storage = current_storage.clone();
+            spawn_local(async move {
+                let delivery = DeliveryClient::new(delivery_url());
+                let token = access_token.get_untracked();
+                let result = if want_on {
+                    crate::push::enable(&delivery, &token).await
+                } else {
+                    crate::push::disable(&delivery, &token).await
+                };
+                match result {
+                    Ok(()) => {
+                        if let Some(storage) = current_storage() {
+                            save_push_on(&storage, want_on);
+                        }
+                        set_status.set(if want_on {
+                            "Benachrichtigungen aktiviert.".to_string()
+                        } else {
+                            "Benachrichtigungen abgeschaltet.".to_string()
+                        });
+                    }
+                    Err(error) => {
+                        // Fehlschlag (Erlaubnis verweigert, kein https, Server
+                        // ohne Push): Haken zurücknehmen und Grund zeigen.
+                        set_push_on.set(!want_on);
+                        set_status.set(format!("Benachrichtigungen: {error}"));
+                    }
+                }
+                set_busy.set(false);
+            });
+        }
+    };
+
     // Ein Handle aus der globalen Blockliste entblocken.
     let on_unblock = {
         let refresh_block_list = refresh_block_list.clone();
@@ -5801,6 +5887,7 @@ fn App() -> impl IntoView {
                     let on_revoke = on_revoke.clone();
                     let on_unblock = on_unblock.clone();
                     let on_sealed_default_toggle = on_sealed_default_toggle.clone();
+                    let on_push_toggle = on_push_toggle.clone();
                     let on_push_history = on_push_history.clone();
                     let on_change_password = on_change_password.clone();
                     let on_backup_export = on_backup_export.clone();
@@ -6050,6 +6137,7 @@ fn App() -> impl IntoView {
                                     let on_revoke = on_revoke.clone();
                                     let on_unblock = on_unblock.clone();
                                     let on_sealed_default_toggle = on_sealed_default_toggle.clone();
+                                    let on_push_toggle = on_push_toggle.clone();
                                     let on_push_history = on_push_history.clone();
                                     let on_change_password = on_change_password.clone();
                                     let on_backup_export = on_backup_export.clone();
@@ -6294,6 +6382,20 @@ fn App() -> impl IntoView {
                                                                 type="checkbox"
                                                                 prop:checked=sealed_default
                                                                 on:change=on_sealed_default_toggle.clone()
+                                                            />
+                                                        </label>
+                                                        <label class="sm-set-row">
+                                                            <span class="sm-set-label">
+                                                                "Benachrichtigungen (Web-Push)"
+                                                                <small>
+                                                                    "Weckt dieses Gerät bei einer neuen Nachricht, auch wenn der Browser geschlossen ist. Braucht die Benachrichtigungs-Erlaubnis; der Push trägt keinen Inhalt, nur einen Hinweis."
+                                                                </small>
+                                                            </span>
+                                                            <input
+                                                                type="checkbox"
+                                                                prop:checked=push_on
+                                                                on:change=on_push_toggle.clone()
+                                                                disabled=busy
                                                             />
                                                         </label>
                                                         <div class="sm-set-row">

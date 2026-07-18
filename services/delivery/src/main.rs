@@ -7,6 +7,7 @@ use common::{config::ServiceConfig, telemetry};
 use delivery::api::{app, AppState};
 use delivery::integrations_client::HttpIntegrationsGateway;
 use delivery::pg;
+use delivery::push::{VapidKeys, VapidPushSender};
 use delivery::store::InMemoryMessageStore;
 
 #[tokio::main]
@@ -53,6 +54,24 @@ async fn main() {
         Some(url) => {
             tracing::info!(%url, "Präsenz-Webhooks an integrations aktiv");
             state.with_integrations(Arc::new(HttpIntegrationsGateway::new(url, internal_token)))
+        }
+        None => state,
+    };
+
+    // Optional: Web-Push (VAPID). Ohne VAPID_PRIVATE_KEY bleibt es beim Noop
+    // (Push aus). Ein GESETZTER, aber kaputter Schlüssel ist ein
+    // Betriebsfehler und bricht den Start ab statt still Push abzuschalten.
+    let state = match std::env::var("VAPID_PRIVATE_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+    {
+        Some(private_key) => {
+            let keys = VapidKeys::from_private_base64(&private_key)
+                .expect("VAPID_PRIVATE_KEY ist ein gültiger base64url-P-256-Schlüssel");
+            let subject = std::env::var("VAPID_SUBJECT")
+                .unwrap_or_else(|_| "mailto:admin@securemessenger.local".to_string());
+            tracing::info!("Web-Push (VAPID) aktiv");
+            state.with_push(Arc::new(VapidPushSender::new(keys, &subject)))
         }
         None => state,
     };

@@ -7,6 +7,12 @@
     <link data-trunk rel="css" href="theme.css" />
     <link data-trunk rel="rust" />
     <!--
+      Service Worker fuer Web-Push (F1): unveraendert in die dist-Wurzel
+      kopieren, damit er unter /sw.js mit Scope "/" liegt (die App
+      registriert genau diesen Pfad).
+    -->
+    <link data-trunk rel="copy-file" href="sw.js" />
+    <!--
       FOUC-Guard: Der Client mountet als Leptos-CSR erst nach dem
       WASM-Download. Ohne diese Zeilen bliebe bis dahin der Default-Modus
       stehen und blitzte beim Wechsel auf. Deshalb hier, VOR dem WASM,

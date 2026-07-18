@@ -52,6 +52,17 @@ spec:
                 secretKeyRef:
                   name: internal-token
                   key: token
+            # Web-Push (F1): der VAPID-Privatschluessel weckt geschlossene
+            # Browser. Optional (optional: true) -> fehlt das Secret, laeuft
+            # Push still als Noop, der Chat-Kern haengt nicht daran.
+            - name: VAPID_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: delivery-push
+                  key: vapid-private-key
+                  optional: true
+            - name: VAPID_SUBJECT
+              value: "mailto:admin@securemessenger.local"
           livenessProbe:
             httpGet:
               path: /live

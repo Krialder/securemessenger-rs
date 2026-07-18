@@ -14,4 +14,5 @@ pub mod groups;
 pub mod hub;
 pub mod integrations_client;
 pub mod pg;
+pub mod push;
 pub mod store;

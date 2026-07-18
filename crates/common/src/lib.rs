@@ -25,6 +25,7 @@ pub mod identity_client;
 pub mod kt;
 pub mod metrics;
 pub mod rate;
+pub mod ssrf;
 
 pub mod http {
     //! Geteilter HTTP-Client fuer Dienst-zu-Dienst-Aufrufe.
