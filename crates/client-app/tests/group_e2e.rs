@@ -170,7 +170,7 @@ async fn three_users_exchange_a_group_message_over_real_services() {
         .map(|s| s.to_string())
         .collect();
     let created = delivery
-        .create_group(&alice.access_token, &group_id, &members)
+        .create_group(&alice.access_token, &group_id, "Test-Gruppe", &members)
         .await
         .expect("Gruppe anlegen");
     assert_eq!(created.epoch, 0);

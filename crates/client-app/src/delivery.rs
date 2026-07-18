@@ -242,18 +242,99 @@ impl DeliveryClient {
     }
 
     /// `POST /groups`: legt eine Gruppe an (Mitglieder als Handles, vom
-    /// Dienst zu Zielgeräten aufgelöst). Liefert die Anfangsepoche.
+    /// Dienst zu Zielgeräten aufgelöst; der Ersteller wird Owner). `name` ist
+    /// der server-sichtbare Gruppenname (leer erlaubt). Liefert die
+    /// Anfangsepoche.
     pub async fn create_group(
         &self,
         access_token: &str,
         group_id: &str,
+        name: &str,
         members: &[String],
     ) -> Result<GroupCreated, ClientError> {
         let response = self
             .http
             .post(format!("{}/groups", self.base_url))
             .bearer_auth(access_token)
-            .json(&CreateGroupRequest { group_id, members })
+            .json(&CreateGroupRequest {
+                group_id,
+                name,
+                members,
+            })
+            .send()
+            .await
+            .map_err(transport)?;
+        parse_json(response).await
+    }
+
+    /// `GET /groups/{id}/meta`: Name, Einstellungen und Rollen (nur für
+    /// Mitglieder).
+    pub async fn group_meta(
+        &self,
+        access_token: &str,
+        group_id: &str,
+    ) -> Result<GroupMetaInfo, ClientError> {
+        let response = self
+            .http
+            .get(format!("{}/groups/{group_id}/meta", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(transport)?;
+        parse_json(response).await
+    }
+
+    /// `POST /groups/{id}/roles`: befördert/degradiert ein Mitglied. Liefert
+    /// die aktualisierte Verwaltungssicht.
+    pub async fn group_set_role(
+        &self,
+        access_token: &str,
+        group_id: &str,
+        target: &str,
+        role: GroupRole,
+    ) -> Result<GroupMetaInfo, ClientError> {
+        let response = self
+            .http
+            .post(format!("{}/groups/{group_id}/roles", self.base_url))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({ "target": target, "role": role }))
+            .send()
+            .await
+            .map_err(transport)?;
+        parse_json(response).await
+    }
+
+    /// `POST /groups/{id}/transfer`: übergibt die Owner-Rolle.
+    pub async fn group_transfer(
+        &self,
+        access_token: &str,
+        group_id: &str,
+        target: &str,
+    ) -> Result<GroupMetaInfo, ClientError> {
+        let response = self
+            .http
+            .post(format!("{}/groups/{group_id}/transfer", self.base_url))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({ "target": target }))
+            .send()
+            .await
+            .map_err(transport)?;
+        parse_json(response).await
+    }
+
+    /// `POST /groups/{id}/info`: ändert Name und/oder Einstellungen.
+    pub async fn group_update_info(
+        &self,
+        access_token: &str,
+        group_id: &str,
+        name: Option<&str>,
+        settings: Option<GroupSettings>,
+    ) -> Result<GroupMetaInfo, ClientError> {
+        let response = self
+            .http
+            .post(format!("{}/groups/{group_id}/info", self.base_url))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({ "name": name, "settings": settings }))
             .send()
             .await
             .map_err(transport)?;
@@ -333,7 +414,57 @@ pub struct GroupCommitOutcome {
 #[derive(Serialize)]
 struct CreateGroupRequest<'a> {
     group_id: &'a str,
+    name: &'a str,
     members: &'a [String],
+}
+
+/// Rolle eines Gruppenmitglieds (Server-durchgesetzt).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GroupRole {
+    Owner,
+    Admin,
+    Member,
+}
+
+impl GroupRole {
+    pub fn label(self) -> &'static str {
+        match self {
+            GroupRole::Owner => "Besitzer",
+            GroupRole::Admin => "Admin",
+            GroupRole::Member => "Mitglied",
+        }
+    }
+}
+
+/// Wer darf eine geregelte Aktion: alle Mitglieder oder nur Staff.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GroupPolicy {
+    All,
+    Admins,
+}
+
+/// Gruppen-Einstellungen (spiegelt den Dienst).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GroupSettings {
+    pub invite_policy: GroupPolicy,
+    pub announcement: bool,
+    pub info_policy: GroupPolicy,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GroupMemberInfo {
+    pub handle: String,
+    pub role: GroupRole,
+}
+
+/// Verwaltungs-Sicht auf eine Gruppe (Name, Einstellungen, Rollen).
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GroupMetaInfo {
+    pub name: String,
+    pub settings: GroupSettings,
+    pub members: Vec<GroupMemberInfo>,
 }
 
 #[derive(Serialize)]

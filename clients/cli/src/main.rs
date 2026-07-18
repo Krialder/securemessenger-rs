@@ -26,7 +26,8 @@ use client_app::account::{
     build_device_credential, build_rotation_cert, decode_seed, IdentityKeypair,
 };
 use client_app::delivery::{
-    parse_ws_event, ws_auth_frame, DeliveryClient, GroupOutgoing, OutgoingEnvelope, WsEvent,
+    parse_ws_event, ws_auth_frame, DeliveryClient, GroupOutgoing, GroupPolicy, GroupRole,
+    OutgoingEnvelope, WsEvent,
 };
 use client_app::directory::DirectoryClient;
 use client_app::grouptext::{self, GroupPayload, RosterDevice};
@@ -154,6 +155,10 @@ async fn run() -> Result<(), String> {
         "group-send" => group_send(&args[1..]).await,
         "group-remove" => group_remove(&args[1..]).await,
         "group-leave" => group_leave(&args[1..]).await,
+        "group-members" => group_members(&args[1..]).await,
+        "group-role" => group_role(&args[1..]).await,
+        "group-transfer" => group_transfer(&args[1..]).await,
+        "group-set" => group_set(&args[1..]).await,
         "invites" => invites_list(),
         "group-accept" => group_accept(&args[1..]).await,
         "group-decline" => group_decline(&args[1..]),
@@ -855,7 +860,14 @@ async fn drain_waiting(
                     continue;
                 }
             };
-            match handle_group_envelope(storage, &own_handle, &opened.group_id, &opened.blob) {
+            match handle_group_envelope(
+                storage,
+                &own_handle,
+                &opened.group_id,
+                &opened.blob,
+                opened.name.as_deref(),
+                opened.inviter.as_deref(),
+            ) {
                 // Auch fehlgeschlagene Verarbeitung bestätigen: ein
                 // erneuter Abruf scheiterte am selben Fehler (MLS-Zustand
                 // kennt die Epoche bzw. den Schlüssel nicht mehr).
@@ -1417,6 +1429,126 @@ async fn rename(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `sm group-members <gruppen-id>`: Name, Einstellungen und Rollen zeigen.
+async fn group_members(args: &[String]) -> Result<(), String> {
+    let [group_id] = args else {
+        return Err("Aufruf: sm group-members <gruppen-id>".to_string());
+    };
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    let meta = DeliveryClient::new(delivery_url())
+        .group_meta(&token, group_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let policy = |p: GroupPolicy| match p {
+        GroupPolicy::All => "alle",
+        GroupPolicy::Admins => "nur Admins",
+    };
+    println!(
+        "Gruppe \"{}\" ({} Mitglieder)",
+        meta.name,
+        meta.members.len()
+    );
+    println!(
+        "  Einladen: {}, Senden: {}, Info ändern: {}",
+        policy(meta.settings.invite_policy),
+        if meta.settings.announcement {
+            "nur Admins"
+        } else {
+            "alle"
+        },
+        policy(meta.settings.info_policy)
+    );
+    for m in meta.members {
+        println!("  {} - {}", m.handle, m.role.label());
+    }
+    Ok(())
+}
+
+/// `sm group-role <gruppen-id> <handle> <admin|member>`: befördern/degradieren.
+async fn group_role(args: &[String]) -> Result<(), String> {
+    let [group_id, handle, role] = args else {
+        return Err("Aufruf: sm group-role <gruppen-id> <handle> <admin|member>".to_string());
+    };
+    let role = match role.as_str() {
+        "admin" => GroupRole::Admin,
+        "member" => GroupRole::Member,
+        _ => return Err("Rolle: admin oder member".to_string()),
+    };
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    DeliveryClient::new(delivery_url())
+        .group_set_role(&token, group_id, handle, role)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("Rolle von {handle} auf {} gesetzt.", role.label());
+    Ok(())
+}
+
+/// `sm group-transfer <gruppen-id> <handle>`: Besitz übergeben (nur Owner).
+async fn group_transfer(args: &[String]) -> Result<(), String> {
+    let [group_id, handle] = args else {
+        return Err("Aufruf: sm group-transfer <gruppen-id> <handle>".to_string());
+    };
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    DeliveryClient::new(delivery_url())
+        .group_transfer(&token, group_id, handle)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("Besitz an {handle} übergeben.");
+    Ok(())
+}
+
+/// `sm group-set <gruppen-id> name|announce|invite|info <wert>`: Name oder
+/// eine Einstellung ändern (announce on|off, invite/info all|admins).
+async fn group_set(args: &[String]) -> Result<(), String> {
+    let [group_id, key, value] = args else {
+        return Err(
+            "Aufruf: sm group-set <gruppen-id> name|announce|invite|info <wert>".to_string(),
+        );
+    };
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    let client = DeliveryClient::new(delivery_url());
+    let meta = client
+        .group_meta(&token, group_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut settings = meta.settings;
+    let parse_policy = |v: &str| match v {
+        "all" | "alle" => Ok(GroupPolicy::All),
+        "admins" => Ok(GroupPolicy::Admins),
+        _ => Err("Wert: all oder admins".to_string()),
+    };
+    let (name, settings): (Option<&str>, Option<_>) = match key.as_str() {
+        "name" => (Some(value.as_str()), None),
+        "announce" => {
+            settings.announcement = match value.as_str() {
+                "on" | "an" => true,
+                "off" | "aus" => false,
+                _ => return Err("Wert: on oder off".to_string()),
+            };
+            (None, Some(settings))
+        }
+        "invite" => {
+            settings.invite_policy = parse_policy(value)?;
+            (None, Some(settings))
+        }
+        "info" => {
+            settings.info_policy = parse_policy(value)?;
+            (None, Some(settings))
+        }
+        _ => return Err("Schlüssel: name|announce|invite|info".to_string()),
+    };
+    let updated = client
+        .group_update_info(&token, group_id, name, settings)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("Aktualisiert: \"{}\".", updated.name);
+    Ok(())
+}
+
 /// `sm whois <handle>`: den aktuellen Anzeigenamen eines Kontakts abfragen
 /// (F010). Der Handle bleibt die kryptografische Identität; der Anzeigename
 /// ist Server-Datum und dient nur der Darstellung.
@@ -1632,10 +1764,16 @@ fn save_invites(storage: &SharedStorage, invites: &[String]) -> Result<(), Strin
 /// Welcome wird bewusst NICHT verarbeitet, sonst wäre das eingeladene
 /// KeyPackage schon für eine noch nicht angenommene (oder Spam-)
 /// Einladung verbraucht.
+fn invite_meta_key(group_id: &str) -> String {
+    format!("invite-meta/{group_id}")
+}
+
 fn remember_invite(
     storage: &SharedStorage,
     group_id: &str,
     welcome_blob: &[u8],
+    name: Option<&str>,
+    inviter: Option<&str>,
 ) -> Result<bool, String> {
     let mut invites = load_invites(storage)?;
     if invites.iter().any(|id| id == group_id) {
@@ -1649,6 +1787,14 @@ fn remember_invite(
         .borrow_mut()
         .put(&invite_key(group_id), welcome_blob)
         .map_err(|e| e.to_string())?;
+    // Name und Einlader für die Anzeige merken (vom Einladenden bezeugt).
+    let meta = serde_json::json!({
+        "name": name.unwrap_or(""),
+        "inviter": inviter.unwrap_or(""),
+    });
+    if let Ok(bytes) = serde_json::to_vec(&meta) {
+        let _ = storage.borrow_mut().put(&invite_meta_key(group_id), &bytes);
+    }
     invites.push(group_id.to_string());
     save_invites(storage, &invites)?;
     Ok(true)
@@ -1662,6 +1808,7 @@ fn forget_invite(storage: &SharedStorage, group_id: &str) -> Result<(), String> 
     save_invites(storage, &invites)?;
     let _ = storage.borrow_mut().remove(&invite_key(group_id));
     let _ = storage.borrow_mut().remove(&invite_buffer_key(group_id));
+    let _ = storage.borrow_mut().remove(&invite_meta_key(group_id));
     Ok(())
 }
 
@@ -1742,13 +1889,16 @@ fn load_roster(storage: &SharedStorage, group_id: &str) -> Result<Vec<RosterDevi
 /// Welcome-Hüllen gehen an die eingeladenen Geräte, und der Geräte-Roster
 /// folgt als erste Anwendungsnachricht (Ende-zu-Ende, wie alles).
 async fn group_create(args: &[String]) -> Result<(), String> {
-    if args.is_empty() {
-        return Err("Aufruf: sm group-create <mitglied> [<mitglied>...]".to_string());
+    let [name, member_args @ ..] = args else {
+        return Err("Aufruf: sm group-create <name> <mitglied> [<mitglied>...]".to_string());
+    };
+    if member_args.is_empty() {
+        return Err("Aufruf: sm group-create <name> <mitglied> [<mitglied>...]".to_string());
     }
     let profile = load_profile()?;
     let token = access_token(&profile)?;
     let mut invitees: Vec<String> = Vec::new();
-    for handle in args {
+    for handle in member_args {
         if handle != &profile.handle && !invitees.contains(handle) {
             invitees.push(handle.clone());
         }
@@ -1823,7 +1973,7 @@ async fn group_create(args: &[String]) -> Result<(), String> {
     let delivery = DeliveryClient::new(delivery_url());
     let group_id = new_uuid();
     let created = delivery
-        .create_group(&token, &group_id, &members)
+        .create_group(&token, &group_id, name, &members)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -1832,13 +1982,20 @@ async fn group_create(args: &[String]) -> Result<(), String> {
     let mut session = GroupSession::create(member, group_id.as_bytes())?;
     let outcome = session.add_members(&invite_blobs)?;
 
+    // Die Welcome-Hülle trägt Name und Einlader, damit der Eingeladene sie
+    // vor dem Beitritt sieht.
     let welcome_fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &profile.device_id)
         .map(|device| {
             Ok(GroupOutgoing {
                 id: new_uuid(),
                 device_id: device.device_id.clone(),
-                envelope: wire::seal_group(&group_id, &outcome.welcome)
-                    .map_err(|e| e.to_string())?,
+                envelope: wire::seal_group_invite(
+                    &group_id,
+                    &outcome.welcome,
+                    name,
+                    &profile.handle,
+                )
+                .map_err(|e| e.to_string())?,
             })
         })
         .collect::<Result<_, String>>()?;
@@ -2123,7 +2280,25 @@ fn invites_list() -> Result<(), String> {
         return Ok(());
     }
     for id in invites {
-        println!("{id}  (annehmen: 'sm group-accept {id}')");
+        let meta = storage
+            .borrow()
+            .get(&invite_meta_key(&id))
+            .ok()
+            .flatten()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+        let name = meta
+            .as_ref()
+            .and_then(|m| m["name"].as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("\"{s}\" "))
+            .unwrap_or_default();
+        let by = meta
+            .as_ref()
+            .and_then(|m| m["inviter"].as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| format!(" von {s}"))
+            .unwrap_or_default();
+        println!("{name}({id}){by}  (annehmen: 'sm group-accept {id}')");
     }
     Ok(())
 }
@@ -2271,6 +2446,8 @@ fn handle_group_envelope(
     own_handle: &str,
     group_id: &str,
     blob: &[u8],
+    invite_name: Option<&str>,
+    invite_inviter: Option<&str>,
 ) -> Result<(), String> {
     let member = load_or_new_member(storage, own_handle)?;
     match GroupSession::load(member, group_id.as_bytes())? {
@@ -2358,9 +2535,17 @@ fn handle_group_envelope(
             // oder Commit einer Gruppe, in der wir nicht sind) wird
             // verworfen (der Aufrufer bestätigt ihn).
             if GroupSession::is_welcome(blob) {
-                if remember_invite(storage, group_id, blob)? {
+                if remember_invite(storage, group_id, blob, invite_name, invite_inviter)? {
+                    let by = invite_inviter
+                        .filter(|s| !s.is_empty())
+                        .map(|s| format!(" von {s}"))
+                        .unwrap_or_default();
+                    let named = invite_name
+                        .filter(|s| !s.is_empty())
+                        .map(|s| format!("\"{s}\" "))
+                        .unwrap_or_default();
                     println!(
-                        "[einladung] Du wurdest zu Gruppe {group_id} eingeladen. Annehmen mit \
+                        "[einladung] Einladung in die Gruppe {named}({group_id}){by}. Annehmen mit \
                          'sm group-accept {group_id}', ablehnen mit 'sm group-decline {group_id}'."
                     );
                 }
@@ -2435,9 +2620,13 @@ fn print_usage() {
          \x20 rename <anzeigename>          Anzeigename aendern (Handle bleibt)\n\
          \x20 rotate-key                    Konto-Wurzelschluessel rotieren (nur Erstgeraet)\n\
          \x20 publish-keys                   Prekey-Satz + MLS-KeyPackages veroeffentlichen\n\
-         \x20 group-create <mitglied>...     MLS-Gruppe mit sich + den Handles gruenden\n\
+         \x20 group-create <name> <mitglied>...  MLS-Gruppe mit Namen gruenden\n\
          \x20 groups                         lokale Gruppenliste (ID + Mitglieder)\n\
          \x20 group-send <id> <text>         E2EE-Gruppennachricht senden\n\
+         \x20 group-members <id>             Name, Einstellungen und Rollen zeigen\n\
+         \x20 group-role <id> <handle> <admin|member>  befoerdern/degradieren\n\
+         \x20 group-transfer <id> <handle>   Besitz uebergeben (nur Owner)\n\
+         \x20 group-set <id> name|announce|invite|info <wert>  Name/Einstellung aendern\n\
          \x20 group-remove <id> <handle>     Mitglied entfernen (MLS-Neuschluesseln)\n\
          \x20 group-leave <id>               Gruppe verlassen (lokal + Ansage)\n\
          \x20 invites                        offene Gruppen-Einladungen anzeigen\n\

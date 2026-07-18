@@ -117,21 +117,58 @@ struct GroupEnvelope {
     v: String,
     group_id: String,
     blob: String,
+    /// Nur auf der Welcome-Hülle einer Einladung: der Gruppenname und der
+    /// Handle des Einladenden, damit der Eingeladene sie VOR dem Beitritt
+    /// sieht (er ist noch kein Mitglied und kann /meta nicht abfragen). Der
+    /// Einladende bezeugt sie; auf Commit-/Anwendungshüllen fehlen sie.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inviter: Option<String>,
 }
 
 /// Eine geöffnete Gruppen-Hülle: Gruppen-ID plus MLS-Blob für
-/// `GroupSession::process`.
+/// `GroupSession::process`, dazu die Einladungs-Metadaten (nur bei einer
+/// Welcome-Hülle gesetzt).
 pub struct OpenedGroupEnvelope {
     pub group_id: String,
     pub blob: Vec<u8>,
+    pub name: Option<String>,
+    pub inviter: Option<String>,
 }
 
-/// Rahmt einen MLS-Blob (Welcome, Commit oder Nachricht) als Gruppen-Hülle.
+/// Rahmt einen MLS-Blob (Commit oder Nachricht) als Gruppen-Hülle.
 pub fn seal_group(group_id: &str, blob: &[u8]) -> Result<String, ClientError> {
+    seal_group_envelope(group_id, blob, None, None)
+}
+
+/// Rahmt eine Welcome-Hülle einer Einladung mit Gruppenname und Einlader.
+pub fn seal_group_invite(
+    group_id: &str,
+    blob: &[u8],
+    name: &str,
+    inviter: &str,
+) -> Result<String, ClientError> {
+    seal_group_envelope(
+        group_id,
+        blob,
+        Some(name.to_string()),
+        Some(inviter.to_string()),
+    )
+}
+
+fn seal_group_envelope(
+    group_id: &str,
+    blob: &[u8],
+    name: Option<String>,
+    inviter: Option<String>,
+) -> Result<String, ClientError> {
     let envelope = GroupEnvelope {
         v: GROUP_WIRE_VERSION.to_string(),
         group_id: group_id.to_string(),
         blob: BASE64.encode(blob),
+        name,
+        inviter,
     };
     let json =
         serde_json::to_vec(&envelope).map_err(|error| ClientError::Protocol(error.to_string()))?;
@@ -223,6 +260,8 @@ pub fn open_group(envelope_b64: &str) -> Result<OpenedGroupEnvelope, ClientError
     Ok(OpenedGroupEnvelope {
         group_id: envelope.group_id,
         blob,
+        name: envelope.name,
+        inviter: envelope.inviter,
     })
 }
 

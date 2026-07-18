@@ -32,7 +32,8 @@ use client_app::account::{
     build_device_credential, build_rotation_cert, decode_seed, IdentityKeypair,
 };
 use client_app::delivery::{
-    parse_ws_event, ws_auth_frame, DeliveryClient, GroupOutgoing, OutgoingEnvelope, WsEvent,
+    parse_ws_event, ws_auth_frame, DeliveryClient, GroupMemberInfo, GroupMetaInfo, GroupOutgoing,
+    GroupRole, OutgoingEnvelope, WsEvent,
 };
 use client_app::directory::DirectoryClient;
 use client_app::grouptext::{self, GroupPayload, RosterDevice};
@@ -376,10 +377,44 @@ fn save_invites(storage: &SharedStorage, invites: &[String]) -> Result<(), Strin
 
 /// Merkt eine Einladung vor (Welcome-Blob ablegen, ID in die Liste),
 /// ohne den Welcome zu verarbeiten. Liefert `true`, wenn sie neu ist.
+fn invite_meta_key(group_id: &str) -> String {
+    format!("invite-meta/{group_id}")
+}
+
+/// Anzeigetext einer Einladung aus Name und Einlader.
+fn invite_banner_text(name: &str, inviter: &str) -> String {
+    match (name.is_empty(), inviter.is_empty()) {
+        (false, false) => format!("Einladung in „{name}“ von {inviter}"),
+        (false, true) => format!("Einladung in „{name}“"),
+        (true, false) => format!("Einladung in eine Gruppe von {inviter}"),
+        (true, true) => "Einladung in eine Gruppe".to_string(),
+    }
+}
+
+/// Liest die Einladungs-Metadaten (Name, Einlader) eines vorgemerkten
+/// Beitritts; leere Strings, wenn nichts bekannt ist.
+fn load_invite_meta(storage: &SharedStorage, group_id: &str) -> (String, String) {
+    storage
+        .borrow()
+        .get(&invite_meta_key(group_id))
+        .ok()
+        .flatten()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .map(|m| {
+            (
+                m["name"].as_str().unwrap_or("").to_string(),
+                m["inviter"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .unwrap_or_default()
+}
+
 fn remember_invite(
     storage: &SharedStorage,
     group_id: &str,
     welcome_blob: &[u8],
+    name: Option<&str>,
+    inviter: Option<&str>,
 ) -> Result<bool, String> {
     let mut invites = load_invites(storage);
     if invites.iter().any(|id| id == group_id) {
@@ -392,6 +427,13 @@ fn remember_invite(
     storage
         .borrow_mut()
         .put(&invite_key(group_id), welcome_blob)?;
+    let meta = serde_json::json!({
+        "name": name.unwrap_or(""),
+        "inviter": inviter.unwrap_or(""),
+    });
+    if let Ok(bytes) = serde_json::to_vec(&meta) {
+        let _ = storage.borrow_mut().put(&invite_meta_key(group_id), &bytes);
+    }
     invites.push(group_id.to_string());
     save_invites(storage, &invites)?;
     Ok(true)
@@ -404,6 +446,7 @@ fn forget_invite(storage: &SharedStorage, group_id: &str) -> Result<(), String> 
     save_invites(storage, &invites)?;
     let _ = storage.borrow_mut().remove(&invite_key(group_id));
     let _ = storage.borrow_mut().remove(&invite_buffer_key(group_id));
+    let _ = storage.borrow_mut().remove(&invite_meta_key(group_id));
     Ok(())
 }
 
@@ -766,9 +809,12 @@ enum Incoming {
         group_id: String,
     },
     /// Eine Einladung in eine Gruppe (Welcome vorgemerkt, noch nicht
-    /// beigetreten); die UI bietet Annehmen/Ablehnen an.
+    /// beigetreten); die UI bietet Annehmen/Ablehnen an. Name und Einlader
+    /// (vom Einladenden bezeugt) fürs Banner.
     GroupInvite {
         group_id: String,
+        name: String,
+        inviter: String,
     },
 }
 
@@ -792,6 +838,8 @@ fn handle_group_envelope(
     own_handle: &str,
     group_id: &str,
     blob: &[u8],
+    invite_name: Option<&str>,
+    invite_inviter: Option<&str>,
 ) -> Result<Option<Incoming>, String> {
     let member = load_or_new_member(storage, own_handle)?;
     match GroupSession::load(member, group_id.as_bytes())? {
@@ -871,9 +919,11 @@ fn handle_group_envelope(
             // Spam-Einladung kein KeyPackage kostet. Verkehr, der vor der
             // Annahme eintrifft (etwa der Roster), wird gepuffert.
             if GroupSession::is_welcome(blob) {
-                if remember_invite(storage, group_id, blob)? {
+                if remember_invite(storage, group_id, blob, invite_name, invite_inviter)? {
                     Ok(Some(Incoming::GroupInvite {
                         group_id: group_id.to_string(),
+                        name: invite_name.unwrap_or("").to_string(),
+                        inviter: invite_inviter.unwrap_or("").to_string(),
                     }))
                 } else {
                     Ok(None)
@@ -1993,6 +2043,7 @@ async fn create_group_web(
     storage: &SharedStorage,
     token: &str,
     own_handle: &str,
+    name: &str,
     invitees: &[String],
 ) -> Result<String, String> {
     let profile = load_profile(storage).ok_or("Kein Profil in der Ablage")?;
@@ -2058,7 +2109,7 @@ async fn create_group_web(
     let delivery = DeliveryClient::new(delivery_url());
     let group_id = new_uuid();
     delivery
-        .create_group(token, &group_id, &members)
+        .create_group(token, &group_id, name, &members)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -2066,12 +2117,13 @@ async fn create_group_web(
     let mut session = GroupSession::create(member, group_id.as_bytes())?;
     let outcome = session.add_members(&invite_blobs)?;
 
+    // Die Welcome-Hülle trägt Name und Einlader für die Einladungs-Anzeige.
     let welcome_fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &own_device_id)
         .map(|device| {
             Ok(GroupOutgoing {
                 id: new_uuid(),
                 device_id: device.device_id.clone(),
-                envelope: wire::seal_group(&group_id, &outcome.welcome)
+                envelope: wire::seal_group_invite(&group_id, &outcome.welcome, name, own_handle)
                     .map_err(|e| e.to_string())?,
             })
         })
@@ -2440,8 +2492,14 @@ async fn fetch_messages(
                     continue;
                 }
             };
-            match handle_group_envelope(&core.storage, &core.handle, &opened.group_id, &opened.blob)
-            {
+            match handle_group_envelope(
+                &core.storage,
+                &core.handle,
+                &opened.group_id,
+                &opened.blob,
+                opened.name.as_deref(),
+                opened.inviter.as_deref(),
+            ) {
                 Ok(Some(incoming)) => received.push(incoming),
                 Ok(None) => {}
                 // Auch fehlgeschlagene Verarbeitung bestätigen (unten):
@@ -2965,6 +3023,8 @@ fn App() -> impl IntoView {
     let (new_chat_input, set_new_chat_input) = signal(String::new());
     // Mitglieder-Eingabe fürs Gründen einer Gruppe (im Neuer-Chat-Panel).
     let (group_input, set_group_input) = signal(String::new());
+    // Gruppenname beim Gründen (optional).
+    let (group_name_input, set_group_name_input) = signal(String::new());
     // Anzeigenamen der Gruppen-Chats (Schlüssel `grp:<id>` -> „Gruppe: ...");
     // aus der Ablage geladen und bei Gründung/Beitritt fortgeschrieben.
     let (group_labels, set_group_labels) =
@@ -2978,6 +3038,12 @@ fn App() -> impl IntoView {
     // Seitenleiste. Aus der Ablage geladen, damit sie ein Neuladen
     // überleben.
     let (invites, set_invites) = signal(Vec::<String>::new());
+    // Anzeigetext je Einladung (group_id -> "Name von X"); reaktiv fürs Banner.
+    let (invite_labels, set_invite_labels) =
+        signal(std::collections::HashMap::<String, String>::new());
+    // Verwaltungssicht (Name, Rollen, Einstellungen) der GEÖFFNETEN Gruppe;
+    // beim Öffnen vom Dienst geholt, für die Rollen-Anzeige und -Aktionen.
+    let (group_meta, set_group_meta) = signal(Option::<GroupMetaInfo>::None);
     // Ob die Sicherheitsnummer im Thread aufgeklappt ist.
     let (safety_open, set_safety_open) = signal(false);
     // Bleibender Verbindungszustand des Echtzeit-Kanals (Chat-Kopf).
@@ -3144,7 +3210,17 @@ fn App() -> impl IntoView {
             let storage = new_core.storage.clone();
             set_me.set(new_core.handle.clone());
             set_group_labels.set(load_group_labels(&storage, &new_core.handle));
-            set_invites.set(load_invites(&storage));
+            let pending = load_invites(&storage);
+            set_invite_labels.set(
+                pending
+                    .iter()
+                    .map(|id| {
+                        let (n, inv) = load_invite_meta(&storage, id);
+                        (id.clone(), invite_banner_text(&n, &inv))
+                    })
+                    .collect(),
+            );
+            set_invites.set(pending);
             let summaries = load_summaries(&storage);
             // Kontakt-Anzeigenamen aus der Ablage übernehmen und beim Start
             // für alle 1:1-Kontakte auffrischen (automatische Übernahme einer
@@ -3583,7 +3659,18 @@ fn App() -> impl IntoView {
                                     // Eine Einladung: in die Banner-Liste, der
                                     // Nutzer entscheidet (Welcome ist schon
                                     // vorgemerkt, kein Beitritt).
-                                    if let Incoming::GroupInvite { group_id } = item {
+                                    if let Incoming::GroupInvite {
+                                        group_id,
+                                        name,
+                                        inviter,
+                                    } = item
+                                    {
+                                        set_invite_labels.update(|m| {
+                                            m.insert(
+                                                group_id.clone(),
+                                                invite_banner_text(&name, &inviter),
+                                            );
+                                        });
                                         set_invites.update(|list| {
                                             if !list.contains(&group_id) {
                                                 list.push(group_id);
@@ -3917,6 +4004,36 @@ fn App() -> impl IntoView {
                 set_contact_names,
             );
             set_selected.set(Some(peer.clone()));
+            // Bei einer Gruppe die Verwaltungssicht (Name, Rollen,
+            // Einstellungen) frisch holen; bei einem 1:1-Chat gibt es keine.
+            set_group_meta.set(None);
+            if let Some(group_id) = group_id_of(&peer) {
+                let group_id = group_id.to_string();
+                let peer_for_meta = peer.clone();
+                spawn_local(async move {
+                    if let Ok(meta) = DeliveryClient::new(delivery_url())
+                        .group_meta(&access_token.get_untracked(), &group_id)
+                        .await
+                    {
+                        // Den Server-Namen in die Chatliste/den Kopf übernehmen
+                        // (statt der abgeleiteten Mitglieder-Liste).
+                        if !meta.name.is_empty() {
+                            let key = peer_for_meta.clone();
+                            let name = meta.name.clone();
+                            set_group_labels.update(|labels| {
+                                if let Some(ui) = labels.get_mut(&key) {
+                                    if !ui.forgotten {
+                                        ui.label = name;
+                                    }
+                                }
+                            });
+                        }
+                        if selected.get_untracked().as_deref() == Some(peer_for_meta.as_str()) {
+                            set_group_meta.set(Some(meta));
+                        }
+                    }
+                });
+            }
             // Blockier-Zustand des Kontakts nachladen; das Ergebnis zählt
             // nur, wenn der Chat beim Eintreffen noch offen ist.
             spawn_local(async move {
@@ -3987,23 +4104,35 @@ fn App() -> impl IntoView {
                 set_status.set("Nicht angemeldet.".to_string());
                 return;
             };
+            let group_name = group_name_input.get_untracked().trim().to_string();
             set_busy.set(true);
             set_status.set("Gruppe wird gegründet ...".to_string());
             let open_chat = open_chat.clone();
             spawn_local(async move {
-                let result =
-                    create_group_web(&storage, &access_token.get_untracked(), &own, &invitees)
-                        .await;
+                let result = create_group_web(
+                    &storage,
+                    &access_token.get_untracked(),
+                    &own,
+                    &group_name,
+                    &invitees,
+                )
+                .await;
                 match result {
                     Ok(group_id) => {
                         let key = group_chat_key(&group_id);
                         let mut members = vec![own.clone()];
                         members.extend(invitees);
+                        // Der eingegebene Name gewinnt; sonst die Mitglieder.
+                        let label = if group_name.is_empty() {
+                            group_label(&members, &own)
+                        } else {
+                            group_name.clone()
+                        };
                         set_group_labels.update(|labels| {
                             labels.insert(
                                 key.clone(),
                                 GroupUi {
-                                    label: group_label(&members, &own),
+                                    label,
                                     members: members.clone(),
                                     forgotten: false,
                                 },
@@ -4011,6 +4140,7 @@ fn App() -> impl IntoView {
                         });
                         set_chats.set(ensure_chat(&storage, &key));
                         set_group_input.set(String::new());
+                        set_group_name_input.set(String::new());
                         set_new_chat_open.set(false);
                         set_status.set("Gruppe gegründet.".to_string());
                         open_chat(key);
@@ -4115,6 +4245,104 @@ fn App() -> impl IntoView {
                         );
                     }
                     Err(error) => set_status.set(format!("Verlassen: {error}")),
+                }
+                set_busy.set(false);
+            });
+        }
+    };
+
+    // Rolle eines Mitglieds ändern (befördern/degradieren). Server-Aktion
+    // ohne MLS-Änderung; danach die Verwaltungssicht auffrischen.
+    let on_group_role = {
+        move |(target, role): (String, GroupRole)| {
+            if busy.get_untracked() {
+                return;
+            }
+            let Some(group_id) = selected
+                .get_untracked()
+                .and_then(|p| group_id_of(&p).map(str::to_string))
+            else {
+                return;
+            };
+            set_busy.set(true);
+            spawn_local(async move {
+                match DeliveryClient::new(delivery_url())
+                    .group_set_role(&access_token.get_untracked(), &group_id, &target, role)
+                    .await
+                {
+                    Ok(meta) => {
+                        set_group_meta.set(Some(meta));
+                        set_status.set(format!("Rolle von {target} geändert."));
+                    }
+                    Err(error) => set_status.set(format!("Rolle ändern: {error}")),
+                }
+                set_busy.set(false);
+            });
+        }
+    };
+
+    // Besitz an ein Mitglied übergeben (nur der Owner).
+    let on_group_transfer = {
+        move |target: String| {
+            if busy.get_untracked() {
+                return;
+            }
+            let Some(group_id) = selected
+                .get_untracked()
+                .and_then(|p| group_id_of(&p).map(str::to_string))
+            else {
+                return;
+            };
+            set_busy.set(true);
+            spawn_local(async move {
+                match DeliveryClient::new(delivery_url())
+                    .group_transfer(&access_token.get_untracked(), &group_id, &target)
+                    .await
+                {
+                    Ok(meta) => {
+                        set_group_meta.set(Some(meta));
+                        set_status.set(format!("Besitz an {target} übergeben."));
+                    }
+                    Err(error) => set_status.set(format!("Übergabe: {error}")),
+                }
+                set_busy.set(false);
+            });
+        }
+    };
+
+    // Announcement-Modus umschalten (nur Staff). Holt die aktuellen
+    // Einstellungen und kippt das Feld.
+    let on_group_announce = {
+        move |on: bool| {
+            if busy.get_untracked() {
+                return;
+            }
+            let Some(group_id) = selected
+                .get_untracked()
+                .and_then(|p| group_id_of(&p).map(str::to_string))
+            else {
+                return;
+            };
+            let Some(mut settings) = group_meta.get_untracked().map(|m| m.settings) else {
+                return;
+            };
+            settings.announcement = on;
+            set_busy.set(true);
+            spawn_local(async move {
+                match DeliveryClient::new(delivery_url())
+                    .group_update_info(
+                        &access_token.get_untracked(),
+                        &group_id,
+                        None,
+                        Some(settings),
+                    )
+                    .await
+                {
+                    Ok(meta) => {
+                        set_group_meta.set(Some(meta));
+                        set_status.set("Einstellung gespeichert.".to_string());
+                    }
+                    Err(error) => set_status.set(format!("Einstellung: {error}")),
                 }
                 set_busy.set(false);
             });
@@ -4756,7 +4984,19 @@ fn App() -> impl IntoView {
                                                         "Öffnen"
                                                     </button>
                                                     <div class="sm-field">
-                                                        <label for="sm-newgroup">"Oder Gruppe: Mitglieder (mit Komma)"</label>
+                                                        <label for="sm-newgroupname">"Oder Gruppe: Name (optional)"</label>
+                                                        <input
+                                                            id="sm-newgroupname"
+                                                            placeholder="Team Alpha"
+                                                            prop:value=group_name_input
+                                                            on:input=move |ev| {
+                                                                set_group_name_input
+                                                                    .set(event_target_value(&ev))
+                                                            }
+                                                        />
+                                                    </div>
+                                                    <div class="sm-field">
+                                                        <label for="sm-newgroup">"Mitglieder (mit Komma)"</label>
                                                         <input
                                                             id="sm-newgroup"
                                                             placeholder="bert, carl"
@@ -4789,6 +5029,7 @@ fn App() -> impl IntoView {
                                     // Annehmen/Ablehnen. Kein automatischer
                                     // Beitritt: der Nutzer entscheidet.
                                     let list = invites.get();
+                                    let labels = invite_labels.get();
                                     (!list.is_empty())
                                         .then(|| {
                                             let accept = on_invite_accept.clone();
@@ -4802,9 +5043,15 @@ fn App() -> impl IntoView {
                                                             let decline = decline.clone();
                                                             let id_a = group_id.clone();
                                                             let id_d = group_id.clone();
+                                                            let text = labels
+                                                                .get(&group_id)
+                                                                .cloned()
+                                                                .unwrap_or_else(|| {
+                                                                    "Einladung in eine Gruppe".to_string()
+                                                                });
                                                             view! {
                                                                 <li class="sm-invite">
-                                                                    <span>"Einladung in eine Gruppe"</span>
+                                                                    <span>{text}</span>
                                                                     <div class="sm-invite-actions">
                                                                         <button
                                                                             type="button"
@@ -5502,42 +5749,108 @@ fn App() -> impl IntoView {
                                                             .get(&members_peer)
                                                             .is_some_and(|ui| ui.forgotten);
                                                         let show = is_group && !forgotten;
+                                                        // Der innere `move`-Verlauf zieht members_peer
+                                                        // in sich hinein; ohne Klon würde die äußere
+                                                        // reaktive Closure dadurch zu FnOnce.
+                                                        let members_peer = members_peer.clone();
                                                         let remove = on_group_remove.clone();
                                                         let leave = on_group_leave.clone();
-                                                        let members_peer = members_peer.clone();
+                                                        // Diese drei Handler fangen nur Copy-Signale und sind
+                                                        // selbst Copy; kein clone nötig.
+                                                        let set_role = on_group_role;
+                                                        let transfer = on_group_transfer;
+                                                        let announce = on_group_announce;
                                                         show.then(move || {
                                                             view! {
                                                                 <details class="sm-group-members">
-                                                                    <summary>"Mitglieder"</summary>
+                                                                    <summary>"Mitglieder & Rollen"</summary>
                                                                     <ul>
                                                                         {move || {
                                                                             let own_now = me.get_untracked();
-                                                                            let members = group_labels
-                                                                                .get()
-                                                                                .get(&members_peer)
-                                                                                .map(|ui| ui.members.clone())
-                                                                                .unwrap_or_default();
+                                                                            let meta = group_meta.get();
+                                                                            // Rollen aus der Verwaltungssicht; solange sie
+                                                                            // noch lädt, die Handles aus dem Label-Signal
+                                                                            // (ohne Rolle, ohne Aktionen).
+                                                                            let members = match &meta {
+                                                                                Some(m) => m.members.clone(),
+                                                                                None => group_labels
+                                                                                    .get()
+                                                                                    .get(&members_peer)
+                                                                                    .map(|ui| {
+                                                                                        ui.members
+                                                                                            .iter()
+                                                                                            .map(|h| GroupMemberInfo {
+                                                                                                handle: h.clone(),
+                                                                                                role: GroupRole::Member,
+                                                                                            })
+                                                                                            .collect()
+                                                                                    })
+                                                                                    .unwrap_or_default(),
+                                                                            };
+                                                                            let own_role = members
+                                                                                .iter()
+                                                                                .find(|m| m.handle == own_now)
+                                                                                .map(|m| m.role);
                                                                             let remove = remove.clone();
                                                                             members
                                                                                 .into_iter()
-                                                                                .map(|member| {
-                                                                                    let is_self = member == own_now;
+                                                                                .map(|m| {
+                                                                                    let is_self = m.handle == own_now;
                                                                                     let remove = remove.clone();
-                                                                                    let target = member.clone();
+                                                                                    let t_role = m.role;
+                                                                                    let can_remove = !is_self
+                                                                                        && t_role != GroupRole::Owner
+                                                                                        && matches!(own_role, Some(GroupRole::Owner))
+                                                                                            || (!is_self
+                                                                                                && t_role == GroupRole::Member
+                                                                                                && matches!(own_role, Some(GroupRole::Admin)));
+                                                                                    let owner_acts = !is_self
+                                                                                        && matches!(own_role, Some(GroupRole::Owner))
+                                                                                        && t_role != GroupRole::Owner;
+                                                                                    let h_rm = m.handle.clone();
+                                                                                    let h_pr = m.handle.clone();
+                                                                                    let h_dm = m.handle.clone();
+                                                                                    let h_tr = m.handle.clone();
                                                                                     view! {
                                                                                         <li>
-                                                                                            <span>{member.clone()}</span>
-                                                                                            {(!is_self)
+                                                                                            <span>
+                                                                                                {m.handle.clone()}
+                                                                                                " · "
+                                                                                                <small>{t_role.label()}</small>
+                                                                                            </span>
+                                                                                            {(owner_acts && t_role == GroupRole::Member)
                                                                                                 .then(|| {
                                                                                                     view! {
-                                                                                                        <button
-                                                                                                            type="button"
-                                                                                                            class="sm-secondary"
-                                                                                                            disabled=busy
-                                                                                                            on:click=move |_| (remove)(
-                                                                                                                target.clone(),
-                                                                                                            )
-                                                                                                        >
+                                                                                                        <button type="button" class="sm-secondary" disabled=busy
+                                                                                                            on:click=move |_| (set_role)((h_pr.clone(), GroupRole::Admin))>
+                                                                                                            "Zu Admin"
+                                                                                                        </button>
+                                                                                                    }
+                                                                                                })}
+                                                                                            {(owner_acts && t_role == GroupRole::Admin)
+                                                                                                .then(|| {
+                                                                                                    view! {
+                                                                                                        <button type="button" class="sm-secondary" disabled=busy
+                                                                                                            on:click=move |_| (set_role)((h_dm.clone(), GroupRole::Member))>
+                                                                                                            "Zu Mitglied"
+                                                                                                        </button>
+                                                                                                    }
+                                                                                                })}
+                                                                                            {(owner_acts)
+                                                                                                .then(|| {
+                                                                                                    view! {
+                                                                                                        <button type="button" class="sm-secondary" disabled=busy
+                                                                                                            on:click=move |_| (transfer)(h_tr.clone())>
+                                                                                                            "Besitz übergeben"
+                                                                                                        </button>
+                                                                                                    }
+                                                                                                })}
+                                                                                            {(can_remove)
+                                                                                                .then(|| {
+                                                                                                    let remove = remove.clone();
+                                                                                                    view! {
+                                                                                                        <button type="button" class="sm-secondary" disabled=busy
+                                                                                                            on:click=move |_| (remove)(h_rm.clone())>
                                                                                                             "Entfernen"
                                                                                                         </button>
                                                                                                     }
@@ -5548,6 +5861,26 @@ fn App() -> impl IntoView {
                                                                                 .collect_view()
                                                                         }}
                                                                     </ul>
+                                                                    {move || {
+                                                                        // Announcement-Umschalter nur fuer Staff.
+                                                                        let meta = group_meta.get();
+                                                                        let own_now = me.get_untracked();
+                                                                        let staff = meta
+                                                                            .as_ref()
+                                                                            .and_then(|m| m.members.iter().find(|x| x.handle == own_now))
+                                                                            .map(|m| matches!(m.role, GroupRole::Owner | GroupRole::Admin))
+                                                                            .unwrap_or(false);
+                                                                        let announcement = meta.as_ref().map(|m| m.settings.announcement).unwrap_or(false);
+                                                                        staff.then(move || {
+                                                                            view! {
+                                                                                <label class="sm-set-row">
+                                                                                    <span class="sm-set-label">"Nur Admins dürfen senden"</span>
+                                                                                    <input type="checkbox" prop:checked=announcement disabled=busy
+                                                                                        on:change=move |ev| (announce)(event_target_checked(&ev)) />
+                                                                                </label>
+                                                                            }
+                                                                        })
+                                                                    }}
                                                                 </details>
                                                                 <button
                                                                     type="button"

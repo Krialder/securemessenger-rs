@@ -642,7 +642,7 @@ async fn group_chat_over_separate_cli_processes() {
     }
 
     // Anna gründet die Gruppe; die Zustell-ID steht in der Ausgabe.
-    let created = anna.run(&["group-create", "bert", "carl"]);
+    let created = anna.run(&["group-create", "Reiseplanung", "bert", "carl"]);
     let group_id = created
         .split_whitespace()
         .nth(1)
@@ -662,7 +662,10 @@ async fn group_chat_over_separate_cli_processes() {
     // Gruppen). Roster und der Vor-Annahme-Text werden dabei gepuffert.
     let bert_recv = bert.run(&["recv"]);
     assert!(
-        bert_recv.contains("eingeladen") && !bert_recv.contains("beigetreten"),
+        bert_recv.contains("Einladung")
+            && bert_recv.contains("Reiseplanung")
+            && bert_recv.contains("von anna")
+            && !bert_recv.contains("beigetreten"),
         "Bert darf nicht automatisch beitreten, stdout war: {bert_recv}"
     );
     // Die Einladung steht in der Liste.
@@ -792,7 +795,7 @@ async fn group_invite_can_be_declined() {
         user.run(&["publish-keys"]);
     }
 
-    let created = ida.run(&["group-create", "jan"]);
+    let created = ida.run(&["group-create", "Projektgruppe", "jan"]);
     let group_id = created
         .split_whitespace()
         .nth(1)
@@ -802,7 +805,10 @@ async fn group_invite_can_be_declined() {
     // jan holt ab: eine Einladung, kein Beitritt.
     let jan_recv = jan.run(&["recv"]);
     assert!(
-        jan_recv.contains("eingeladen") && !jan_recv.contains("beigetreten"),
+        jan_recv.contains("Einladung")
+            && jan_recv.contains("Projektgruppe")
+            && jan_recv.contains("von ida")
+            && !jan_recv.contains("beigetreten"),
         "stdout war: {jan_recv}"
     );
     // Ablehnen: die Einladung ist weg, jan ist keiner Gruppe beigetreten.
@@ -989,7 +995,7 @@ async fn group_reaches_own_second_device() {
 
     // Rosa (Gerät 1) gründet die Gruppe mit timo. Dabei wird auch rosas
     // EIGENES Zweitgerät eingeladen.
-    let created = rosa1.run(&["group-create", "timo"]);
+    let created = rosa1.run(&["group-create", "Familie", "timo"]);
     let group_id = created
         .split_whitespace()
         .nth(1)
@@ -1003,7 +1009,7 @@ async fn group_reaches_own_second_device() {
     timo.run(&["group-accept", &group_id]);
     let rosa2_recv = rosa2.run(&["recv"]);
     assert!(
-        rosa2_recv.contains("eingeladen"),
+        rosa2_recv.contains("Einladung") && rosa2_recv.contains("Familie"),
         "rosas Zweitgerät muss eine Einladung bekommen, stdout war: {rosa2_recv}"
     );
     let rosa2_accept = rosa2.run(&["group-accept", &group_id]);
