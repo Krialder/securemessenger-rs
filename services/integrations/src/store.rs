@@ -77,48 +77,48 @@ pub trait TenantStore: Send + Sync {
 
     /// Legt einen Webhook-Endpunkt an, aber nur, wenn der Mandant noch unter
     /// `max_per_tenant` Endpunkten liegt. `false` = der Deckel ist erreicht.
-    /// Zaehlen und Einfuegen laufen atomar (eine Sperre bzw. eine Anweisung),
-    /// damit gleichzeitige Anlagen den Deckel nicht ueberrennen.
+    /// Zählen und Einfügen laufen atomar (eine Sperre bzw. eine Anweisung),
+    /// damit gleichzeitige Anlagen den Deckel nicht überrennen.
     async fn create_webhook(
         &self,
         endpoint: WebhookEndpoint,
         max_per_tenant: usize,
     ) -> Result<bool, StoreError>;
 
-    /// Alle Webhook-Endpunkte eines Mandanten (fuer die Selbstverwaltung),
+    /// Alle Webhook-Endpunkte eines Mandanten (für die Selbstverwaltung),
     /// stabil nach (created_at, id) sortiert (beide Ablagen gleich).
     async fn list_webhooks(&self, tenant_id: &str) -> Result<Vec<WebhookEndpoint>, StoreError>;
 
-    /// Loescht einen Endpunkt des Mandanten; `false` = es gab keinen mit
-    /// dieser ID bei diesem Mandanten (fuer 404, ohne fremde IDs zu verraten).
+    /// Löscht einen Endpunkt des Mandanten; `false` = es gab keinen mit
+    /// dieser ID bei diesem Mandanten (für 404, ohne fremde IDs zu verraten).
     /// Die ID ist eine kanonische UUID (der Aufrufer normalisiert sie).
     async fn delete_webhook(&self, tenant_id: &str, id: &str) -> Result<bool, StoreError>;
 
-    /// Alle Endpunkte (ueber alle Mandanten), die ein Ereignis fuer einen
+    /// Alle Endpunkte (über alle Mandanten), die ein Ereignis für einen
     /// Handle abonniert haben UND deren Mandant nicht gesperrt ist und den
-    /// noetigen Scope noch hat. Grundlage der Zustellung: die Berechtigung
-    /// wird hier zur Zustellzeit erneut geprueft, nicht nur bei der Anlage.
+    /// nötigen Scope noch hat. Grundlage der Zustellung: die Berechtigung
+    /// wird hier zur Zustellzeit erneut geprüft, nicht nur bei der Anlage.
     async fn find_webhook_subscribers(
         &self,
         handle: &str,
         event: &str,
     ) -> Result<Vec<WebhookEndpoint>, StoreError>;
 
-    /// Reiht eine Zustellung in die Outbox ein (faellig sofort).
+    /// Reiht eine Zustellung in die Outbox ein (fällig sofort).
     async fn enqueue_webhook_delivery(&self, delivery: OutboxDelivery) -> Result<(), StoreError>;
 
-    /// Nimmt bis zu `limit` faellige, noch nicht zugestellte Zustellungen in
-    /// Besitz: erhoeht ihre Versuchszahl und verschiebt sie auf den naechsten
+    /// Nimmt bis zu `limit` fällige, noch nicht zugestellte Zustellungen in
+    /// Besitz: erhöht ihre Versuchszahl und verschiebt sie auf den nächsten
     /// Backoff (damit kein zweiter Worker sie parallel greift), und gibt sie
-    /// zum Senden zurueck. Zeilen mit `attempts >= MAX_DELIVERY_ATTEMPTS`
+    /// zum Senden zurück. Zeilen mit `attempts >= MAX_DELIVERY_ATTEMPTS`
     /// bleiben liegen (Dead Letter).
     async fn claim_due_deliveries(&self, limit: usize) -> Result<Vec<OutboxDelivery>, StoreError>;
 
     /// Markiert eine Zustellung als erledigt.
     async fn mark_delivery_done(&self, id: &str) -> Result<(), StoreError>;
 
-    /// Vermerkt den letzten Fehler (der naechste Versuch ist schon beim
-    /// Claim eingeplant); nur fuer die Nachvollziehbarkeit.
+    /// Vermerkt den letzten Fehler (der nächste Versuch ist schon beim
+    /// Claim eingeplant); nur für die Nachvollziehbarkeit.
     async fn mark_delivery_error(&self, id: &str, error: &str) -> Result<(), StoreError>;
 }
 
@@ -253,8 +253,8 @@ impl TenantStore for InMemoryTenantStore {
         max_per_tenant: usize,
     ) -> Result<bool, StoreError> {
         let mut inner = self.inner.lock().expect("Lock nicht vergiftet");
-        // Zaehlen und Einfuegen unter DERSELBEN Sperre: kein Check-then-act,
-        // das den Deckel unter gleichzeitigen Anlagen ueberrennen koennte.
+        // Zählen und Einfügen unter DERSELBEN Sperre: kein Check-then-act,
+        // das den Deckel unter gleichzeitigen Anlagen überrennen könnte.
         let count = inner
             .webhooks
             .values()
@@ -282,7 +282,7 @@ impl TenantStore for InMemoryTenantStore {
 
     async fn delete_webhook(&self, tenant_id: &str, id: &str) -> Result<bool, StoreError> {
         let mut inner = self.inner.lock().expect("Lock nicht vergiftet");
-        // Nur loeschen, wenn ID UND Mandant passen: ein Mandant darf keinen
+        // Nur löschen, wenn ID UND Mandant passen: ein Mandant darf keinen
         // fremden Endpunkt entfernen.
         let owned = inner
             .webhooks
@@ -300,7 +300,7 @@ impl TenantStore for InMemoryTenantStore {
         event: &str,
     ) -> Result<Vec<WebhookEndpoint>, StoreError> {
         let inner = self.inner.lock().expect("Lock nicht vergiftet");
-        // Berechtigung zur Zustellzeit erneut pruefen: der Mandant darf nicht
+        // Berechtigung zur Zustellzeit erneut prüfen: der Mandant darf nicht
         // gesperrt sein und muss den vom Ereignis geforderten Scope noch haben
         // (ein gesperrter oder entrechteter Mandant bekommt nichts mehr).
         let required = event_required_scope(event);
@@ -341,7 +341,7 @@ impl TenantStore for InMemoryTenantStore {
     async fn claim_due_deliveries(&self, limit: usize) -> Result<Vec<OutboxDelivery>, StoreError> {
         let mut inner = self.inner.lock().expect("Lock nicht vergiftet");
         let now = now_epoch();
-        // Faellige Zeilen, aelteste (frueheste next_attempt_at) zuerst.
+        // Fällige Zeilen, älteste (früheste next_attempt_at) zuerst.
         let mut due: Vec<(String, u64)> = inner
             .outbox
             .iter()
@@ -355,7 +355,7 @@ impl TenantStore for InMemoryTenantStore {
         for (id, _) in due.into_iter().take(limit) {
             if let Some(record) = inner.outbox.get_mut(&id) {
                 record.attempts += 1;
-                // Naechsten Versuch schon einplanen (Claim-Lease = Backoff),
+                // Nächsten Versuch schon einplanen (Claim-Lease = Backoff),
                 // damit kein zweiter Durchlauf dieselbe Zeile greift.
                 record.next_attempt_at = now + delivery_backoff_secs(record.attempts);
                 claimed.push(OutboxDelivery {

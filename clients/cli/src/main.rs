@@ -2838,27 +2838,27 @@ fn print_usage() {
          \x20 whois <handle>                 Anzeigename eines Kontakts abfragen\n\
          \x20 login <passwort>               Gerät anmelden, Token speichern\n\
          \x20 logout                         Session abmelden\n\
-         \x20 passwd <altes> <neues>         Konto-Passwort aendern (meldet andere Geraete ab)\n\
+         \x20 passwd <altes> <neues>         Konto-Passwort ändern (meldet andere Geräte ab)\n\
          \x20 whoami                         Profil anzeigen\n\
-         \x20 link <handle> <passwort>       neues Zweitgeraet koppeln: Antrag ausgeben\n\
-         \x20 approve <antrag>               Zweitgeraet freischalten (nur Erstgeraet)\n\
-         \x20 link-finish <handle> <passwort>  Kopplung auf dem Zweitgeraet abschliessen\n\
-         \x20 devices                        eigene Geraetemenge mit Nummern anzeigen\n\
-         \x20 unlink <geraete-id>            ein Geraet entfernen (Revocation)\n\
-         \x20 delete-account <passwort>     Konto-Loeschung vormerken (Widerrufsfrist)\n\
-         \x20 undelete                      vorgemerkte Loeschung widerrufen\n\
-         \x20 rename <anzeigename>          Anzeigename aendern (Handle bleibt)\n\
+         \x20 link <handle> <passwort>       neues Zweitgerät koppeln: Antrag ausgeben\n\
+         \x20 approve <antrag>               Zweitgerät freischalten (nur Erstgeraet)\n\
+         \x20 link-finish <handle> <passwort>  Kopplung auf dem Zweitgerät abschließen\n\
+         \x20 devices                        eigene Gerätemenge mit Nummern anzeigen\n\
+         \x20 unlink <geraete-id>            ein Gerät entfernen (Revocation)\n\
+         \x20 delete-account <passwort>     Konto-Löschung vormerken (Widerrufsfrist)\n\
+         \x20 undelete                      vorgemerkte Löschung widerrufen\n\
+         \x20 rename <anzeigename>          Anzeigename ändern (Handle bleibt)\n\
          \x20 rotate-key                    Konto-Wurzelschluessel rotieren (nur Erstgeraet)\n\
-         \x20 publish-keys                   Prekey-Satz + MLS-KeyPackages veroeffentlichen\n\
-         \x20 group-create <name> <mitglied>...  MLS-Gruppe mit Namen gruenden\n\
+         \x20 publish-keys                   Prekey-Satz + MLS-KeyPackages veröffentlichen\n\
+         \x20 group-create <name> <mitglied>...  MLS-Gruppe mit Namen gründen\n\
          \x20 groups                         lokale Gruppenliste (ID + Mitglieder)\n\
          \x20 group-send <id> <text>         E2EE-Gruppennachricht senden\n\
          \x20 group-edit <id> <msg-id> <text>  Gruppennachricht bearbeiten\n\
          \x20 group-delete <id> <msg-id>     Gruppennachricht bei allen loeschen\n\
          \x20 group-members <id>             Name, Einstellungen und Rollen zeigen\n\
-         \x20 group-role <id> <handle> <admin|member>  befoerdern/degradieren\n\
-         \x20 group-transfer <id> <handle>   Besitz uebergeben (nur Owner)\n\
-         \x20 group-set <id> name|announce|invite|info <wert>  Name/Einstellung aendern\n\
+         \x20 group-role <id> <handle> <admin|member>  befördern/degradieren\n\
+         \x20 group-transfer <id> <handle>   Besitz übergeben (nur Owner)\n\
+         \x20 group-set <id> name|announce|invite|info <wert>  Name/Einstellung ändern\n\
          \x20 group-remove <id> <handle>     Mitglied entfernen (MLS-Neuschluesseln)\n\
          \x20 group-leave <id>               Gruppe verlassen (lokal + Ansage)\n\
          \x20 invites                        offene Gruppen-Einladungen anzeigen\n\
@@ -2871,9 +2871,9 @@ fn print_usage() {
          \x20 import <datei> <sicherungs-pw>  Sicherung in ein frisches Profil einspielen\n\
          \x20 recv                           wartende Nachrichten abholen und entschlüsseln\n\
          \x20 listen [--once]                Hinweiskanal halten und bei Hinweisen abholen\n\
-         \x20 verify                         eigenen KT-Eintrag pruefen (Selbstpruefung)\n\
-         \x20 audit <von> <bis>              KT-Log-Konsistenz zwischen zwei Epochen pruefen\n\
-         \x20 keycheck <handle>              Geraeteschluessel eines Kontakts auf Aenderung pruefen\n\
+         \x20 verify                         eigenen KT-Eintrag prüfen (Selbstprüfung)\n\
+         \x20 audit <von> <bis>              KT-Log-Konsistenz zwischen zwei Epochen prüfen\n\
+         \x20 keycheck <handle>              Geräteschlüssel eines Kontakts auf Änderung prüfen\n\
          \x20 report <message_id>            empfangene Nachricht melden (Franking aufdecken)\n\
          \x20 block <handle>                 Absender blockieren\n\
          \x20 unblock <handle>               Blockierung aufheben\n\

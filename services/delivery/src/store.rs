@@ -456,7 +456,7 @@ mod tests {
         };
         store.save_push_subscription("dev-1", &sub).await.unwrap();
         assert_eq!(store.push_subscription("dev-1").await.unwrap(), Some(sub));
-        // Anderes Geraet ist unberuehrt.
+        // Anderes Gerät ist unberührt.
         assert_eq!(store.push_subscription("dev-2").await.unwrap(), None);
 
         // Ein erneutes Abonnieren ersetzt (neuer Endpoint).

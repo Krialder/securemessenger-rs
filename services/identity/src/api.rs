@@ -43,9 +43,9 @@ const REGISTER_RATE_LIMIT: u32 = 5;
 /// Client. [ANNAHME: 20/min; die Spec fordert striktes Limit, nennt keine
 /// Zahl.]
 const DISCOVERY_RATE_LIMIT: u32 = 20;
-/// Anzeigename-Abrufe je Abrufer und Minute. Grosszuegig, weil die Clients
-/// beim App-Start je Kontakt einmal fragen und beim Chat-Oeffnen auffrischen;
-/// nur eine Bremse gegen missbraeuchliches Reihum-Abfragen. [ANNAHME: 120/min.]
+/// Anzeigename-Abrufe je Abrufer und Minute. Großzügig, weil die Clients
+/// beim App-Start je Kontakt einmal fragen und beim Chat-Öffnen auffrischen;
+/// nur eine Bremse gegen missbräuchliches Reihum-Abfragen. [ANNAHME: 120/min.]
 const PROFILE_RATE_LIMIT: u32 = 120;
 
 /// Geteilter Zustand aller Handler.
@@ -352,11 +352,11 @@ async fn sender_certificate(
         return api_error(
             StatusCode::FORBIDDEN,
             "unknown_device",
-            "Geraet ist nicht (mehr) Teil der gueltigen Geraetemenge",
+            "Gerät ist nicht (mehr) Teil der gültigen Gerätemenge",
         );
     };
     let Ok(identity_key) = BASE64.decode(&device.public_key) else {
-        tracing::error!(handle = %who.handle, "registrierter Geraeteschluessel ist kein Base64");
+        tracing::error!(handle = %who.handle, "registrierter Geräteschlüssel ist kein Base64");
         return internal();
     };
     let expires_at_millis = now_unix() * 1000 + SENDER_CERTIFICATE_TTL_MILLIS;
@@ -377,7 +377,7 @@ async fn sender_certificate(
             api_error(
                 StatusCode::BAD_REQUEST,
                 "device_key_unsupported",
-                "der registrierte Geraeteschluessel ist kein libsignal-Identitaetsschluessel",
+                "der registrierte Geräteschlüssel ist kein libsignal-Identitätsschlüssel",
             )
         }
     }
@@ -786,7 +786,7 @@ async fn register(State(st): State<AppState>, Json(req): Json<RegisterRequest>) 
                 return api_error(
                     StatusCode::BAD_REQUEST,
                     "pow_required",
-                    "Registrierung braucht einen gueltigen Proof-of-Work (Schwierigkeit unter GET /pow)",
+                    "Registrierung braucht einen gültigen Proof-of-Work (Schwierigkeit unter GET /pow)",
                 )
             }
         }
@@ -1556,7 +1556,7 @@ async fn add_device(
         Err(StoreError::TooManyDevices) => api_error(
             StatusCode::CONFLICT,
             "too_many_devices",
-            "Das Konto hat die Hoechstzahl an Geraeten erreicht",
+            "Das Konto hat die Höchstzahl an Geräten erreicht",
         ),
         Err(error) => store_failure(error),
     }
@@ -1650,7 +1650,7 @@ async fn provision_put(
         Err(PutError::TooLarge) => api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "payload_too_large",
-            "der verschluesselte Antrag ist zu gross",
+            "der verschlüsselte Antrag ist zu groß",
         ),
         Err(PutError::ChannelTaken) => api_error(
             StatusCode::CONFLICT,
@@ -1660,7 +1660,7 @@ async fn provision_put(
         Err(PutError::Full) => api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "relay_full",
-            "der Kopplungs-Relay ist voruebergehend voll",
+            "der Kopplungs-Relay ist vorübergehend voll",
         ),
     }
 }

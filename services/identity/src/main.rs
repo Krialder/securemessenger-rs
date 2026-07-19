@@ -7,10 +7,10 @@ use identity::api::{app, AppState};
 use identity::pg;
 use identity::session::SessionConfig;
 
-/// Obergrenze fuer beide Token-Laufzeiten: 10 Jahre. Faengt die klassische
-/// Millisekunden-Verwechslung (30 Tage als 2592000000 waeren 82 Jahre) und
+/// Obergrenze für beide Token-Laufzeiten: 10 Jahre. Fängt die klassische
+/// Millisekunden-Verwechslung (30 Tage als 2592000000 wären 82 Jahre) und
 /// bleibt weit unter dem Punkt, an dem die Unix-Sekunden-Arithmetik der
-/// Ablage kippen koennte.
+/// Ablage kippen könnte.
 const TTL_MAX_SECS: u64 = 10 * 365 * 24 * 60 * 60;
 
 /// Liest eine Token-Laufzeit aus der Umgebung. Fehlt die Variable (oder ist
@@ -19,8 +19,8 @@ const TTL_MAX_SECS: u64 = 10 * 365 * 24 * 60 * 60;
 /// Unterschied ist Absicht: eine fehlende Variable ist der Normalfall, ein
 /// gesetzter-aber-kaputter Wert ist eine Fehlkonfiguration, und ein Dienst,
 /// der sie still verwirft, liefe mit anderen Laufzeiten als der Betreiber
-/// glaubt (etwa 30 Tage Refresh statt der beabsichtigten Verkuerzung).
-/// Gleiches Muster wie bei den uebrigen Pflicht-Secrets in dieser Datei.
+/// glaubt (etwa 30 Tage Refresh statt der beabsichtigten Verkürzung).
+/// Gleiches Muster wie bei den übrigen Pflicht-Secrets in dieser Datei.
 fn ttl_from_env(name: &str, default: std::time::Duration) -> std::time::Duration {
     let Ok(raw) = std::env::var(name) else {
         return default;
@@ -32,19 +32,19 @@ fn ttl_from_env(name: &str, default: std::time::Duration) -> std::time::Duration
     let secs: u64 = raw
         .parse()
         .unwrap_or_else(|_| panic!("{name} ist keine Ganzzahl in Sekunden: '{raw}'"));
-    assert!(secs > 0, "{name} muss groesser als 0 sein");
+    assert!(secs > 0, "{name} muss größer als 0 sein");
     assert!(
         secs <= TTL_MAX_SECS,
-        "{name} ist groesser als 10 Jahre ({secs} s); Sekunden statt Millisekunden angeben"
+        "{name} ist größer als 10 Jahre ({secs} s); Sekunden statt Millisekunden angeben"
     );
     std::time::Duration::from_secs(secs)
 }
 
 /// Token-Laufzeiten aus der Umgebung, sonst die Vorgaben (15 min Access,
 /// 30 Tage Refresh). ACCESS_TTL_SECS und REFRESH_TTL_SECS erlauben einer
-/// Betriebsumgebung eine andere Wahl, ohne dass ein Client dafuer gebaut
+/// Betriebsumgebung eine andere Wahl, ohne dass ein Client dafür gebaut
 /// werden muss; in der Entwicklung macht ein kurzer Access-Wert die
-/// Token-Erneuerung des Clients binnen Sekunden statt Minuten pruefbar.
+/// Token-Erneuerung des Clients binnen Sekunden statt Minuten prüfbar.
 fn session_config_from_env() -> SessionConfig {
     let default = SessionConfig::default();
     let config = SessionConfig {
@@ -93,9 +93,9 @@ async fn main() {
         None => {
             tracing::warn!("DATABASE_URL nicht gesetzt, Daten nur im Prozessspeicher");
             // Die TTL-Variablen gelten auch hier: gerade der Modus ohne
-            // Datenbank ist der Entwicklungsfall, fuer den ein kurzer
+            // Datenbank ist der Entwicklungsfall, für den ein kurzer
             // Access-Wert gedacht ist; ein Knopf, der je nach Persistenz
-            // still ins Leere griffe, wuerde Fehlkonfiguration verschleiern.
+            // still ins Leere griffe, würde Fehlkonfiguration verschleiern.
             AppState::with_session_config(session_config_from_env())
         }
     };
@@ -128,7 +128,7 @@ async fn main() {
 
     // Mit CDS_OPRF_KEY (Base64-Seed, 32 Byte) steht Contact Discovery
     // bereit; ohne bleiben die /discovery-Routen 404. Ein flüchtiger
-    // Schlüssel waere nach einem Neustart nicht mehr zum vorhandenen
+    // Schlüssel wäre nach einem Neustart nicht mehr zum vorhandenen
     // Discovery-Index passend, deshalb hier Pflicht-Secret statt Default.
     let state = match std::env::var("CDS_OPRF_KEY").ok().filter(|s| !s.is_empty()) {
         Some(seed_b64) => {
@@ -145,7 +145,7 @@ async fn main() {
         None => state,
     };
 
-    // Mit POW_DIFFICULTY (fuehrende Nullbits) verlangt die Registrierung
+    // Mit POW_DIFFICULTY (führende Nullbits) verlangt die Registrierung
     // einen Proof-of-Work als Sybil-Bremse; 0 oder ungesetzt = aus.
     let state = match std::env::var("POW_DIFFICULTY")
         .ok()

@@ -10,10 +10,10 @@ use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::{routing::get, Router};
 
-/// Prozessweite Bereitschaft fuer die `/ready`-Probe. Startet als bereit und
+/// Prozessweite Bereitschaft für die `/ready`-Probe. Startet als bereit und
 /// wird beim Shutdown auf `false` gesetzt, damit Kubernetes den drainenden
 /// Pod aus der Rotation nimmt, bevor der Server die letzten Anfragen auslaufen
-/// laesst (sonst laufen noch neue Anfragen in einen sterbenden Pod).
+/// lässt (sonst laufen noch neue Anfragen in einen sterbenden Pod).
 static READY: AtomicBool = AtomicBool::new(true);
 
 /// Setzt die Bereitschaft, die `/ready` meldet.
@@ -28,15 +28,15 @@ pub mod rate;
 pub mod ssrf;
 
 pub mod http {
-    //! Geteilter HTTP-Client fuer Dienst-zu-Dienst-Aufrufe.
+    //! Geteilter HTTP-Client für Dienst-zu-Dienst-Aufrufe.
     //!
     //! Immer mit Timeouts: ein verbundener, aber nicht antwortender
-    //! Nachbardienst (etwa identity auf dem Auth-Heisspfad) wuerde sonst jede
-    //! Anfrage unbegrenzt blockieren und Tasks samt DB-Pool erschoepfen, ein
+    //! Nachbardienst (etwa identity auf dem Auth-Heißpfad) würde sonst jede
+    //! Anfrage unbegrenzt blockieren und Tasks samt DB-Pool erschöpfen, ein
     //! Kaskadenausfall. reqwest hat von sich aus KEINEN Request-Timeout.
     use std::time::Duration;
 
-    /// reqwest-Client mit Verbindungs- und Gesamt-Timeout fuer interne Aufrufe.
+    /// reqwest-Client mit Verbindungs- und Gesamt-Timeout für interne Aufrufe.
     pub fn internal_client() -> reqwest::Client {
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(2))
@@ -46,8 +46,8 @@ pub mod http {
     }
 }
 
-/// Ein Future, das aufloest, wenn der Prozess enden soll: SIGTERM (Unix, so
-/// stoppt Kubernetes einen Pod) oder Ctrl-C. Fuer
+/// Ein Future, das auflöst, wenn der Prozess enden soll: SIGTERM (Unix, so
+/// stoppt Kubernetes einen Pod) oder Ctrl-C. Für
 /// `axum::serve(...).with_graceful_shutdown(...)`, damit laufende Anfragen und
 /// WebSockets beim Rollout/Drain sauber auslaufen statt hart abzubrechen.
 pub async fn shutdown_signal() {
@@ -71,11 +71,11 @@ pub async fn shutdown_signal() {
         _ = terminate => {}
     }
     // Erst unbereit melden (Kubernetes nimmt den Pod aus der Rotation), dann
-    // laesst axum::serve die laufenden Anfragen auslaufen.
+    // lässt axum::serve die laufenden Anfragen auslaufen.
     set_ready(false);
     tracing::info!("Shutdown-Signal empfangen, fahre geordnet herunter");
     // Im Produktionsbetrieb kurz warten, damit Kubernetes die Unbereitschaft
-    // sieht und keine neuen Anfragen mehr schickt, BEVOR der Server aufhoert
+    // sieht und keine neuen Anfragen mehr schickt, BEVOR der Server aufhört
     // anzunehmen (sonst liefen sie in einen sterbenden Pod). Im
     // Entwicklungsbetrieb kein Warten, damit Ctrl-C sofort greift.
     if production_mode() {
@@ -83,9 +83,9 @@ pub async fn shutdown_signal() {
     }
 }
 
-/// Laeuft der Dienst im Produktionsbetrieb (`SM_ENV=production`)? Dann sind
+/// Läuft der Dienst im Produktionsbetrieb (`SM_ENV=production`)? Dann sind
 /// Persistenz und Secrets Pflicht; fehlen sie, bricht der Start ab, statt
-/// still auf In-Memory oder ephemere Schluessel auszuweichen (ein
+/// still auf In-Memory oder ephemere Schlüssel auszuweichen (ein
 /// Datenverlust- und Sicherheitsrisiko). Ohne den Schalter bleibt der
 /// bequeme Entwicklungsbetrieb (Ausweichen mit Warnung).
 pub fn production_mode() -> bool {
@@ -182,8 +182,8 @@ where
     S: Clone + Send + Sync + 'static,
 {
     Router::new()
-        // /live: lebt der Prozess ueberhaupt? (statisch ok, korrekt fuer
-        // Liveness.) /ready: nimmt der Pod neue Anfragen an? Waehrend des
+        // /live: lebt der Prozess überhaupt? (statisch ok, korrekt für
+        // Liveness.) /ready: nimmt der Pod neue Anfragen an? Während des
         // Shutdowns 503, damit Kubernetes ihn aus der Rotation nimmt.
         .route("/live", get(|| async { "ok" }))
         .route("/ready", get(ready_probe))

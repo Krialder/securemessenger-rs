@@ -1,28 +1,28 @@
-//! Provisioning-Chiffre fuer die QR-Kopplung eines Zweitgeraets.
+//! Provisioning-Chiffre für die QR-Kopplung eines Zweitgeräts.
 //!
-//! Die manuelle Kopplung uebertraegt den Kopplungs-Antrag (Geraete-ID plus
-//! oeffentlicher Geraeteschluessel) als lange Base64-Zeile, die der Nutzer
-//! vom neuen aufs bestehende Geraet kopiert. Dieses Crate automatisiert die
-//! Uebergabe ueber einen Relay, ohne dem Relay den Antrag anzuvertrauen:
+//! Die manuelle Kopplung überträgt den Kopplungs-Antrag (Geräte-ID plus
+//! öffentlicher Geräteschlüssel) als lange Base64-Zeile, die der Nutzer
+//! vom neuen aufs bestehende Gerät kopiert. Dieses Crate automatisiert die
+//! Übergabe über einen Relay, ohne dem Relay den Antrag anzuvertrauen:
 //!
-//! 1. Das neue Geraet zieht ein zufaelliges 32-Byte-Geheimnis (im QR-Code)
+//! 1. Das neue Gerät zieht ein zufälliges 32-Byte-Geheimnis (im QR-Code)
 //!    und `seal`t seinen Antrag darunter. Aus dem Geheimnis leitet HKDF-SHA256
-//!    domaenengetrennt eine Kanal-ID und einen Chiffre-Schluessel ab.
+//!    domänengetrennt eine Kanal-ID und einen Chiffre-Schlüssel ab.
 //! 2. Es legt `{channel_id, nonce, ciphertext}` beim Relay ab.
-//! 3. Das bestehende Geraet bekommt das Geheimnis (QR gescannt oder
+//! 3. Das bestehende Gerät bekommt das Geheimnis (QR gescannt oder
 //!    eingegeben), leitet dieselbe Kanal-ID ab, holt den Chiffretext und
-//!    `open`t ihn mit demselben Schluessel.
+//!    `open`t ihn mit demselben Schlüssel.
 //!
 //! Der Relay sieht nur die Kanal-ID (aus dem Geheimnis abgeleitet, nicht
 //! umkehrbar) und opaken Chiffretext. Er kann den Antrag nicht lesen und
-//! nicht faelschen: die Poly1305-Pruefung faengt jede Aenderung, und ohne
-//! das Geheimnis (nur auf dem Bildschirm des neuen Geraets) laesst sich
-//! weder die Kanal-ID treffen noch ein gueltiger Chiffretext erzeugen. Damit
+//! nicht fälschen: die Poly1305-Prüfung fängt jede Änderung, und ohne
+//! das Geheimnis (nur auf dem Bildschirm des neuen Geräts) lässt sich
+//! weder die Kanal-ID treffen noch ein gültiger Chiffretext erzeugen. Damit
 //! ist der Vertrauensanker der physische QR-Pfad (Bildschirm zu Kamera),
 //! genau wie bei der manuellen Kopie der Anker die Zwischenablage war.
 //!
 //! Kein Eigenbau: HKDF-SHA256 (RFC 5869) und ChaCha20-Poly1305, beide aus
-//! den geprueften RustCrypto-Bibliotheken; hier nur zu einem versionierten
+//! den geprüften RustCrypto-Bibliotheken; hier nur zu einem versionierten
 //! Format komponiert.
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -34,11 +34,11 @@ use rand::RngCore as _;
 use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-/// Laenge des Kopplungs-Geheimnisses in Bytes (256 Bit; passt als Base64 in
+/// Länge des Kopplungs-Geheimnisses in Bytes (256 Bit; passt als Base64 in
 /// einen kleinen QR-Code).
 pub const SECRET_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
-/// Laenge der Kanal-ID in Bytes; als Hex ein URL-sicherer Pfad-Bestandteil.
+/// Länge der Kanal-ID in Bytes; als Hex ein URL-sicherer Pfad-Bestandteil.
 const CHANNEL_LEN: usize = 16;
 const KEY_LEN: usize = 32;
 
@@ -49,14 +49,14 @@ const INFO_CHANNEL: &[u8] = b"smprov.v1 channel";
 const INFO_KEY: &[u8] = b"smprov.v1 key";
 
 /// Das Kopplungs-Geheimnis. Wird beim Fallenlassen aus dem Speicher
-/// gewischt, weil daraus Kanal-ID und Chiffre-Schluessel entstehen.
+/// gewischt, weil daraus Kanal-ID und Chiffre-Schlüssel entstehen.
 #[derive(ZeroizeOnDrop)]
 pub struct Secret([u8; SECRET_LEN]);
 
-/// Fehler beim Entschluesseln oder Einlesen.
+/// Fehler beim Entschlüsseln oder Einlesen.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProvisioningError {
-    /// Eingabe unlesbar (kein Base64, falsche Laenge).
+    /// Eingabe unlesbar (kein Base64, falsche Länge).
     Malformed,
     /// Der Chiffretext verifiziert nicht: falsches Geheimnis oder manipuliert.
     WrongSecretOrTampered,
@@ -75,7 +75,7 @@ impl std::fmt::Display for ProvisioningError {
 
 impl std::error::Error for ProvisioningError {}
 
-/// Der abgelegte, verschluesselte Antrag samt seiner (aus dem Geheimnis
+/// Der abgelegte, verschlüsselte Antrag samt seiner (aus dem Geheimnis
 /// abgeleiteten) Kanal-ID. Nonce und Chiffretext als Base64.
 pub struct Sealed {
     pub channel_id: String,
@@ -96,9 +96,9 @@ impl Secret {
     /// abtippbarer Code), existiert also ohnehin in der Oberfläche. Der
     /// zeroize-Schutz gilt dem `Secret`-Array selbst; diese Anzeige-Kopie
     /// lebt so kurz wie die Kopplungs-Ansicht. [ANNAHME: eine restlose
-    /// Wisch-Garantie ueber alle Kopien (auch die HKDF-PRK im hkdf-Crate,
-    /// das ohne zeroize-Feature laeuft) ist Defense-in-depth und im
-    /// wasm-Linear-Memory ohnehin nicht vollstaendig erreichbar.]
+    /// Wisch-Garantie über alle Kopien (auch die HKDF-PRK im hkdf-Crate,
+    /// das ohne zeroize-Feature läuft) ist Defense-in-depth und im
+    /// wasm-Linear-Memory ohnehin nicht vollständig erreichbar.]
     pub fn to_b64(&self) -> String {
         BASE64.encode(self.0)
     }
@@ -123,11 +123,11 @@ impl Secret {
 
     fn derive(&self, info: &[u8], out: &mut [u8]) {
         let hk = Hkdf::<Sha256>::new(None, &self.0);
-        // expand scheitert nur bei absurder Laenge; unsere sind fix klein.
-        hk.expand(info, out).expect("HKDF-Laenge gueltig");
+        // expand scheitert nur bei absurder Länge; unsere sind fix klein.
+        hk.expand(info, out).expect("HKDF-Länge gültig");
     }
 
-    /// Die Kanal-ID (Hex): der Relay-Schluessel, aus dem Geheimnis abgeleitet
+    /// Die Kanal-ID (Hex): der Relay-Schlüssel, aus dem Geheimnis abgeleitet
     /// und nicht umkehrbar. Beide Seiten rechnen dieselbe.
     pub fn channel_id(&self) -> String {
         let mut id = [0u8; CHANNEL_LEN];
@@ -144,7 +144,7 @@ impl Secret {
     }
 }
 
-/// Verschluesselt den Antrag unter dem Geheimnis und liefert die
+/// Verschlüsselt den Antrag unter dem Geheimnis und liefert die
 /// Relay-Ablage (Kanal-ID, frischer Nonce, Chiffretext).
 pub fn seal(secret: &Secret, plaintext: &[u8]) -> Sealed {
     let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -159,7 +159,7 @@ pub fn seal(secret: &Secret, plaintext: &[u8]) -> Sealed {
                 aad: AAD,
             },
         )
-        .expect("ChaCha20-Poly1305-Verschluesselung");
+        .expect("ChaCha20-Poly1305-Verschlüsselung");
     Sealed {
         channel_id: secret.channel_id(),
         nonce_b64: BASE64.encode(nonce_bytes),
@@ -167,7 +167,7 @@ pub fn seal(secret: &Secret, plaintext: &[u8]) -> Sealed {
     }
 }
 
-/// Entschluesselt einen vom Relay geholten Chiffretext mit dem Geheimnis.
+/// Entschlüsselt einen vom Relay geholten Chiffretext mit dem Geheimnis.
 pub fn open(
     secret: &Secret,
     nonce_b64: &str,
@@ -211,7 +211,7 @@ mod tests {
     fn roundtrip() {
         let secret = Secret::generate();
         let sealed = seal(&secret, b"kopplungs-antrag");
-        // Die Kanal-ID des Ablegers und des Holers stimmen ueberein.
+        // Die Kanal-ID des Ablegers und des Holers stimmen überein.
         assert_eq!(sealed.channel_id, secret.channel_id());
         let opened = open(&secret, &sealed.nonce_b64, &sealed.ciphertext_b64).unwrap();
         assert_eq!(opened, b"kopplungs-antrag");
@@ -273,7 +273,7 @@ mod tests {
     fn malformed_inputs_are_rejected() {
         let secret = Secret::generate();
         // `.err()` verwirft den Secret-Erfolgswert; Secret hat bewusst kein
-        // Debug (Schluesselmaterial), also nicht direkt auf dem Result
+        // Debug (Schlüsselmaterial), also nicht direkt auf dem Result
         // assert_eq.
         assert_eq!(
             Secret::from_b64("kein base64!!!").err(),

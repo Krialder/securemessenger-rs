@@ -64,12 +64,12 @@ pub struct AppState {
     limiter: Arc<RateLimiter>,
     /// SHA-256-Digest des Shared Secrets; None = interne Route aus.
     internal_token_hash: Option<String>,
-    /// Signierpaar der Webhooks (Ed25519), oeffentlicher Teil veroeffentlicht.
+    /// Signierpaar der Webhooks (Ed25519), öffentlicher Teil veröffentlicht.
     webhook_signer: Arc<WebhookSigner>,
     /// Zustellung der Webhooks; im Test ein Fake, sonst reqwest.
     webhook_sender: Arc<dyn WebhookSender>,
-    /// Ob Webhook-URLs auf interne/Loopback-Ziele zeigen duerfen. Vorgabe
-    /// aus (SSRF-Schutz); nur der lokale Lauf schaltet es fuer den Empfaenger
+    /// Ob Webhook-URLs auf interne/Loopback-Ziele zeigen dürfen. Vorgabe
+    /// aus (SSRF-Schutz); nur der lokale Lauf schaltet es für den Empfänger
     /// auf localhost frei.
     allow_private_webhooks: bool,
 }
@@ -87,7 +87,7 @@ impl AppState {
             limiter: Arc::new(RateLimiter::default()),
             internal_token_hash: None,
             // Ohne gesetzten Seed ein ephemeres Paar: der lokale Lauf
-            // funktioniert, ueber einen Neustart aendert sich der Schluessel.
+            // funktioniert, über einen Neustart ändert sich der Schlüssel.
             webhook_signer: Arc::new(WebhookSigner::ephemeral()),
             webhook_sender: Arc::new(HttpWebhookSender::default()),
             allow_private_webhooks: false,
@@ -226,7 +226,7 @@ async fn authenticate_tenant(
         Ok(Some(tenant)) => tenant,
         Ok(None) => return Err(invalid_token()),
         Err(error) => {
-            tracing::error!(%error, "Token-Aufloesung fehlgeschlagen");
+            tracing::error!(%error, "Token-Auflösung fehlgeschlagen");
             return Err(internal());
         }
     };
@@ -244,7 +244,7 @@ async fn authenticate_tenant(
 fn authorize(st: &AppState, tenant: &Tenant, scope: &'static str) -> Option<Response> {
     if !tenant.has_scope(scope) {
         // "Token", nicht "Mandant": seit Least Privilege je Token kann das
-        // Token enger sein als der Mandant (der das Recht durchaus haette).
+        // Token enger sein als der Mandant (der das Recht durchaus hätte).
         return Some(api_error(
             StatusCode::FORBIDDEN,
             "missing_scope",
@@ -269,7 +269,7 @@ struct TokenForm {
     client_secret: Option<String>,
     /// Optional angefragte Scopes (leerzeichengetrennt). Muss eine Teilmenge
     /// der Mandanten-Scopes sein und verengt das ausgestellte Token auf genau
-    /// diese Rechte (Least Privilege je Token). Fehlt der Parameter, traegt
+    /// diese Rechte (Least Privilege je Token). Fehlt der Parameter, trägt
     /// das Token die vollen Mandanten-Rechte.
     scope: Option<String>,
 }
@@ -279,14 +279,14 @@ struct TokenResponse {
     access_token: String,
     token_type: &'static str,
     expires_in: u64,
-    /// Die tatsaechlich gewaehrten Scopes (leerzeichengetrennt, RFC 6749).
+    /// Die tatsächlich gewährten Scopes (leerzeichengetrennt, RFC 6749).
     scope: String,
 }
 
 /// OAuth2-Fehlerantwort (`{error, error_description}`, RFC 6749 Abschnitt
-/// 5.2), getrennt vom `{code, message}`-Schema der uebrigen Routen, damit
+/// 5.2), getrennt vom `{code, message}`-Schema der übrigen Routen, damit
 /// Standard-OAuth2-Clients die Fehler maschinell verstehen. Bei
-/// `invalid_client` gehoert ein `WWW-Authenticate: Basic` dazu.
+/// `invalid_client` gehört ein `WWW-Authenticate: Basic` dazu.
 fn oauth_error(status: StatusCode, error: &'static str, description: &str) -> Response {
     let mut response = (
         status,
@@ -315,7 +315,7 @@ fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
 /// `POST /integrations/token`: standardkonformer OAuth2-Client-Credentials-
 /// Grant. Unbekannte Client-ID, falsches Secret und gesperrter Mandant
 /// antworten identisch (`invalid_client`, 401), damit die Antwort nichts
-/// ueber existierende Mandanten verraet.
+/// über existierende Mandanten verrät.
 async fn token(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -325,7 +325,7 @@ async fn token(
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "unsupported_grant_type",
-            "Nur grant_type=client_credentials wird unterstuetzt",
+            "Nur grant_type=client_credentials wird unterstützt",
         );
     }
     // Zugangsdaten bevorzugt aus dem HTTP-Basic-Header, sonst aus dem Body.
@@ -372,7 +372,7 @@ async fn token(
         }
     };
 
-    // Angefragte Scopes muessen eine Teilmenge der Mandanten-Rechte sein.
+    // Angefragte Scopes müssen eine Teilmenge der Mandanten-Rechte sein.
     // Ein leerer oder fehlender scope-Parameter bedeutet "gib die vollen
     // Mandanten-Rechte" (RFC 6749 3.3: scope ist optional); ein angefragter,
     // engerer Satz verengt das Token auf genau diese Rechte (Least Privilege).
@@ -470,7 +470,7 @@ async fn notify(
             )
         }
         Err(error) => {
-            tracing::error!(%error, "Nutzer-Aufloesung fehlgeschlagen");
+            tracing::error!(%error, "Nutzer-Auflösung fehlgeschlagen");
             return internal();
         }
     };
@@ -545,7 +545,7 @@ async fn presence(
             )
         }
         Err(error) => {
-            tracing::error!(%error, "Nutzer-Aufloesung fehlgeschlagen");
+            tracing::error!(%error, "Nutzer-Auflösung fehlgeschlagen");
             return internal();
         }
     };
@@ -556,7 +556,7 @@ async fn presence(
         match st.realtime.query_presence(&device_ids).await {
             Ok(online_ids) => !online_ids.is_empty(),
             Err(error) => {
-                tracing::error!(%error, "Praesenz-Abfrage fehlgeschlagen");
+                tracing::error!(%error, "Präsenz-Abfrage fehlgeschlagen");
                 return internal();
             }
         }
@@ -574,9 +574,9 @@ fn now_epoch() -> u64 {
 // Der SSRF-Host-Filter (Loopback/privat/Cloud-Metadaten) liegt jetzt in
 // common::ssrf, geteilt mit dem Web-Push-Endpoint der Zustellung.
 
-/// `GET /integrations/webhook-key`: der oeffentliche Ed25519-Schluessel, mit
-/// dem ein Fremdprojekt die Signatur eingehender Webhooks prueft. Oeffentlich
-/// und ohne Auth (ein oeffentlicher Schluessel ist zum Teilen da).
+/// `GET /integrations/webhook-key`: der öffentliche Ed25519-Schlüssel, mit
+/// dem ein Fremdprojekt die Signatur eingehender Webhooks prüft. Öffentlich
+/// und ohne Auth (ein öffentlicher Schlüssel ist zum Teilen da).
 async fn webhook_key(State(st): State<AppState>) -> Response {
     (
         StatusCode::OK,
@@ -620,7 +620,7 @@ impl From<WebhookEndpoint> for WebhookResponse {
 /// `POST /integrations/{tenant}/webhooks`: der Mandant registriert selbst
 /// einen Endpunkt. Jedes abonnierte Ereignis braucht den Scope, den es
 /// aufdeckt (presence.changed braucht presence): der Push ist damit nicht
-/// durchlaessiger als der Poll.
+/// durchlässiger als der Poll.
 async fn create_webhook(
     State(st): State<AppState>,
     Path(path_tenant): Path<String>,
@@ -644,8 +644,8 @@ async fn create_webhook(
         );
     }
     // SSRF-Schutz: die URL darf nicht auf ein internes/Loopback-Ziel zeigen
-    // (der Dienst wuerde sonst im internen Netz oder auf die Cloud-Metadaten
-    // POSTen). Nur der lokale Lauf schaltet das fuer localhost frei.
+    // (der Dienst würde sonst im internen Netz oder auf die Cloud-Metadaten
+    // POSTen). Nur der lokale Lauf schaltet das für localhost frei.
     if !st.allow_private_webhooks && common::ssrf::is_blocked_host(url) {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -753,7 +753,7 @@ async fn delete_webhook(
         Err(response) => return response,
     };
     // ID auf die kanonische UUID-Form bringen, damit In-Memory und
-    // PostgreSQL gleich vergleichen (sonst faengt PG Gross-/Kleinschreibung
+    // PostgreSQL gleich vergleichen (sonst fängt PG Groß-/Kleinschreibung
     // ab, In-Memory nicht). Keine UUID = es gibt keinen solchen Endpunkt.
     let Ok(canonical) = uuid::Uuid::try_parse(&id).map(|u| u.to_string()) else {
         return api_error(
@@ -770,7 +770,7 @@ async fn delete_webhook(
             "Kein solcher Endpunkt",
         ),
         Err(error) => {
-            tracing::error!(%error, "Webhook-Loeschung fehlgeschlagen");
+            tracing::error!(%error, "Webhook-Löschung fehlgeschlagen");
             internal()
         }
     }
@@ -780,15 +780,15 @@ async fn delete_webhook(
 struct PresenceEventRequest {
     handle: String,
     online: bool,
-    /// Fortlaufende Nummer des Uebergangs (von delivery unter der Zaehl-
-    /// Sperre vergeben). Sie reist in den Envelope, damit ein Empfaenger die
+    /// Fortlaufende Nummer des Übergangs (von delivery unter der Zähl-
+    /// Sperre vergeben). Sie reist in den Envelope, damit ein Empfänger die
     /// Reihenfolge herstellen kann: die Zustellung ist Best effort und nicht
     /// geordnet, aber `seq` ordnet online/offline eindeutig.
     #[serde(default)]
     seq: u64,
 }
 
-/// `POST /internal/presence-event`: delivery meldet eine Praesenz-Aenderung
+/// `POST /internal/presence-event`: delivery meldet eine Präsenz-Änderung
 /// eines Handles (online/offline). Der Dienst sucht die Abonnenten und
 /// stellt jedem einen signierten Envelope zu (interne Route, Shared Secret).
 async fn presence_event(
@@ -813,9 +813,9 @@ async fn presence_event(
     let matched = subscribers.len();
     let now = now_epoch();
     // In die Outbox einreihen (nicht direkt senden): der Hintergrund-Worker
-    // liefert mit Wiederholung aus (mindestens einmal). Der Envelope-Koerper
+    // liefert mit Wiederholung aus (mindestens einmal). Der Envelope-Körper
     // wird jetzt gebaut (stabile id und created_at), signiert wird je Versuch
-    // im Worker neu. Ein nicht erreichbarer Empfaenger verliert kein Ereignis.
+    // im Worker neu. Ein nicht erreichbarer Empfänger verliert kein Ereignis.
     let mut enqueued = 0u32;
     for endpoint in subscribers {
         let delivery_id = uuid::Uuid::new_v4().to_string();

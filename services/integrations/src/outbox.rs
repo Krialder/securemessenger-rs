@@ -2,10 +2,10 @@
 //!
 //! `presence_event` reiht Zustellungen nur in die Outbox ein; hier werden sie
 //! geholt und gesendet. Jeder Versuch wird mit FRISCHEM Zeitstempel neu
-//! signiert (der Koerper mit stabiler id/created_at bleibt gleich), damit ein
-//! Empfaenger mit Replay-Fenster einen spaeten Wiederholversuch nicht als zu
-//! alt abweist. Der naechste Versuch ist beim Claim schon eingeplant
-//! (Backoff), ein Fehler haelt die anderen Zustellungen nicht auf.
+//! signiert (der Körper mit stabiler id/created_at bleibt gleich), damit ein
+//! Empfänger mit Replay-Fenster einen späten Wiederholversuch nicht als zu
+//! alt abweist. Der nächste Versuch ist beim Claim schon eingeplant
+//! (Backoff), ein Fehler hält die anderen Zustellungen nicht auf.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +20,7 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
-/// Ein Durchlauf: bis zu `limit` faellige Zustellungen holen, senden,
+/// Ein Durchlauf: bis zu `limit` fällige Zustellungen holen, senden,
 /// Erfolg/Fehler vermerken. Liefert die Zahl der erfolgreich zugestellten.
 /// Der Worker-Loop ruft nur dies auf, damit die Logik testbar bleibt.
 pub async fn drain_once(
@@ -57,7 +57,7 @@ pub async fn drain_once(
                 }
             }
             Err(error) => {
-                // Der naechste Versuch ist beim Claim schon eingeplant; hier
+                // Der nächste Versuch ist beim Claim schon eingeplant; hier
                 // nur den Fehler vermerken (best effort).
                 let _ = store.mark_delivery_error(&row.id, &error).await;
                 tracing::warn!(
@@ -73,7 +73,7 @@ pub async fn drain_once(
 }
 
 /// Startet den Dauer-Worker: pollt die Outbox in kurzem Takt und liefert
-/// faellige Zustellungen aus. Best effort, laeuft neben dem HTTP-Server.
+/// fällige Zustellungen aus. Best effort, läuft neben dem HTTP-Server.
 pub fn spawn_worker(
     store: Arc<dyn TenantStore>,
     signer: Arc<WebhookSigner>,

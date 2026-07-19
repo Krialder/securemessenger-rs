@@ -1887,6 +1887,13 @@ fn own_device_number(core: &Core) -> u32 {
     u32::from(core.device.address().device_id())
 }
 
+/// Wie die Self-Sync-Kopie einer 1:1-Zustellung aussieht: eine gewöhnliche
+/// Nachricht (Text + ID) oder ein Änderungsereignis (rohe smmsg-Bytes).
+enum SelfCopy<'a> {
+    Text { text: &'a str },
+    Event { event: &'a [u8] },
+}
+
 /// Sendet eine Nachricht; baut beim ersten Kontakt die PQXDH-Sitzungen aus
 /// den Verzeichnis-Bündeln auf und merkt sich die Geräte des Kontakts in
 /// der Ablage (gleicher Fluss und gleiches Format wie im CLI).
@@ -1900,13 +1907,6 @@ fn own_device_number(core: &Core) -> u32 {
 /// Zustellung kann die Erneuerung rotieren, und der Dienst entwertet das
 /// alte Token dabei sofort. Jeder Request liest deshalb unmittelbar vorher
 /// den aktuellen Stand.
-/// Wie die Self-Sync-Kopie einer 1:1-Zustellung aussieht: eine gewöhnliche
-/// Nachricht (Text + ID) oder ein Änderungsereignis (rohe smmsg-Bytes).
-enum SelfCopy<'a> {
-    Text { text: &'a str },
-    Event { event: &'a [u8] },
-}
-
 async fn deliver_1to1(
     core: &mut Core,
     token: ReadSignal<String>,
@@ -2239,21 +2239,14 @@ async fn delete_message(
     Ok(())
 }
 
-/// Löst die eigenen ANDEREN Geräte auf und baut je Gerät eine
-/// Self-Sync-Kopie (Gegenstück zur CLI). Die Geräteliste wird gecacht
-/// (`sync/own_devices`); Schlüssel-vorhanden heißt aufgelöst (auch leer =
-/// keine Zweitgeräte), damit ein Ein-Gerät-Konto nicht bei jedem Senden
-/// erneut auflöst und Prekeys verbraucht. Das eigene Gerät (Erst- oder
-/// gekoppeltes Zweitgerät) fällt über `own_device_number` heraus. Der Cache
-/// wird bei der Anmeldung geleert, damit ein neu gekoppeltes Gerät auftaucht.
-///
-/// Löst die eigenen ANDEREN Geräte auf und baut je Gerät eine Sitzung, mit
-/// Cache in der Ablage (`sync/own_devices`): Schlüssel-vorhanden heißt
-/// aufgelöst (auch leer = keine Zweitgeräte), damit ein Ein-Gerät-Konto
-/// nicht bei jedem Senden erneut auflöst und Prekeys verbraucht. Das eigene
-/// Gerät fällt über `own_device_number` heraus. Der Cache wird nach
-/// Freischalten und bei der Anmeldung geleert, damit ein neu gekoppeltes
-/// Gerät auftaucht. Geteilt von Self-Sync und Verlaufs-Nachzug.
+/// Löst die eigenen ANDEREN Geräte auf und baut je Gerät eine Sitzung
+/// (Gegenstück zur CLI), geteilt von Self-Sync und Verlaufs-Nachzug. Die
+/// Geräteliste wird gecacht (`sync/own_devices`): Schlüssel-vorhanden heißt
+/// aufgelöst (auch leer = keine Zweitgeräte), damit ein Ein-Gerät-Konto nicht
+/// bei jedem Senden erneut auflöst und Prekeys verbraucht. Das eigene Gerät
+/// (Erst- oder gekoppeltes Zweitgerät) fällt über `own_device_number` heraus.
+/// Der Cache wird nach dem Freischalten eines Geräts und bei der Anmeldung
+/// geleert, damit ein neu gekoppeltes Gerät auftaucht.
 async fn own_siblings(
     core: &mut Core,
     token: ReadSignal<String>,
@@ -3525,17 +3518,14 @@ async fn approve_device(storage: &SharedStorage, token: &str, input: &str) -> Re
     Ok(outcome.protocol_device_id)
 }
 
-/// Rotiert den Konto-Wurzelschlüssel (ADR-0010, `sm rotate-key`-Gegenstück
-/// im Web). Nur auf einem Erstgerät mit Wurzel-Seed. Signiert das
-/// Rotations-Zertifikat mit dem ALTEN Schlüssel, jedes Gerät mit dem NEUEN,
-/// reicht beides ein und legt erst nach dem Erfolg den neuen Seed ab.
-/// Liefert die Zahl der neu signierten Geräte.
-/// Rotiert den Konto-Wurzelschlüssel (ADR-0010), Browser-Fassung des
-/// CLI-Ablaufs. Absturzsicher: der neue Seed wird VOR dem Serveraufruf als
-/// `pending` in IndexedDB abgelegt und erst nach dem bestätigten Erfolg nach
-/// `account_seed` befördert; eine unterbrochene Rotation wird beim nächsten
-/// Versuch abgeschlossen (siehe rotate_key in der CLI). Jedes Gerät wird mit
-/// dem neuen Schlüssel neu signiert und sein Ablauf erneuert.
+/// Rotiert den Konto-Wurzelschlüssel (ADR-0010, Browser-Fassung von `sm
+/// rotate-key`). Nur auf einem Erstgerät mit Wurzel-Seed. Signiert das
+/// Rotations-Zertifikat mit dem ALTEN Schlüssel, jedes Gerät mit dem NEUEN
+/// (und erneuert dessen Ablauf), und reicht beides ein. Absturzsicher: der
+/// neue Seed wird VOR dem Serveraufruf als `pending` in IndexedDB abgelegt
+/// und erst nach dem bestätigten Erfolg nach `account_seed` befördert; eine
+/// unterbrochene Rotation schließt der nächste Versuch ab (siehe rotate_key
+/// in der CLI). Liefert die Zahl der neu signierten Geräte.
 async fn rotate_key_web(storage: &SharedStorage, token: &str) -> Result<usize, String> {
     let mut profile = load_profile(storage).ok_or("Kein Profil in der Ablage")?;
     if profile.account_seed.is_empty() {

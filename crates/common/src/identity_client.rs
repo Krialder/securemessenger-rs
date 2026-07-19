@@ -56,8 +56,8 @@ impl HttpIdentityGateway {
     pub fn new(base_url: &str, internal_token: &str) -> Self {
         Self {
             // Mit Timeouts (crate::http): dieser Aufruf liegt auf dem
-            // Auth-Heisspfad JEDER authentifizierten Anfrage der anderen
-            // Dienste; ohne Timeout haengt ein stummes identity alles auf.
+            // Auth-Heißpfad JEDER authentifizierten Anfrage der anderen
+            // Dienste; ohne Timeout hängt ein stummes identity alles auf.
             client: crate::http::internal_client(),
             // Ohne abschließenden Slash gespeichert, die Pfade bringen ihn mit.
             base_url: base_url.trim_end_matches('/').to_string(),

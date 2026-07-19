@@ -1,33 +1,33 @@
 //! Signatur und Zustellung der Webhooks.
 //!
-//! Kein Krypto-Eigenbau und kein pro-Endpunkt-Geheimnis: der Dienst haelt
-//! EIN Ed25519-Signierpaar (wie das btlog-Crate), veroeffentlicht den
-//! oeffentlichen Teil unter GET /integrations/webhook-key, und jeder
-//! Empfaenger prueft die Signatur damit. So liegt in der Ablage kein
-//! rueckholbares Signier-Geheimnis (NF040-Ethos), und ein Fremdprojekt
-//! verifiziert alle Webhooks mit EINEM veroeffentlichten Schluessel.
+//! Kein Krypto-Eigenbau und kein pro-Endpunkt-Geheimnis: der Dienst hält
+//! EIN Ed25519-Signierpaar (wie das btlog-Crate), veröffentlicht den
+//! öffentlichen Teil unter GET /integrations/webhook-key, und jeder
+//! Empfänger prüft die Signatur damit. So liegt in der Ablage kein
+//! rückholbares Signier-Geheimnis (NF040-Ethos), und ein Fremdprojekt
+//! verifiziert alle Webhooks mit EINEM veröffentlichten Schlüssel.
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
 
-/// Header-Namen der Zustellung (bewusst mit Praefix, damit sie nicht mit
+/// Header-Namen der Zustellung (bewusst mit Präfix, damit sie nicht mit
 /// fremden Headern kollidieren).
 pub const HEADER_EVENT: &str = "x-securemessenger-event";
 pub const HEADER_DELIVERY: &str = "x-securemessenger-delivery";
 pub const HEADER_TIMESTAMP: &str = "x-securemessenger-timestamp";
 pub const HEADER_SIGNATURE: &str = "x-securemessenger-signature";
 
-/// Haelt das Signierpaar und leistet Signatur plus Schluessel-Veroeffentlichung.
+/// Hält das Signierpaar und leistet Signatur plus Schlüssel-Veröffentlichung.
 pub struct WebhookSigner {
     key: SigningKey,
 }
 
 impl WebhookSigner {
-    /// Aus einem Base64-kodierten 32-Byte-Seed (Betriebsvorgabe ueber
-    /// INTEGRATIONS_WEBHOOK_SIGNING_KEY), damit der oeffentliche Schluessel
-    /// ueber Neustarts stabil bleibt und Empfaenger ihn cachen koennen.
+    /// Aus einem Base64-kodierten 32-Byte-Seed (Betriebsvorgabe über
+    /// INTEGRATIONS_WEBHOOK_SIGNING_KEY), damit der öffentliche Schlüssel
+    /// über Neustarts stabil bleibt und Empfänger ihn cachen können.
     pub fn from_seed_b64(seed_b64: &str) -> Result<Self, String> {
         let bytes = BASE64
             .decode(seed_b64.trim())
@@ -40,9 +40,9 @@ impl WebhookSigner {
         })
     }
 
-    /// Ephemeres Paar aus OS-Zufall: fuer den lokalen Lauf ohne gesetzten
-    /// Seed. Ueber einen Neustart aendert sich dann der oeffentliche
-    /// Schluessel (Empfaenger muessten ihn neu holen); der Aufrufer warnt.
+    /// Ephemeres Paar aus OS-Zufall: für den lokalen Lauf ohne gesetzten
+    /// Seed. Über einen Neustart ändert sich dann der öffentliche
+    /// Schlüssel (Empfänger müssten ihn neu holen); der Aufrufer warnt.
     pub fn ephemeral() -> Self {
         use argon2::password_hash::rand_core::{OsRng, RngCore};
         let mut seed = [0u8; 32];
@@ -52,14 +52,14 @@ impl WebhookSigner {
         }
     }
 
-    /// Der oeffentliche Schluessel (Base64), wie ihn der Discovery-Endpunkt
-    /// ausgibt und der Empfaenger zum Pruefen nutzt.
+    /// Der öffentliche Schlüssel (Base64), wie ihn der Discovery-Endpunkt
+    /// ausgibt und der Empfänger zum Prüfen nutzt.
     pub fn public_key_b64(&self) -> String {
         BASE64.encode(self.key.verifying_key().to_bytes())
     }
 
     /// Signiert die kanonische Nachricht `{timestamp}.{body}` (der
-    /// Zeitstempel ist mitsigniert, damit ein Empfaenger einen Replay
+    /// Zeitstempel ist mitsigniert, damit ein Empfänger einen Replay
     /// anhand des Alters abweisen kann). Ergebnis ist die Base64-Signatur.
     pub fn sign(&self, timestamp: u64, body: &[u8]) -> String {
         let mut message = format!("{timestamp}.").into_bytes();
@@ -80,14 +80,14 @@ pub struct Delivery {
 }
 
 /// Verschickt eine Zustellung. Der Trait entkoppelt die HTTP-Schicht von
-/// reqwest, damit Tests einen Fake-Sender stecken koennen.
+/// reqwest, damit Tests einen Fake-Sender stecken können.
 #[async_trait]
 pub trait WebhookSender: Send + Sync {
     async fn deliver(&self, delivery: Delivery) -> Result<(), String>;
 }
 
 /// HTTP-Umsetzung: POST mit den signierten Headern und knappem Timeout
-/// (ein langsamer Empfaenger darf die Zustellung nicht endlos aufhalten).
+/// (ein langsamer Empfänger darf die Zustellung nicht endlos aufhalten).
 pub struct HttpWebhookSender {
     client: reqwest::Client,
 }
@@ -97,8 +97,8 @@ impl Default for HttpWebhookSender {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             // Keine Weiterleitungen folgen: sonst umginge ein Ziel eine
-            // spaetere Ziel-Pruefung ueber ein 302 auf ein internes Ziel
-            // (SSRF-Haertung, zusammen mit der Host-Pruefung bei der Anlage).
+            // spätere Ziel-Prüfung über ein 302 auf ein internes Ziel
+            // (SSRF-Härtung, zusammen mit der Host-Prüfung bei der Anlage).
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest-Client baubar");
@@ -122,7 +122,7 @@ impl WebhookSender for HttpWebhookSender {
             .await
             .map_err(|err| format!("Zustellung fehlgeschlagen: {err}"))?;
         if !response.status().is_success() {
-            return Err(format!("Empfaenger antwortete {}", response.status()));
+            return Err(format!("Empfänger antwortete {}", response.status()));
         }
         Ok(())
     }
@@ -140,8 +140,8 @@ mod tests {
         let ts = 1_700_000_000;
         let sig_b64 = signer.sign(ts, body);
 
-        // Ein Empfaenger baut die kanonische Nachricht nach und prueft mit
-        // dem veroeffentlichten Schluessel.
+        // Ein Empfänger baut die kanonische Nachricht nach und prüft mit
+        // dem veröffentlichten Schlüssel.
         let pub_bytes: [u8; 32] = BASE64
             .decode(signer.public_key_b64())
             .unwrap()
@@ -155,7 +155,7 @@ mod tests {
         message.extend_from_slice(body);
         assert!(vk.verify(&message, &sig).is_ok());
 
-        // Ein veraenderter Zeitstempel bricht die Pruefung.
+        // Ein veränderter Zeitstempel bricht die Prüfung.
         let mut tampered = format!("{}.", ts + 1).into_bytes();
         tampered.extend_from_slice(body);
         assert!(vk.verify(&tampered, &sig).is_err());

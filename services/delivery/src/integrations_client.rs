@@ -1,11 +1,11 @@
 //! Ausgehende Anbindung an den integrations-Dienst.
 //!
-//! delivery haelt die WebSocket-Verbindungen und weiss damit als einziger
-//! Dienst, wann ein Nutzer online oder offline geht. Diese Praesenz-
-//! Aenderung meldet es integrations, das daraus die Webhooks der
+//! delivery hält die WebSocket-Verbindungen und weiß damit als einziger
+//! Dienst, wann ein Nutzer online oder offline geht. Diese Präsenz-
+//! Änderung meldet es integrations, das daraus die Webhooks der
 //! Fremdprojekte speist (Push statt Poll). Die Meldung ist best effort:
 //! eine nicht erreichbare integrations-Instanz darf die Zustellung und
-//! die Echtzeit-Verbindungen von delivery nie stoeren.
+//! die Echtzeit-Verbindungen von delivery nie stören.
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -13,13 +13,13 @@ use serde_json::json;
 #[async_trait]
 pub trait IntegrationsGateway: Send + Sync {
     /// Meldet, dass ein Handle online (true) oder offline (false) ging.
-    /// `seq` ist die fortlaufende Uebergangs-Nummer (delivery vergibt sie
-    /// unter der Praesenz-Sperre), damit der Empfaenger ordnen kann.
+    /// `seq` ist die fortlaufende Übergangs-Nummer (delivery vergibt sie
+    /// unter der Präsenz-Sperre), damit der Empfänger ordnen kann.
     async fn presence_changed(&self, handle: &str, online: bool, seq: u64);
 }
 
-/// Tut nichts: ohne gesetzte INTEGRATIONS_URL laeuft delivery ohne die
-/// Webhook-Anbindung (sie ist optional, der Chat-Kern haengt nicht daran).
+/// Tut nichts: ohne gesetzte INTEGRATIONS_URL läuft delivery ohne die
+/// Webhook-Anbindung (sie ist optional, der Chat-Kern hängt nicht daran).
 pub struct NoopIntegrationsGateway;
 
 #[async_trait]
@@ -61,10 +61,10 @@ impl IntegrationsGateway for HttpIntegrationsGateway {
             .await;
         match result {
             Ok(response) if !response.status().is_success() => {
-                tracing::warn!(status = %response.status(), "integrations wies Praesenz-Ereignis ab");
+                tracing::warn!(status = %response.status(), "integrations wies Präsenz-Ereignis ab");
             }
             Err(error) => {
-                tracing::warn!(%error, "Praesenz-Ereignis an integrations fehlgeschlagen");
+                tracing::warn!(%error, "Präsenz-Ereignis an integrations fehlgeschlagen");
             }
             Ok(_) => {}
         }

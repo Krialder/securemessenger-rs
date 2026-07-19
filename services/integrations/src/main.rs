@@ -34,17 +34,17 @@ async fn main() {
     let realtime = Arc::new(HttpRealtimeGateway::new(delivery_url, internal_token));
 
     // Webhook-Signierpaar: aus dem Betriebs-Seed, sonst ephemer (dann
-    // aendert sich der oeffentliche Schluessel ueber Neustarts, Empfaenger
-    // muessten ihn neu holen). Ein kaputter Seed bricht den Start ab, statt
+    // ändert sich der öffentliche Schlüssel über Neustarts, Empfänger
+    // müssten ihn neu holen). Ein kaputter Seed bricht den Start ab, statt
     // still ephemer zu werden.
     let webhook_signer = match std::env::var("INTEGRATIONS_WEBHOOK_SIGNING_KEY") {
         Ok(seed) if !seed.is_empty() => Arc::new(
             integrations::webhook::WebhookSigner::from_seed_b64(&seed)
-                .expect("INTEGRATIONS_WEBHOOK_SIGNING_KEY ist ein gueltiger Base64-32-Byte-Seed"),
+                .expect("INTEGRATIONS_WEBHOOK_SIGNING_KEY ist ein gültiger Base64-32-Byte-Seed"),
         ),
         _ => {
             tracing::warn!(
-                "INTEGRATIONS_WEBHOOK_SIGNING_KEY nicht gesetzt, ephemerer Webhook-Schluessel"
+                "INTEGRATIONS_WEBHOOK_SIGNING_KEY nicht gesetzt, ephemerer Webhook-Schlüssel"
             );
             Arc::new(integrations::webhook::WebhookSigner::ephemeral())
         }
@@ -68,7 +68,7 @@ async fn main() {
     // Mandanten-Anlage-Route frei.
     .with_internal_token(internal_token)
     .with_webhook_signer(webhook_signer)
-    // SSRF-Schutz standardmaessig an; nur der lokale Lauf erlaubt
+    // SSRF-Schutz standardmäßig an; nur der lokale Lauf erlaubt
     // Webhook-Ziele auf localhost (INTEGRATIONS_ALLOW_PRIVATE_WEBHOOKS=1).
     .allow_private_webhooks(
         std::env::var("INTEGRATIONS_ALLOW_PRIVATE_WEBHOOKS")
