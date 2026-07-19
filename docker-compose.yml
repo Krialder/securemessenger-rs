@@ -162,30 +162,41 @@ services:
   # ausgibt. In echt braucht coturn eine oeffentlich erreichbare Adresse
   # (external-ip) und offene UDP-Ports.
   #
-  # TURN_SHARED_SECRET ist PFLICHT (:? bricht den Start ab, wenn leer): ein
-  # coturn mit leerem Geheimnis waere ein offener Relay. Das Geheimnis wird in
-  # eine Konfigurationsdatei geschrieben und turnserver mit -c gestartet, damit
-  # es NICHT in der Prozess-Kommandozeile (ps / /proc/PID/cmdline) steht.
+  # coturn laeuft nur mit `--profile calls`. Das Geheimnis wird in eine
+  # Konfigurationsdatei geschrieben und turnserver mit -c gestartet, damit es
+  # NICHT in der Prozess-Kommandozeile (ps / /proc/PID/cmdline) steht.
+  #
+  # Das Pflicht-Geheimnis wird im ENTRYPOINT geprueft (Abbruch bei leer, sonst
+  # waere coturn ein offener Relay), NICHT per compose `:?`: `:?` wuerde die
+  # Variable schon beim Einlesen der ganzen Datei verlangen und damit auch den
+  # normalen Start OHNE Anrufe abbrechen (compose interpoliert profil-los).
   coturn:
     image: coturn/coturn:4.6
     profiles: ["calls"]
     restart: unless-stopped
     network_mode: host
     environment:
-      STATIC_AUTH_SECRET: ${TURN_SHARED_SECRET:?fuer Anrufe (Profil calls) noetig}
+      STATIC_AUTH_SECRET: ${TURN_SHARED_SECRET:-}
+      # Hinter NAT (der Server sieht seine oeffentliche Adresse nicht selbst):
+      # die oeffentliche IP setzen, damit coturn sie in den Kandidaten nennt.
+      # Direkt oeffentlich erreichbar (Proxmox-VM mit eigener IP): leer lassen.
+      EXTERNAL_IP: ${EXTERNAL_IP:-}
     entrypoint:
       - /bin/sh
       - -c
       - >
+        [ -n "$$STATIC_AUTH_SECRET" ] ||
+        { echo 'TURN_SHARED_SECRET fehlt (fuer Anrufe noetig)' >&2; exit 1; };
         umask 077 &&
-        printf '%s\n'
+        { printf '%s\n'
         'listening-ip=0.0.0.0'
         'use-auth-secret'
         "static-auth-secret=$$STATIC_AUTH_SECRET"
         'realm=securemessenger'
         'no-tls' 'no-dtls' 'no-cli'
-        'min-port=49160' 'max-port=49200'
-        > /tmp/turnserver.conf &&
+        'min-port=49160' 'max-port=49200';
+        [ -n "$$EXTERNAL_IP" ] && printf 'external-ip=%s\n' "$$EXTERNAL_IP";
+        :; } > /tmp/turnserver.conf &&
         exec turnserver -n -c /tmp/turnserver.conf
 
   kt:

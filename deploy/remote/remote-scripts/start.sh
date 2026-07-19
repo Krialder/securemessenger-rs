@@ -1,10 +1,11 @@
 #!/bin/sh
 # Startet den Stack auf dem Server und wartet auf die Healthchecks.
-# Aufruf: start.sh <zielordner> [web] [sso]
+# Aufruf: start.sh <zielordner> [web] [sso] [calls]
 # --no-build: die Images kommen fertig gebaut per docker load, der Server
-# kompiliert nie selbst.
+# kompiliert nie selbst (coturn ist ein Fremd-Image und wird gezogen wie
+# postgres/minio/keycloak).
 set -eu
-DIR="${1:?Aufruf: start.sh <zielordner> [web] [sso]}"
+DIR="${1:?Aufruf: start.sh <zielordner> [web] [sso] [calls]}"
 shift
 PROFILES=""
 EXPECTED=8
@@ -12,6 +13,8 @@ for p in "$@"; do
     case "$p" in
         web) PROFILES="$PROFILES --profile web"; EXPECTED=$((EXPECTED + 1)) ;;
         sso) PROFILES="$PROFILES --profile sso"; EXPECTED=$((EXPECTED + 1)) ;;
+        # coturn hat keinen Healthcheck; running zaehlt (wie web/keycloak).
+        calls) PROFILES="$PROFILES --profile calls"; EXPECTED=$((EXPECTED + 1)) ;;
     esac
 done
 

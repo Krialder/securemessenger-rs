@@ -66,7 +66,8 @@ $xaml = @"
         <TextBox   Grid.Row="3" Grid.Column="1" x:Name="TbDir" Text="$vDir" Margin="0,0,0,8" Padding="6,4"/>
         <StackPanel Grid.Row="4" Grid.Column="1" Orientation="Horizontal" Margin="0,4,0,0">
           <CheckBox x:Name="CbWeb" Content="Web-Client" Foreground="$($t.Text)" Margin="0,0,16,0"/>
-          <CheckBox x:Name="CbSso" Content="Keycloak (SSO)" Foreground="$($t.Text)"/>
+          <CheckBox x:Name="CbSso" Content="Keycloak (SSO)" Foreground="$($t.Text)" Margin="0,0,16,0"/>
+          <CheckBox x:Name="CbCalls" Content="Anrufe (coturn)" Foreground="$($t.Text)"/>
         </StackPanel>
       </Grid>
     </Border>
@@ -97,6 +98,7 @@ $ui = @{
     Host = $window.FindName('TbHost'); Port = $window.FindName('TbPort')
     User = $window.FindName('TbUser'); Dir = $window.FindName('TbDir')
     Web = $window.FindName('CbWeb'); Sso = $window.FindName('CbSso')
+    Calls = $window.FindName('CbCalls')
     Key = $window.FindName('BtnKey'); Deploy = $window.FindName('BtnDeploy')
     Log = $window.FindName('LogBox'); Status = $window.FindName('StatusLine')
     Progress = $window.FindName('Progress'); Window = $window
@@ -163,6 +165,7 @@ $ui.Deploy.Add_Click({
 $smArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$DeployPs1)
 if ($Web) { $smArgs += '-Web' }
 if ($Sso) { $smArgs += '-Sso' }
+if ($Calls) { $smArgs += '-Calls' }
 & powershell @smArgs 2>&1 | ForEach-Object { $Queue.Enqueue(@{ kind='log'; text = "$_" }) }
 $Queue.Enqueue(@{ kind='done'; ok = ($LASTEXITCODE -eq 0) })
 '@
@@ -171,6 +174,7 @@ $Queue.Enqueue(@{ kind='done'; ok = ($LASTEXITCODE -eq 0) })
     $ui.Job = Start-SmJob $worker @{
         Queue = $queue; DeployPs1 = $deployPs1
         Web = [bool]$ui.Web.IsChecked; Sso = [bool]$ui.Sso.IsChecked
+        Calls = [bool]$ui.Calls.IsChecked
     }
 }.GetNewClosure())
 

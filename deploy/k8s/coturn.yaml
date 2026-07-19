@@ -44,21 +44,25 @@ spec:
                   key: shared-secret
           # Das Geheimnis in eine Konfigurationsdatei schreiben und turnserver
           # mit -c starten, damit es NICHT in der Prozess-Kommandozeile
-          # (ps / /proc/PID/cmdline) steht.
+          # (ps / /proc/PID/cmdline) steht. Ein leeres Geheimnis bricht den
+          # Start ab (ein coturn ohne Geheimnis waere ein offener Relay);
+          # external-ip nur setzen, wenn vorhanden (leere Zeile verwirrt coturn).
           command:
             - /bin/sh
             - -c
             - >
+              [ -n "$STATIC_AUTH_SECRET" ] ||
+              { echo 'delivery-turn/shared-secret fehlt' >&2; exit 1; };
               umask 077 &&
-              printf '%s\n'
+              { printf '%s\n'
               'listening-ip=0.0.0.0'
               'use-auth-secret'
               "static-auth-secret=$STATIC_AUTH_SECRET"
               'realm=securemessenger'
               'no-tls' 'no-dtls' 'no-cli'
-              'min-port=49160' 'max-port=49200'
-              "external-ip=$EXTERNAL_IP"
-              > /tmp/turnserver.conf &&
+              'min-port=49160' 'max-port=49200';
+              [ -n "$EXTERNAL_IP" ] && printf 'external-ip=%s\n' "$EXTERNAL_IP";
+              :; } > /tmp/turnserver.conf &&
               exec turnserver -n -c /tmp/turnserver.conf
           resources:
             requests:

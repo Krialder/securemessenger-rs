@@ -52,7 +52,7 @@ einmaligen Schluessel-Eintrag). Alles Weitere macht das Werkzeug.
 `ServerDeploy.cmd` doppelklicken. Im Fenster:
 
 1. Server-IP, Port (meist 22), Benutzer und Zielordner eintragen; optional
-   Web-Client und/oder Keycloak anhaken.
+   Web-Client, Keycloak und/oder Anrufe (coturn) anhaken.
 2. **"1. Schluessel einrichten"** klicken: ein Konsolenfenster fragt EINMAL
    nach dem Server-Passwort und traegt danach den erzeugten SSH-Schluessel
    ein. Ab jetzt laeuft alles ueber den Schluessel, kein Passwort wird
@@ -75,6 +75,7 @@ deploy\remote\deploy.ps1 -CheckOnly
 # ausliefern und starten
 deploy\remote\deploy.ps1                       # nur die Dienste
 deploy\remote\deploy.ps1 -Web -Sso             # samt Web-Client und Keycloak
+deploy\remote\deploy.ps1 -Web -Calls           # samt Web-Client und 1:1-Anrufen (coturn)
 
 # spaeter
 deploy\remote\deploy.ps1 -Status
@@ -98,6 +99,20 @@ deploy\remote\deploy.ps1 -Stop
 - **Kein Passwort wird gespeichert.** Das lokale Verbindungsprofil
   (`profile.json`) und der SSH-Schluessel (`keys/`) sind gitignored und
   enthalten keine Server-Passwoerter.
+
+## Push und Anrufe (F1/F2) auf dem Server
+
+- **Web-Push (immer vorbereitet):** `envgen.sh` legt einen `VAPID_PRIVATE_KEY`
+  an, delivery weckt damit geschlossene Geraete. ABER: Service Worker (und
+  damit Push) brauchen im Browser **HTTPS**. Die Compose-Auslieferung serviert
+  HTTP; Push wirkt erst mit TLS an der Edge (Reverse-Proxy, siehe unten).
+- **Anrufe (opt-in mit `-Calls`):** startet zusaetzlich **coturn** (TURN-Relay)
+  und setzt `TURN_SHARED_SECRET`/`TURN_URLS` auf die Server-Adresse. Ohne
+  `-Calls` bleiben Anrufe aus (der Client blendet den Knopf aus). coturn
+  braucht **offene Ports 3478 (UDP/TCP)** und **49160-49200 (UDP)** auf dem
+  Server. Sieht der Server seine oeffentliche Adresse nicht selbst (NAT),
+  `EXTERNAL_IP=<oeffentliche-ip>` in die `.env` auf dem Server eintragen und
+  neu starten.
 
 ## Sicherheit fuer den echten Betrieb
 

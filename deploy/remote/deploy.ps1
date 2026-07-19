@@ -16,6 +16,9 @@
     deploy.ps1 -CheckOnly      nur Verbindung + Zielsystem-Bericht
     deploy.ps1                 Voll-Auslieferung
     deploy.ps1 -Web -Sso       zusaetzlich Web-Client bzw. Keycloak
+    deploy.ps1 -Calls          zusaetzlich coturn fuer 1:1-Anrufe (F2). Braucht
+                               offene Ports 3478 UDP/TCP + 49160-49200 UDP auf
+                               dem Server; bei NAT EXTERNAL_IP in der .env.
     deploy.ps1 -SkipBuild      lokalen Image-Build ueberspringen
     deploy.ps1 -NoStart        alles uebertragen, nicht starten
     deploy.ps1 -Status         Stack-Status auf dem Server
@@ -29,6 +32,7 @@ param(
     [switch]$Stop,
     [switch]$Web,
     [switch]$Sso,
+    [switch]$Calls,
     [switch]$SkipBuild,
     [switch]$NoStart,
     [string]$TargetHost,
@@ -119,7 +123,11 @@ if (-not (Publish-SmSource $p)) { exit 1 }
 if (-not (Publish-SmImages $p -Web:$Web)) { exit 1 }
 
 Write-DeployStep 'Erzeuge die .env auf dem Server (falls sie fehlt)'
-$r = Invoke-SmRemoteScript $p 'envgen.sh' $p.TargetDir
+# Mit -Calls die Server-Adresse an envgen geben: es erzeugt das TURN-Geheimnis
+# und setzt TURN_URLS auf diese Adresse (der Browser erreicht coturn dort).
+$envArgs = $p.TargetDir
+if ($Calls) { $envArgs = "$($p.TargetDir) $($p.TargetHost)" }
+$r = Invoke-SmRemoteScript $p 'envgen.sh' $envArgs
 Write-Host "    $($r.Output)"
 if (-not $r.Ok) { Write-DeployBad 'envgen fehlgeschlagen'; exit 1 }
 
@@ -132,6 +140,7 @@ Write-DeployStep 'Starte den Stack auf dem Server'
 $startArgs = $p.TargetDir
 if ($Web) { $startArgs = "$startArgs web" }
 if ($Sso) { $startArgs = "$startArgs sso" }
+if ($Calls) { $startArgs = "$startArgs calls" }
 $r = Invoke-SmRemoteScript $p 'start.sh' $startArgs
 Write-Host $r.Output
 if (-not $r.Ok) { Write-DeployBad 'Start fehlgeschlagen (Ausgabe oben; deploy.ps1 -Status fuer den Zustand)'; exit 1 }
@@ -140,4 +149,5 @@ Write-Host "`nAusgeliefert und gestartet." -ForegroundColor White
 Write-Host "    Dienste:  http://$($p.TargetHost):8080-8085 (identity, directory, delivery, kt, media, integrations)"
 if ($Web) { Write-Host "    Web:      http://$($p.TargetHost):3000" }
 if ($Sso) { Write-Host "    SSO:      http://$($p.TargetHost):8090 (Admin-Passwort in $($p.TargetDir)/.env auf dem Server)" }
+if ($Calls) { Write-Host "    Anrufe:   coturn laeuft (TURN $($p.TargetHost):3478). Ports 3478 UDP/TCP + 49160-49200 UDP oeffnen; bei NAT EXTERNAL_IP in der .env setzen." }
 Write-Host '    Status:   deploy.ps1 -Status | Stoppen: deploy.ps1 -Stop'
