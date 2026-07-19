@@ -1,6 +1,6 @@
 # Deployment
 
-Container- und Kubernetes-Definitionen für die SecureMessenger-Dienste: `identity`, `directory`, `delivery`, `integrations`, `media`, dazu Keycloak als OIDC-Provider (F060).
+Container- und Kubernetes-Definitionen für die sechs SecureMessenger-Dienste: `identity`, `directory`, `delivery`, `integrations`, `kt`, `media`, dazu Keycloak als OIDC-Provider (F060) und optional coturn für 1:1-Anrufe (F2).
 
 ## Docker-Image bauen
 
@@ -16,7 +16,7 @@ Reproduzierbarkeit (pflichtenheft.md 8.2): beide Basis-Images sind per Digest ge
 
 ## Kubernetes
 
-`k8s/` enthält je Dienst ein Deployment samt Service (Probes auf `/live` und `/ready`, zwei Repliken, Secrets für `DATABASE_URL` und `INTERNAL_TOKEN`), dazu Namespace, Ingress, NetworkPolicy und die Kustomization, die alles zusammenbindet:
+`k8s/` enthält je Dienst ein Deployment samt Service (Probes auf `/live` und `/ready`, zwei Repliken). Jeder Dienst braucht mindestens `DATABASE_URL` und `INTERNAL_TOKEN`; die dienstspezifischen Geheimnisse (etwa VAPID und TURN für `delivery`, der Webhook-Signierschlüssel für `integrations`, Sealed-Sender und CDS-OPRF für `identity`) sind in [k8s/SECRETS.md](k8s/SECRETS.md) vollständig aufgeführt. Dazu Namespace, Ingress, NetworkPolicy und die Kustomization, die alles zusammenbindet:
 
 ```
 kubectl apply -k deploy/k8s

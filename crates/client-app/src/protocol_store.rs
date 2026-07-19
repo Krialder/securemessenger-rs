@@ -407,7 +407,7 @@ mod tests {
 
     /// Der Kern-Beweis der Persistenz: eine Sitzung wird über einer Ablage
     /// aufgebaut, das Gerät verworfen und aus derselben Ablage neu
-    /// erstellt; der Ratchet läuft nahtlos weiter (die zweite Nachricht
+    /// erstellt; der Ratchet läuft ohne Bruch weiter (die zweite Nachricht
     /// ist eine normale Ratchet-Nachricht, kein zweiter Aufbau).
     #[tokio::test]
     async fn session_survives_device_reconstruction() {

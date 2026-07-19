@@ -615,7 +615,7 @@ async fn fetch(State(st): State<AppState>, headers: HeaderMap) -> Response {
 
 /// `GET /push/vapid-key`: der öffentliche VAPID-Schlüssel, den der Client als
 /// `applicationServerKey` fürs Abo braucht. 404, wenn Push aus ist (kein
-/// VAPID-Schlüssel konfiguriert) — der Client blendet die Funktion dann aus.
+/// VAPID-Schlüssel konfiguriert); der Client blendet die Funktion dann aus.
 async fn vapid_key(State(st): State<AppState>) -> Response {
     match st.push.public_key() {
         Some(public_key) => Json(VapidKeyResponse { public_key }).into_response(),
@@ -1034,8 +1034,9 @@ struct GroupStateResponse {
     devices: usize,
 }
 
-/// Gruppen-Name auf 1..=128 Zeichen begrenzen (getrimmt); leer ist erlaubt
-/// (Rückfall auf die Mitglieder-Anzeige im Client). Keine Steuerzeichen.
+/// Gruppen-Name auf höchstens 128 Zeichen begrenzen (getrimmt) und ohne
+/// Steuerzeichen. Leer ist zulässig: der Client fällt dann auf die
+/// Mitglieder-Anzeige zurück.
 fn valid_group_name(name: &str) -> bool {
     let trimmed = name.trim();
     trimmed.chars().count() <= 128 && !trimmed.chars().any(|c| c.is_control())

@@ -189,8 +189,9 @@ $Queue.Enqueue(@{ kind = 'scandone' })
 
 # Start-Codeblock: ausgewaehlte Einrichtungen erledigen, Docker-Daemon
 # sicherstellen, dann ueber sm.ps1 starten (das kuemmert sich um Datenbank,
-# Dienste, Web-Client und Browser). Der Build laeuft nur, wenn ausgewaehlt;
-# sm.ps1 wird mit -NoBuild aufgerufen, damit nichts doppelt gebaut wird.
+# Dienste, Web-Client und Browser). Aufruf mit -Web -OpenBrowser (siehe
+# unten); die Dienst-Images baut der Compose-Stack selbst nach Bedarf, einen
+# eigenen Build-Schalter gibt es seit dem Entfernen der Demo nicht mehr.
 $startWorker = @'
 . (Join-Path $ScriptsDir 'lib-checks.ps1')
 Initialize-SmEnv

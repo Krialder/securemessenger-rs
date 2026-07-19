@@ -43,7 +43,7 @@ einmaligen Schluessel-Eintrag). Alles Weitere macht das Werkzeug.
 
 > LXC-Container statt VM geht auch (leichter), muss aber "nested" und mit
 > `keyctl`/`fuse` fuer Docker konfiguriert sein; eine echte VM ist der
-> unkompliziertere, robustere Weg.
+> unkompliziertere, verlaesslichere Weg.
 
 ## Schritt 2: Ausliefern
 

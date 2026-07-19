@@ -234,7 +234,7 @@ Vor dem offiziellen Kick-off präsentiert das Team: Rollenverteilung, Methodenwa
 | M5 | Metadaten und Verifikation | Sealed Sender, KT vollständig, Safety Numbers, Contact Discovery | M6 |
 | M6 | Gruppen | MLS-Gruppen, Delivery Service gehärtet | M7 |
 | M7 | Medien und Härtung | Medienversand, Fuzzing, Property-Tests, zweites externes Audit | M8 |
-| M8 | Abnahme | Übergabe der Dokumentation und Endabnahme | — |
+| M8 | Abnahme | Übergabe der Dokumentation und Endabnahme | - |
 
 ### 7.3 Qualitätsvorgaben
 

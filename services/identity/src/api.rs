@@ -29,7 +29,7 @@ use crate::store::{AccountStore, InMemoryStore, StoreError};
 use common::rate::RateLimiter;
 
 /// Login-Versuche je Handle und Minute: bremst Credential-Stuffing gegen
-/// ein einzelnes Konto, ohne ehrliche Tipper auszusperren.
+/// ein einzelnes Konto, ohne legitime Tipper auszusperren.
 /// [ANNAHME: 10/min; das Pflichtenheft fordert strenge Limits auf Login
 /// und Registrierung, nennt aber keine Zahlen.]
 const LOGIN_RATE_LIMIT: u32 = 10;
@@ -39,7 +39,7 @@ const LOGIN_RATE_LIMIT: u32 = 10;
 const REGISTER_RATE_LIMIT: u32 = 5;
 /// Discovery-Runden je Abrufer und Minute. Die harte Bremse gegen
 /// Enumeration: ohne Kenntnis des Handles ist jeder Wert nutzlos, und
-/// mehr als eine Handvoll Auflösungen pro Minute braucht kein ehrlicher
+/// mehr als eine Handvoll Auflösungen pro Minute braucht kein legitimer
 /// Client. [ANNAHME: 20/min; die Spec fordert striktes Limit, nennt keine
 /// Zahl.]
 const DISCOVERY_RATE_LIMIT: u32 = 20;

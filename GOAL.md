@@ -6,11 +6,11 @@ Dieses Dokument ist Ziel und Arbeits-Prompt in einem. Verweise darauf mit `/goal
 
 In dieser Reihenfolge, dann `git log` und `git status`:
 
-1. `dokumentation/uebergabe-abschluss.md` — Wiedereinstieg, Verifikations-Loop, technische Fallen.
+1. `dokumentation/uebergabe-abschluss.md`: Wiedereinstieg, Verifikations-Loop, technische Fallen.
 2. `dokumentation/live-dokument.md` Abschnitt 9a: der aktuelle, verbindliche Funktionsstand (die einzige maßgebliche Status-Quelle).
-3. `ENTWICKLUNG.md` — Struktur, Bauanleitung, Endpunkt-Tabellen aller Dienste.
-4. `dokumentation/live-dokument.md` Abschnitt 10 — was in welcher Etappe entstand.
-5. `dokumentation/pflichtenheft.md`, `dokumentation/roadmap.md`, `dokumentation/specs/`, `dokumentation/entscheidungen/` — Soll-Stand und die verbindlichen Entscheidungen.
+3. `ENTWICKLUNG.md`: Struktur, Bauanleitung, Endpunkt-Tabellen aller Dienste.
+4. `dokumentation/live-dokument.md` Abschnitt 10: was in welcher Etappe entstand.
+5. `dokumentation/pflichtenheft.md`, `dokumentation/roadmap.md`, `dokumentation/specs/`, `dokumentation/entscheidungen/`: Soll-Stand und die verbindlichen Entscheidungen.
 
 ## Ist-Stand (Kurzfassung, Details in den Quellen oben)
 

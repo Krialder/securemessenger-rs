@@ -48,7 +48,7 @@ Die Antwort kann nur sein, dass A den KT-Beweis der Heimat-Instanz von B nachrec
 - A muss die signierende KT-Wurzel von `azubi-os.de` kennen und ihr trauen. Das ist der neue Vertrauensanker: eine Instanz-Allowlist mit den KT-Signierschlüsseln der föderierten Instanzen (Trust on First Use plus Sicherheitsnummern-Abgleich über einen zweiten Kanal, wie beim Geräte-Schlüsselwechsel).
 - Gegen eine Instanz, die IHREN eigenen Nutzern verschiedene Wurzeln zeigt (Split View), hilft nur unabhängiges Gossip der KT-Wurzeln zwischen Instanzen und externen Auditoren, das die Föderation gerade natürlich macht: die Instanzen können sich gegenseitig die Wurzeln bezeugen.
 
-Ehrlich: das ist erhebliche Arbeit und teils extern (Auditoren, Gossip-Betrieb), dieselben offenen Punkte wie beim einzel-instanzlichen KT, nur betreiberübergreifend zugespitzt.
+Das ist erhebliche Arbeit und teils extern (Auditoren, Gossip-Betrieb), dieselben offenen Punkte wie beim einzel-instanzlichen KT, nur betreiberübergreifend zugespitzt.
 
 ## Metadatenschutz weicht auf
 

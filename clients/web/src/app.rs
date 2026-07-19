@@ -2350,7 +2350,7 @@ async fn build_sync_envelopes(
 /// unter das Hüllen-Größenlimit der Zustellung passen (64 KiB je Hülle; hier
 /// mit Sicherheitsmarge auf 48 KiB Klartext gedeckelt, weil Verschlüsselung
 /// und Base64 noch zulegen). Bei sehr langen Chats fehlen die ältesten
-/// Zeilen; das ist die ehrliche Grenze eines einzelnen Nachzugs.
+/// Zeilen; das ist die tatsächliche Grenze eines einzelnen Nachzugs.
 fn cap_history_lines(
     peer: &str,
     lines: &[client_app::sync::HistLine],
