@@ -1,4 +1,8 @@
-//! Nutzlast-Format des Anruf-Datenkanals (`smdc.v1`).
+//! Nutzlast-Format des Anruf-Datenkanals (`smdch.v1`).
+//!
+//! Der Tag heißt bewusst `smdch` (data channel), NICHT `smdc`: `smdc.v1`
+//! bezeichnet bereits das Geräte-Credential (`account`-Modul), das andere
+//! Projekte lesen. Ein eigener Tag hält die beiden Wire-Formate auseinander.
 //!
 //! Jeder 1:1-Anruf trägt neben dem Ton einen WebRTC-Datenkanal (`sm-data`,
 //! `call`-Modul). Über ihn läuft das Live-Tippen (Paket E): während man
@@ -21,7 +25,7 @@
 
 use serde::{Deserialize, Serialize};
 
-const DATACHAN_VERSION: &str = "smdc.v1";
+const DATACHAN_VERSION: &str = "smdch.v1";
 
 #[derive(Serialize, Deserialize)]
 struct DataBlob {
@@ -50,7 +54,7 @@ pub fn encode_typing(text: &str) -> String {
 }
 
 /// Deutet eine empfangene Datenkanal-Nachricht. `None`, wenn es kein gültiges
-/// `smdc.v1` ist oder das `kind` unbekannt (dann ignorieren, nicht anzeigen).
+/// `smdch.v1` ist oder das `kind` unbekannt (dann ignorieren, nicht anzeigen).
 pub fn decode(message: &str) -> Option<DataEvent> {
     let blob: DataBlob = serde_json::from_str(message).ok()?;
     if blob.v != DATACHAN_VERSION {
@@ -89,7 +93,7 @@ mod tests {
     #[test]
     fn foreign_or_unknown_is_ignored() {
         assert_eq!(decode("kein json"), None);
-        assert_eq!(decode(r#"{"v":"smdc.v9","kind":"typing"}"#), None);
-        assert_eq!(decode(r#"{"v":"smdc.v1","kind":"poll","text":"x"}"#), None);
+        assert_eq!(decode(r#"{"v":"smdch.v9","kind":"typing"}"#), None);
+        assert_eq!(decode(r#"{"v":"smdch.v1","kind":"poll","text":"x"}"#), None);
     }
 }

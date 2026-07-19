@@ -249,29 +249,17 @@ impl KtClient {
             )));
         }
 
-        // Schritt 1: Ed25519-Signatur über die kanonische Wurzelnachricht.
+        // Schritt 1: Ed25519-Signatur über die kanonische Wurzelnachricht
+        // (dieselbe Prüfung wie verify_consistency, in verify_signed_root
+        // gekapselt; liefert direkt den 32-Byte-Wurzel-Hash).
         let verifying_key = decode_verifying_key(signing_key_b64)?;
-        let root_hash = decode_b64(&signed.root_hash, "root_hash")?;
-        let signature_bytes = decode_b64(&signed.signature, "signature")?;
-        let signature = Signature::from_slice(&signature_bytes)
-            .map_err(|error| ClientError::Decode(format!("Wurzelsignatur: {error}")))?;
-        verifying_key
-            .verify(&root_message(signed.epoch, &root_hash), &signature)
-            .map_err(|_| {
-                ClientError::KeyTransparency(format!(
-                    "Wurzelsignatur der Epoche {} verifiziert nicht",
-                    signed.epoch
-                ))
-            })?;
+        let root_hash = verify_signed_root(&signed, &verifying_key)?;
 
         // Schritt 3: der akd-Inklusionsbeweis gegen die signierte Wurzel.
         let vrf_public = decode_b64(&info.vrf_public_key, "vrf_public_key")?;
         let proof_bytes = decode_b64(&proof.proof, "proof")?;
         let lookup: akd::LookupProof = bincode::deserialize(&proof_bytes)
             .map_err(|error| ClientError::Decode(format!("Inklusionsbeweis: {error}")))?;
-        let root_hash: [u8; 32] = root_hash
-            .try_into()
-            .map_err(|_| ClientError::Decode("Wurzel-Hash hat nicht 32 Byte".to_string()))?;
         let result = akd::client::lookup_verify::<KtConfiguration>(
             &vrf_public,
             root_hash,
