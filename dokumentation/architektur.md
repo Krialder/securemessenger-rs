@@ -87,7 +87,7 @@ Die zustandslosen Dienste skalieren waagerecht. Die heißen Pfade sind Echtzeit 
 
 ## Föderation, vorbereitet aber aus
 
-Intern hat jede Identität die Form `handle@home-server`, auch wenn es vorerst nur einen Server gibt. Eine Server-zu-Server-Schnittstelle ist grob umrissen, aber abgeschaltet. Das de-riskt die Benennung, mehr nicht. Echte Föderation braucht serverübergreifende Key Transparency, Server-Discovery und S2S-Authentifizierung, und sie weicht den Metadatenschutz auf. Sie bleibt eine Option für später, Abwägung in [ADR-0001](entscheidungen/0001-hybrid-kern.md).
+Intern hat jede Identität die Form `handle@home-server`, auch wenn es vorerst nur einen Server gibt. Eine Server-zu-Server-Schnittstelle ist grob umrissen, aber abgeschaltet. Das de-riskt die Benennung, mehr nicht. Echte Föderation braucht serverübergreifende Key Transparency, Server-Discovery und S2S-Authentifizierung, und sie weicht den Metadatenschutz auf. Sie bleibt eine Option für später, Abwägung in [ADR-0001](entscheidungen/0001-hybrid-kern.md). Der ausgearbeitete Entwurf (Modell entlang MIMI, ein Hub je Gruppe, betreiberübergreifendes KT, Allowlist-Föderation) steht in [specs/foederation.md](specs/foederation.md).
 
 ## Eine Nachricht von A nach B
 
