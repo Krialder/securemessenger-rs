@@ -21,7 +21,7 @@ license.workspace = true
 
 [dependencies]
 # AEAD: frischer Nonce je seal aus dem OS-CSPRNG, Poly1305 faengt Manipulation.
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 # HKDF-SHA256 leitet aus dem 32-Byte-Geheimnis die Kanal-ID und den
 # Chiffre-Schluessel domaenengetrennt ab (RFC 5869).
 hkdf = "0.12"
