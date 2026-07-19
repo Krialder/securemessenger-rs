@@ -501,13 +501,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "chacha20"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "chacha20poly1305"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
 dependencies = [
  "aead",
- "chacha20",
+ "chacha20 0.9.1",
  "cipher",
  "poly1305",
  "zeroize",
@@ -558,7 +569,7 @@ dependencies = [
  "oprf",
  "pow",
  "proptest",
- "rand 0.9.4",
+ "rand 0.10.2",
  "reqwest",
  "sealed-cert",
  "serde",
@@ -579,7 +590,7 @@ dependencies = [
  "openmls_basic_credential",
  "openmls_rust_crypto",
  "proptest",
- "rand 0.9.4",
+ "rand 0.10.2",
  "sealed-cert",
  "tokio",
 ]
@@ -1285,7 +1296,7 @@ version = "0.1.0"
 dependencies = [
  "hmac",
  "proptest",
- "rand 0.9.4",
+ "rand 0.10.2",
  "sha2",
  "subtle",
 ]
@@ -1735,7 +1746,7 @@ dependencies = [
  "k256",
  "p256",
  "p384",
- "rand 0.8.6",
+ "rand 0.8.7",
  "rand_chacha 0.3.1",
  "rand_core 0.10.1",
  "rand_core 0.6.4",
@@ -2000,7 +2011,7 @@ dependencies = [
  "libsignal-protocol",
  "oprf",
  "pow",
- "rand 0.9.4",
+ "rand 0.10.2",
  "reqwest",
  "sealed-cert",
  "serde",
@@ -2187,7 +2198,7 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "chacha20poly1305",
- "rand 0.9.4",
+ "rand 0.10.2",
  "zeroize",
 ]
 
@@ -2219,7 +2230,7 @@ dependencies = [
  "ed25519-dalek",
  "http-body-util",
  "kt-format",
- "rand 0.9.4",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "sha2",
@@ -2913,7 +2924,7 @@ dependencies = [
  "num-integer",
  "num-iter",
  "num-traits",
- "rand 0.8.6",
+ "rand 0.8.7",
  "smallvec",
  "zeroize",
 ]
@@ -3053,7 +3064,7 @@ dependencies = [
  "ed25519-dalek",
  "openmls_traits",
  "p256",
- "rand 0.8.6",
+ "rand 0.8.7",
  "serde",
  "tls_codec",
 ]
@@ -3086,7 +3097,7 @@ dependencies = [
  "openmls_memory_storage",
  "openmls_traits",
  "p256",
- "rand 0.8.6",
+ "rand 0.8.7",
  "rand_chacha 0.3.1",
  "serde",
  "sha2",
@@ -3113,7 +3124,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 name = "oprf"
 version = "0.1.0"
 dependencies = [
- "rand 0.8.6",
+ "rand 0.10.2",
  "voprf",
 ]
 
@@ -3579,7 +3590,7 @@ dependencies = [
  "base64",
  "chacha20poly1305",
  "hkdf",
- "rand 0.9.4",
+ "rand 0.10.2",
  "sha2",
  "zeroize",
 ]
@@ -3706,9 +3717,9 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
-version = "0.8.6"
+version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ca0ecfa931c29007047d1bc58e623ab12e5590e8c7cc53200d5202b69266d8a"
+checksum = "22f6172bdec972074665ed81ed53b71da00bfc44b65a753cfde883ec4c702a1a"
 dependencies = [
  "libc",
  "rand_chacha 0.3.1",
@@ -3731,6 +3742,7 @@ version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
 dependencies = [
+ "chacha20 0.10.1",
  "getrandom 0.4.3",
  "rand_core 0.10.1",
 ]
@@ -4182,7 +4194,7 @@ name = "sealed-cert"
 version = "0.1.0"
 dependencies = [
  "libsignal-protocol",
- "rand 0.9.4",
+ "rand 0.10.2",
 ]
 
 [[package]]
@@ -4513,7 +4525,7 @@ dependencies = [
  "futures-util",
  "identity",
  "keystore",
- "rand 0.9.4",
+ "rand 0.10.2",
  "sealed-cert",
  "serde",
  "serde_json",
@@ -4539,7 +4551,7 @@ dependencies = [
  "leptos",
  "provisioning",
  "qrcode",
- "rand 0.9.4",
+ "rand 0.10.2",
  "send_wrapper",
  "serde",
  "serde_json",
@@ -4732,7 +4744,7 @@ dependencies = [
  "memchr",
  "once_cell",
  "percent-encoding",
- "rand 0.8.6",
+ "rand 0.8.7",
  "rsa",
  "serde",
  "sha1",
@@ -4771,7 +4783,7 @@ dependencies = [
  "md-5",
  "memchr",
  "once_cell",
- "rand 0.8.6",
+ "rand 0.8.7",
  "serde",
  "serde_json",
  "sha2",

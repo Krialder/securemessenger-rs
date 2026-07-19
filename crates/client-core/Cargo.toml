@@ -24,7 +24,7 @@ openmls_rust_crypto = { git = "https://github.com/openmls/openmls", rev = "47dbe
 openmls_basic_credential = { git = "https://github.com/openmls/openmls", rev = "47dbedecad0c1fd8eb5368d582250ebfcc1e1ce6" }
 # Zufall fuer Schluesselerzeugung: dieselbe rand-Major wie libsignal (0.9),
 # der eigentliche Zufall kommt aus dem OS-CSPRNG.
-rand = "0.9"
+rand = "0.10"
 
 # Browser-Ziel (wasm32-unknown-unknown): libsignal zieht getrandom 0.2 als
 # Transitivabhaengigkeit herein. Ohne Feature bricht dessen Build mit einem

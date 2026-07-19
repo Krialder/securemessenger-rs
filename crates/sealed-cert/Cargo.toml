@@ -19,4 +19,4 @@ license.workspace = true
 # Dasselbe Pin wie client-core: das Zertifikatsformat muss exakt das sein,
 # das sealed_sender_encrypt/decrypt im Client erwartet.
 libsignal-protocol = { git = "https://github.com/signalapp/libsignal", rev = "57d41c877d5a55d881fb3f52d9b16900118ee29b" }
-rand = "0.9"
+rand = "0.10"
