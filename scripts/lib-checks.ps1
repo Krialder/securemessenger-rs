@@ -44,6 +44,20 @@ function Initialize-SmEnv {
 
 function Test-SmHave($name) { return [bool](Get-Command $name -ErrorAction SilentlyContinue) }
 
+# Findet die installierte Docker-Desktop-Anwendung (Pfad zur .exe oder $null).
+# Bewusst NICHT ueber `Get-Command docker`: der CLI-Shim bleibt nach einer
+# Deinstallation im PATH zurueck, sodass eine Pruefung auf `docker` faelschlich
+# 'vorhanden' meldet, obwohl Docker Desktop weg ist. Die Anwendung selbst ist
+# das verlaessliche Signal.
+function Get-SmDockerDesktopExe {
+    foreach ($base in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if (-not $base) { continue }
+        $exe = Join-Path $base 'Docker\Docker\Docker Desktop.exe'
+        if (Test-Path $exe) { return $exe }
+    }
+    return $null
+}
+
 function Test-SmDockerDaemon {
     if (-not (Test-SmHave 'docker')) { return $false }
     try { docker info *> $null } catch { return $false }
@@ -342,15 +356,15 @@ function Get-SmComponents {
         Why = 'Container fuer PostgreSQL und die Dienst-Images'
         Optional = $false
         Check = {
-            if (Test-SmHave 'docker') { New-SmStatus 'ok' 'Client vorhanden' }
-            else { New-SmStatus 'missing' 'fehlt' }
+            if (Get-SmDockerDesktopExe) { New-SmStatus 'ok' 'installiert' }
+            else { New-SmStatus 'missing' 'nicht installiert' }
         }
         Fix = { param($log)
             & $log 'Installiere Docker Desktop ueber winget...'
             winget install -e --id Docker.DockerDesktop --accept-source-agreements --accept-package-agreements
             Initialize-SmEnv
             & $log 'Docker Desktop installiert. Eventuell ist ein Windows-Neustart noetig.'
-            return (Test-SmHave 'docker')
+            return [bool](Get-SmDockerDesktopExe)
         }
     })
 
@@ -385,8 +399,8 @@ function Get-SmComponents {
         Fix = { param($log)
             if (Test-SmDockerDaemon) { return $true }
             & $log 'Starte Docker Desktop...'
-            $dd = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
-            if (-not (Test-Path $dd)) { & $log 'Docker Desktop nicht gefunden.'; return $false }
+            $dd = Get-SmDockerDesktopExe
+            if (-not $dd) { & $log 'Docker Desktop nicht gefunden.'; return $false }
             # Haengengebliebene Prozesse eines gescheiterten Starts nehmen
             # den neuen Start sonst nicht an, und verwaiste Sockets lassen
             # ihn im Fehlerdialog sterben.
