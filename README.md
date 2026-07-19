@@ -28,7 +28,7 @@ Ohne Argument startet der Verbund im Produktionsmodus. Die Secrets zieht er aus 
 - 1:1-Chats und Gruppen, Ende-zu-Ende verschlüsselt (Double Ratchet beziehungsweise MLS nach RFC 9420).
 - Mehrere Geräte pro Konto, jedes mit eigenen Schlüsseln, dazu Self-Sync der gesendeten Nachrichten.
 - Nachrichten bearbeiten und löschen, für alle oder nur lokal.
-- Sprachanrufe zwischen zwei Browsern (WebRTC, TURN über coturn) samt Live-Tippen über den Datenkanal.
+- Sprachanrufe zwischen zwei Browsern (WebRTC, TURN über coturn) samt Live-Tippen über den Datenkanal (in Implementierung und braucht einen Server).
 - Web-Push, damit eine Nachricht auch bei geschlossenem Browser ankommt.
 - Schlüssel prüfen auf drei Wegen: Key Transparency (Selbst- und Konsistenzprüfung), Sicherheitsnummer, Warnung bei einem Schlüsselwechsel.
 - Verschlüsselte Sicherungsdatei, mit der sich ein Gerät nach einem geleerten Browser-Speicher wiederherstellen lässt.
