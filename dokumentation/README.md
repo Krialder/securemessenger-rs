@@ -1,6 +1,6 @@
 # Sichere Messaging-Plattform
 
-Verschlüsselte Kommunikation, gebaut gegen die Angreifer von heute und die von morgen. Ein Konto über Web, Mobile und Desktop, der Server bekommt nur Chiffretext zu sehen.
+Ende-zu-Ende verschlüsselte Kommunikation. Ein Konto über Web, Mobile und Desktop, der Server bekommt nur Chiffretext zu sehen. Was die Verschlüsselung im Einzelnen deckt und wo ihre Grenzen liegen, steht in [sicherheit.md](sicherheit.md).
 
 Die Plattform ist zugleich als Basis für die übrigen Ausbildungsprojekte gedacht: Sie liefert Anmeldung (SSO), Benachrichtigung und Chat als geteilte Dienste über Standard-Protokolle, damit ein Projekt wie AzubiOS sie einbindet, ohne seinen eigenen Stack zu ändern. Backend und Krypto-Core sind beide in Rust geschrieben, betrieben über Docker auf Kubernetes. Was das im Einzelnen heißt, steht im [Lastenheft](lastenheft.md) und im [Pflichtenheft](pflichtenheft.md).
 
@@ -17,7 +17,7 @@ Diese Doku ist eine Übersicht plus die Specs, an denen so ein System steht oder
 ## Was die Plattform kann
 
 - 1:1-Chats und Gruppen, Ende-zu-Ende verschlüsselt (Double Ratchet beziehungsweise MLS).
-- Schlüsselaustausch, der gegen künftige Quantencomputer hält (PQXDH, hybrid).
+- Der 1:1-Sitzungsaufbau ist gegen einen späteren Quantencomputer abgesichert (PQXDH, hybrid); die Gruppen (MLS) laufen bis auf Weiteres klassisch.
 - Mehrere Geräte pro Konto, jedes mit eigenen, ans Konto gebundenen Schlüsseln.
 - Metadaten so weit runtergedrückt, wie es geht (Sealed Sender, keine Telefonnummern).
 - Dateiversand und verschlüsselte Anrufe sind geplant, beides ein eigenes Kapitel für sich.
