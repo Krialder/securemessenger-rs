@@ -816,6 +816,28 @@ fn fanout_targets<'a>(
         .filter(move |device| device.device_id != own_device_id)
 }
 
+/// Rahmt einen fertigen MLS-Blob (Commit oder Anwendungsnachricht) als
+/// Gruppen-Hüllen an alle Roster-Geräte außer dem eigenen. Gemeinsamer
+/// Fanout-Baustein von Gruppen-Senden/Bearbeiten/Löschen, Entfernen und
+/// Verlassen; die Welcome-Hülle bleibt eigen (sie trägt zusätzlich Name und
+/// Einladenden, seal_group_invite).
+fn seal_group_fanout(
+    roster: &[RosterDevice],
+    own_device_id: &str,
+    group_id: &str,
+    blob: &[u8],
+) -> Result<Vec<GroupOutgoing>, String> {
+    fanout_targets(roster, own_device_id)
+        .map(|device| {
+            Ok(GroupOutgoing {
+                id: new_uuid(),
+                device_id: device.device_id.clone(),
+                envelope: wire::seal_group(group_id, blob).map_err(|e| e.to_string())?,
+            })
+        })
+        .collect()
+}
+
 /// Die eindeutigen Handles aus einer Leaf-Identitätsliste
 /// (`member_identities`): ein Multi-Device-Mitglied hat mehrere Leaves mit
 /// demselben Handle, für Anzeige und `members`-Parameter zählt jeder einmal.
@@ -2701,15 +2723,7 @@ async fn create_group_web(
     // Auch das Erzeugen rückt den Sende-Ratchet vor: sichern, BEVOR der
     // Chiffretext das Gerät verlässt.
     save_member_state(storage, &session.export_state()?)?;
-    let roster_fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &own_device_id)
-        .map(|device| {
-            Ok(GroupOutgoing {
-                id: new_uuid(),
-                device_id: device.device_id.clone(),
-                envelope: wire::seal_group(&group_id, &roster_blob).map_err(|e| e.to_string())?,
-            })
-        })
-        .collect::<Result<_, String>>()?;
+    let roster_fanout = seal_group_fanout(&roster, &own_device_id, &group_id, &roster_blob)?;
     delivery
         .group_messages(token, &group_id, &roster_fanout)
         .await
@@ -2749,15 +2763,7 @@ async fn send_group_payload(
     let roster = load_roster(storage, group_id)?;
     let blob = session.create_message(payload)?;
     save_member_state(storage, &session.export_state()?)?;
-    let fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &own_device_id)
-        .map(|device| {
-            Ok(GroupOutgoing {
-                id: new_uuid(),
-                device_id: device.device_id.clone(),
-                envelope: wire::seal_group(group_id, &blob).map_err(|e| e.to_string())?,
-            })
-        })
-        .collect::<Result<_, String>>()?;
+    let fanout = seal_group_fanout(&roster, &own_device_id, group_id, &blob)?;
     DeliveryClient::new(delivery_url())
         .group_messages(token, group_id, &fanout)
         .await
@@ -2855,15 +2861,7 @@ async fn remove_group_member(
     let commit = session.remove_members(&[handle.as_bytes().to_vec()])?;
 
     let delivery = DeliveryClient::new(delivery_url());
-    let commit_fanout: Vec<GroupOutgoing> = fanout_targets(&old_roster, &own_device_id)
-        .map(|device| {
-            Ok(GroupOutgoing {
-                id: new_uuid(),
-                device_id: device.device_id.clone(),
-                envelope: wire::seal_group(group_id, &commit).map_err(|e| e.to_string())?,
-            })
-        })
-        .collect::<Result<_, String>>()?;
+    let commit_fanout = seal_group_fanout(&old_roster, &own_device_id, group_id, &commit)?;
     // Senden, dann anwenden. Bei 409 oder Versandfehler wird nichts
     // gesichert: der lokale Zustand bleibt bei Epoche N (kein Fork), ein
     // Abruf wendet den Gewinner-Commit an.
@@ -2893,15 +2891,7 @@ async fn remove_group_member(
 
     let roster_blob = session.create_message(&grouptext::encode_roster(&new_roster))?;
     save_member_state(storage, &session.export_state()?)?;
-    let roster_fanout: Vec<GroupOutgoing> = fanout_targets(&new_roster, &own_device_id)
-        .map(|device| {
-            Ok(GroupOutgoing {
-                id: new_uuid(),
-                device_id: device.device_id.clone(),
-                envelope: wire::seal_group(group_id, &roster_blob).map_err(|e| e.to_string())?,
-            })
-        })
-        .collect::<Result<_, String>>()?;
+    let roster_fanout = seal_group_fanout(&new_roster, &own_device_id, group_id, &roster_blob)?;
     if !roster_fanout.is_empty() {
         // Best effort: die Empfänger heilen den Roster ohnehin selbst.
         if let Err(error) = delivery
@@ -3043,15 +3033,7 @@ async fn leave_group_web(
     let roster = load_roster(storage, group_id)?;
     let blob = session.create_message(&grouptext::encode_leave())?;
     save_member_state(storage, &session.export_state()?)?;
-    let fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &own_device_id)
-        .map(|device| {
-            Ok(GroupOutgoing {
-                id: new_uuid(),
-                device_id: device.device_id.clone(),
-                envelope: wire::seal_group(group_id, &blob).map_err(|e| e.to_string())?,
-            })
-        })
-        .collect::<Result<_, String>>()?;
+    let fanout = seal_group_fanout(&roster, &own_device_id, group_id, &blob)?;
     if !fanout.is_empty() {
         DeliveryClient::new(delivery_url())
             .group_messages(token, group_id, &fanout)

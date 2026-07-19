@@ -1098,10 +1098,18 @@ async fn drain_waiting(
         }
     }
     if !acked.is_empty() {
-        delivery
-            .ack(token, &acked)
-            .await
-            .map_err(|e| e.to_string())?;
+        // Ein Fehler beim Bestätigen darf die Nachrichten NICHT verwerfen:
+        // die Entschlüsselung hat den Ratchet schon fortgeschaltet, beim
+        // nächsten Abruf wären dieselben Hüllen unlesbar und die Inhalte
+        // endgültig verloren. Also nur warnen; die unbestätigten Hüllen räumt
+        // der nächste Abruf über den Unlesbar-Pfad oben ab (gleiche Politik
+        // wie im Web-Client).
+        if let Err(error) = delivery.ack(token, &acked).await {
+            eprintln!(
+                "Bestätigen von {} Hüllen fehlgeschlagen: {error}",
+                acked.len()
+            );
+        }
     }
     Ok(acked.len())
 }
@@ -2209,15 +2217,7 @@ async fn group_create(args: &[String]) -> Result<(), String> {
     // BEVOR der Chiffretext das Gerät verlässt (sonst nutzte ein
     // Wiederanlauf dieselbe Ratchet-Position erneut).
     save_member_state(&storage, &session.export_state()?)?;
-    let roster_fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &profile.device_id)
-        .map(|device| {
-            Ok(GroupOutgoing {
-                id: new_uuid(),
-                device_id: device.device_id.clone(),
-                envelope: wire::seal_group(&group_id, &roster_blob).map_err(|e| e.to_string())?,
-            })
-        })
-        .collect::<Result<_, String>>()?;
+    let roster_fanout = seal_group_fanout(&roster, &profile.device_id, &group_id, &roster_blob)?;
     delivery
         .group_messages(&token, &group_id, &roster_fanout)
         .await
@@ -2308,15 +2308,7 @@ async fn deliver_group_payload(group_id: &str, payload: &[u8]) -> Result<u64, St
     let roster = load_roster(&storage, group_id)?;
     let blob = session.create_message(payload)?;
     save_member_state(&storage, &session.export_state()?)?;
-    let fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &profile.device_id)
-        .map(|device| {
-            Ok(GroupOutgoing {
-                id: new_uuid(),
-                device_id: device.device_id.clone(),
-                envelope: wire::seal_group(group_id, &blob).map_err(|e| e.to_string())?,
-            })
-        })
-        .collect::<Result<_, String>>()?;
+    let fanout = seal_group_fanout(&roster, &profile.device_id, group_id, &blob)?;
     let sent = delivery_client()
         .group_messages(&token, group_id, &fanout)
         .await
@@ -2371,15 +2363,7 @@ async fn group_remove(args: &[String]) -> Result<(), String> {
 
     // Der Commit geht an ALLE bisherigen Geräte außer den eigenen, auch
     // an die des Entfernten (Erkennen + Aufräumen).
-    let commit_fanout: Vec<GroupOutgoing> = fanout_targets(&old_roster, &profile.device_id)
-        .map(|device| {
-            Ok(GroupOutgoing {
-                id: new_uuid(),
-                device_id: device.device_id.clone(),
-                envelope: wire::seal_group(group_id, &commit).map_err(|e| e.to_string())?,
-            })
-        })
-        .collect::<Result<_, String>>()?;
+    let commit_fanout = seal_group_fanout(&old_roster, &profile.device_id, group_id, &commit)?;
     // Senden, dann anwenden. Lehnt der Dienst ab (409, ein anderes
     // Mitglied war schneller) oder scheitert der Versand, wird NICHTS
     // gesichert: der lokale Zustand bleibt bei Epoche N (kein Fork), und
@@ -2420,15 +2404,7 @@ async fn group_remove(args: &[String]) -> Result<(), String> {
     // Frischer Roster an die Rest-Gruppe (best effort, siehe oben).
     let roster_blob = session.create_message(&grouptext::encode_roster(&new_roster))?;
     save_member_state(&storage, &session.export_state()?)?;
-    let roster_fanout: Vec<GroupOutgoing> = fanout_targets(&new_roster, &profile.device_id)
-        .map(|device| {
-            Ok(GroupOutgoing {
-                id: new_uuid(),
-                device_id: device.device_id.clone(),
-                envelope: wire::seal_group(group_id, &roster_blob).map_err(|e| e.to_string())?,
-            })
-        })
-        .collect::<Result<_, String>>()?;
+    let roster_fanout = seal_group_fanout(&new_roster, &profile.device_id, group_id, &roster_blob)?;
     if !roster_fanout.is_empty() {
         if let Err(error) = delivery_client()
             .group_messages(&token, group_id, &roster_fanout)
@@ -2465,15 +2441,7 @@ async fn group_leave(args: &[String]) -> Result<(), String> {
     let roster = load_roster(&storage, group_id)?;
     let blob = session.create_message(&grouptext::encode_leave())?;
     save_member_state(&storage, &session.export_state()?)?;
-    let fanout: Vec<GroupOutgoing> = fanout_targets(&roster, &profile.device_id)
-        .map(|device| {
-            Ok(GroupOutgoing {
-                id: new_uuid(),
-                device_id: device.device_id.clone(),
-                envelope: wire::seal_group(group_id, &blob).map_err(|e| e.to_string())?,
-            })
-        })
-        .collect::<Result<_, String>>()?;
+    let fanout = seal_group_fanout(&roster, &profile.device_id, group_id, &blob)?;
     if !fanout.is_empty() {
         delivery_client()
             .group_messages(&token, group_id, &fanout)
@@ -2663,6 +2631,28 @@ fn fanout_targets<'a>(
     roster
         .iter()
         .filter(move |device| device.device_id != own_device_id)
+}
+
+/// Rahmt einen fertigen MLS-Blob (Commit oder Anwendungsnachricht) als
+/// Gruppen-Hüllen an alle Roster-Geräte außer dem eigenen. Der gemeinsame
+/// Fanout-Baustein von group-send/edit/delete, group-remove und group-leave;
+/// die Welcome-Hülle bleibt eigen, weil sie zusätzlich Name und Einladenden
+/// trägt (seal_group_invite).
+fn seal_group_fanout(
+    roster: &[RosterDevice],
+    own_device_id: &str,
+    group_id: &str,
+    blob: &[u8],
+) -> Result<Vec<GroupOutgoing>, String> {
+    fanout_targets(roster, own_device_id)
+        .map(|device| {
+            Ok(GroupOutgoing {
+                id: new_uuid(),
+                device_id: device.device_id.clone(),
+                envelope: wire::seal_group(group_id, blob).map_err(|e| e.to_string())?,
+            })
+        })
+        .collect()
 }
 
 /// Verarbeitet eine eingehende Gruppen-Hülle: bekannte Gruppe -> MLS

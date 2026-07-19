@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::domain::{NewMessage, StoreOutcome, WaitingMessage};
 use crate::groups::{
-    apply_set_role, apply_transfer, apply_update_info, authorize_commit, dedup, CommitContext,
+    apply_commit, apply_set_role, apply_transfer, apply_update_info, dedup, CommitContext,
     GroupError, GroupMeta, GroupRecord, GroupSettings, GroupState, GroupStore, NewGroup, Role,
 };
 use crate::store::{MessageStore, PushSubscription, StoreError};
@@ -585,22 +585,13 @@ impl GroupStore for PgGroupStore {
         }
         let mut tx = self.pool.begin().await.map_err(group_backend)?;
         let mut record = load_record(&mut tx, gid).await?;
-        if record.epoch != ctx.expected_epoch {
-            return Err(GroupError::StaleEpoch {
-                current: record.epoch,
-            });
-        }
-        let new_handles: std::collections::HashSet<String> =
-            ctx.new_member_handles.iter().cloned().collect();
-        authorize_commit(&record, ctx.actor, &new_handles)?;
-        record.roles.retain(|h, _| new_handles.contains(h));
-        for handle in &new_handles {
-            record.roles.entry(handle.clone()).or_insert(Role::Member);
-        }
-        record.epoch += 1;
+        // Dieselbe reine Zustandsregel wie der InMemory-Store (Epoche,
+        // Autorisierung, Rollen, epoch++); nur die Geräte-/Rollen-Persistenz
+        // ist hier SQL.
+        let epoch = apply_commit(&mut record, &ctx)?;
         sqlx::query("UPDATE groups SET epoch = $2 WHERE id = $1")
             .bind(gid)
-            .bind(i64::try_from(record.epoch).unwrap_or(i64::MAX))
+            .bind(i64::try_from(epoch).unwrap_or(i64::MAX))
             .execute(&mut *tx)
             .await
             .map_err(group_backend)?;

@@ -342,6 +342,32 @@ pub(crate) fn authorize_commit(
     Ok(())
 }
 
+/// Wendet einen Mitglieder-Commit auf den geladenen Datensatz an: prüft die
+/// Epochen-Reihenfolge, autorisiert die Mitgliederänderung, führt die Rollen
+/// nach (Weggefallene raus, Neue als Member, Bestehende behalten ihre Rolle)
+/// und erhöht die Epoche. Reine Zustandsregel, von InMemory- und PG-Store
+/// geteilt, damit die Autorisierung nicht zwischen den beiden auseinander-
+/// läuft; die GERÄTE-Persistenz bleibt Sache des jeweiligen Stores (der eine
+/// hält ein Feld, der andere schreibt Zeilen). Liefert die neue Epoche.
+pub(crate) fn apply_commit(
+    record: &mut GroupRecord,
+    ctx: &CommitContext<'_>,
+) -> Result<u64, GroupError> {
+    if record.epoch != ctx.expected_epoch {
+        return Err(GroupError::StaleEpoch {
+            current: record.epoch,
+        });
+    }
+    let new_handles: HashSet<String> = ctx.new_member_handles.iter().cloned().collect();
+    authorize_commit(record, ctx.actor, &new_handles)?;
+    record.roles.retain(|h, _| new_handles.contains(h));
+    for handle in &new_handles {
+        record.roles.entry(handle.clone()).or_insert(Role::Member);
+    }
+    record.epoch += 1;
+    Ok(record.epoch)
+}
+
 pub(crate) fn dedup(devices: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
     devices
@@ -414,22 +440,9 @@ impl GroupStore for InMemoryGroupStore {
             .groups
             .get_mut(group_id)
             .ok_or(GroupError::UnknownGroup)?;
-        if record.epoch != ctx.expected_epoch {
-            return Err(GroupError::StaleEpoch {
-                current: record.epoch,
-            });
-        }
-        let new_handles: HashSet<String> = ctx.new_member_handles.iter().cloned().collect();
-        authorize_commit(record, ctx.actor, &new_handles)?;
-        // Rollen anpassen: neue werden Member, weggefallene raus. Bestehende
-        // behalten ihre Rolle.
-        record.roles.retain(|h, _| new_handles.contains(h));
-        for handle in &new_handles {
-            record.roles.entry(handle.clone()).or_insert(Role::Member);
-        }
-        record.epoch += 1;
+        let epoch = apply_commit(record, &ctx)?;
         record.devices = dedup(ctx.new_devices);
-        Ok(record.epoch)
+        Ok(epoch)
     }
 
     async fn set_role(
