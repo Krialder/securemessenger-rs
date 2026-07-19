@@ -105,10 +105,14 @@ impl VapidPushSender {
         // Keine Weiterleitungen folgen: sonst könnte ein Push-Endpoint per
         // 30x auf ein internes Ziel zeigen und den SSRF-Filter des Abos
         // umgehen (Defense-in-Depth zur Host-Prüfung beim Abonnieren).
+        // Fail-fast statt unwrap_or_default: ein nicht baubarer Client würde
+        // sonst still auf den Standard (folgt Weiterleitungen) zurückfallen
+        // und genau diese Härtung aushebeln. Gleicher Umgang wie im
+        // integrations-Gateway (integrations_client.rs).
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_default();
+            .expect("reqwest-Client baubar");
         Self {
             keys,
             subject: subject.to_string(),

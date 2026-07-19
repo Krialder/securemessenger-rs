@@ -63,12 +63,15 @@ pub fn is_blocked_host(url: &str) -> bool {
 pub fn is_internal_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
+            let o = v4.octets();
             v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_multicast()
-                || v4.octets()[0] == 0 // 0.0.0.0/8
+                || o[0] == 0 // 0.0.0.0/8
+                || (o[0] == 100 && (o[1] & 0xc0) == 0x40) // CGNAT 100.64.0.0/10 (RFC 6598)
+                || o == [255, 255, 255, 255] // limitierter Broadcast
         }
         IpAddr::V6(v6) => {
             v6.is_loopback()
@@ -107,7 +110,7 @@ fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
         ));
     }
     // v4-compatible ::/96 (veraltet): erste 96 Bit null, letzte 32 = IPv4.
-    // :: und ::1 sind schon anderweitig abgefangen; hier zaehlt die IPv4.
+    // :: und ::1 sind schon anderweitig abgefangen; hier zählt die IPv4.
     if s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
         return Some(std::net::Ipv4Addr::from(
             ((s[6] as u32) << 16) | s[7] as u32,
@@ -141,6 +144,13 @@ mod tests {
         assert!(is_blocked_host("https://foo.internal/x"));
         assert!(is_blocked_host("https://[::1]/x"));
         assert!(is_blocked_host("https://[fd00::1]/x"));
+        // CGNAT (RFC 6598) und limitierter Broadcast: manche Netze fahren dort
+        // interne Infrastruktur.
+        assert!(is_blocked_host("https://100.64.0.1/x"));
+        assert!(is_blocked_host("https://100.127.255.254/x"));
+        assert!(!is_blocked_host("https://100.63.0.1/x")); // knapp ausserhalb
+        assert!(!is_blocked_host("https://100.128.0.1/x")); // knapp ausserhalb
+        assert!(is_blocked_host("https://255.255.255.255/x"));
         assert!(is_blocked_host("nonsense"));
         // Userinfo darf den Host nicht verschleiern.
         assert!(is_blocked_host("https://fcm.googleapis.com@127.0.0.1/x"));
@@ -163,7 +173,7 @@ mod tests {
     }
 
     /// IPv6-Adressen, die eine interne IPv4 einbetten (NAT64/6to4/
-    /// v4-compatible), muessen blockiert sein: hinter einem NAT64/6to4-Gateway
+    /// v4-compatible), müssen blockiert sein: hinter einem NAT64/6to4-Gateway
     /// landet der Aufruf sonst doch am internen IPv4-Ziel.
     #[test]
     fn ipv6_embedded_internal_ipv4_is_blocked() {
@@ -179,7 +189,7 @@ mod tests {
         assert!(is_blocked_host("https://[::127.0.0.1]/x"));
         // v4-mapped ::ffff:169.254.169.254.
         assert!(is_blocked_host("https://[::ffff:169.254.169.254]/x"));
-        // Eine NAT64-Einbettung einer OEFFENTLICHEN IPv4 bleibt erlaubt.
+        // Eine NAT64-Einbettung einer ÖFFENTLICHEN IPv4 bleibt erlaubt.
         assert!(!is_blocked_host("https://[64:ff9b::808:808]/x")); // 8.8.8.8
     }
 

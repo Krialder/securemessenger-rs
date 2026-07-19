@@ -563,6 +563,20 @@ fn store_failure(error: StoreError) -> Response {
     internal()
 }
 
+/// Prüft ein Passwort gegen einen Hash auf dem Blocking-Pool (Argon2id ist
+/// bewusst teuer). Ein abgebrochener Task (Panik im Verifizierer) ist ein
+/// interner Fehler und wird als 500 zurückgegeben, NICHT still als „Passwort
+/// falsch" (401): sonst sähe ein Absturz am Login wie ein Anmeldefehler aus.
+/// Gleiche Behandlung wie in register/change_password.
+async fn verify_password_blocking(password: String, hash: String) -> Result<bool, Response> {
+    tokio::task::spawn_blocking(move || auth::verify_password(&password, &hash))
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "spawn_blocking bei der Passwortprüfung abgebrochen");
+            internal()
+        })
+}
+
 /// Meldet die aktuelle Schlüsselmenge eines Kontos ans KT-Verzeichnis,
 /// fire-and-forget im Hintergrund: die Antwort an den Client wartet nie
 /// auf kt, und ein kt-Ausfall wird nur geloggt (kt_notify.rs).
@@ -935,10 +949,10 @@ async fn login(State(st): State<AppState>, Json(req): Json<LoginRequest>) -> Res
             Err(error) => return store_failure(error),
         };
     let password = req.password;
-    let password_ok =
-        tokio::task::spawn_blocking(move || auth::verify_password(&password, &stored_hash))
-            .await
-            .unwrap_or(false);
+    let password_ok = match verify_password_blocking(password, stored_hash).await {
+        Ok(ok) => ok,
+        Err(response) => return response,
+    };
     // Geräteprüfung nach der Passwortarbeit und mit derselben generischen
     // Antwort: wer das Passwort nicht kennt, erfährt auch nichts über die
     // Gerätemenge.
@@ -1168,10 +1182,10 @@ async fn delete_account(
     };
     let password = req.password;
     let stored = account.password_hash;
-    let password_ok =
-        tokio::task::spawn_blocking(move || auth::verify_password(&password, &stored))
-            .await
-            .unwrap_or(false);
+    let password_ok = match verify_password_blocking(password, stored).await {
+        Ok(ok) => ok,
+        Err(response) => return response,
+    };
     if !password_ok {
         return api_error(
             StatusCode::UNAUTHORIZED,
