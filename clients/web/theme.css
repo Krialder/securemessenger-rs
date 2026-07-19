@@ -970,6 +970,19 @@ button:disabled {
   margin-inline-end: auto;
 }
 
+/* Live-Tipp-Vorschau im Anruf-Balken (Paket E): der Entwurf des
+   Gesprächspartners, kursiv und leiser als der Verbunden-Text, mit
+   Auslassung bei langen Entwürfen. */
+.sm-call-typing {
+  font-weight: 400;
+  font-style: italic;
+  color: var(--sm-on-surface-muted);
+  max-inline-size: 30ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Banner ueber dem Composer im Bearbeiten-Modus: sagt, dass das Senden
    jetzt ersetzt statt anhaengt, mit Abbrechen daneben. */
 .sm-edit-banner {

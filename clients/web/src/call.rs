@@ -113,16 +113,14 @@ impl CallSession {
         *self.on_closed.borrow_mut() = Some(on_closed);
     }
 
-    /// Setzt den Empfangs-Callback für Datenkanal-Nachrichten. Genutzt von
-    /// Paket E (Live-Tippen); der Datenkanal selbst wird schon hier verdrahtet.
-    #[allow(dead_code)]
+    /// Setzt den Empfangs-Callback für Datenkanal-Nachrichten (Paket E,
+    /// Live-Tippen); der Datenkanal selbst wird schon hier verdrahtet.
     pub fn set_on_data(&self, on_data: Rc<dyn Fn(String)>) {
         *self.on_data.borrow_mut() = Some(on_data);
     }
 
     /// Schickt Text über den Datenkanal (Paket E: Tipp-Anzeige). Still, wenn
     /// der Kanal noch nicht offen ist.
-    #[allow(dead_code)]
     pub fn send_data(&self, text: &str) {
         if let Some(channel) = self.data_channel.borrow().as_ref() {
             if channel.ready_state() == web_sys::RtcDataChannelState::Open {

@@ -217,6 +217,24 @@ fn save_sealed_default(storage: &SharedStorage, on: bool) {
         .put(SEALED_DEFAULT_KEY, &[u8::from(on)]);
 }
 
+/// Ablage-Schlüssel der Einstellung „Live-Tippen im Anruf" (Paket E): während
+/// eines Anrufs sieht der Gesprächspartner den Entwurf in Echtzeit. Ein Byte
+/// (0/1), bleibt über Neuladen erhalten.
+const LIVE_TYPING_KEY: &str = "settings/live_typing";
+
+fn load_live_typing(storage: &SharedStorage) -> bool {
+    storage
+        .borrow()
+        .get(LIVE_TYPING_KEY)
+        .ok()
+        .flatten()
+        .is_some_and(|bytes| bytes.first() == Some(&1))
+}
+
+fn save_live_typing(storage: &SharedStorage, on: bool) {
+    let _ = storage.borrow_mut().put(LIVE_TYPING_KEY, &[u8::from(on)]);
+}
+
 /// Ob Web-Push (Benachrichtigungen bei geschlossenem Browser) für dieses
 /// Gerät eingeschaltet ist. Persistiert, damit die App das Abo beim Start
 /// still auffrischen kann (der Push-Endpoint des Browsers kann rotieren).
@@ -3795,6 +3813,16 @@ fn App() -> impl IntoView {
     // und der Anruf hätte keinen Ton.
     let call_pending: SendWrapper<Rc<RefCell<Vec<client_app::call::Signal>>>> =
         SendWrapper::new(Rc::new(RefCell::new(Vec::new())));
+    // Live-Tippen (Paket E): ob es eingeschaltet ist (Einstellung, persistiert)
+    // und der zuletzt empfangene Entwurf des Gesprächspartners (nur während
+    // eines Anrufs; None = keine Vorschau).
+    let (live_typing, set_live_typing) = signal(false);
+    let (peer_typing, set_peer_typing) = signal(Option::<String>::None);
+    // Der Anruf-Partner, an den zuletzt ein Live-Tipp-Entwurf ging (oder None,
+    // wenn gerade nicht geteilt wird). Damit ein Verlassen des Chats dem
+    // Partner ein leeres Update schickt (Vorschau weg) und ein Betreten NICHT
+    // gleich den vorhandenen Puffer streamt.
+    let call_share_target = StoredValue::new(Option::<String>::None);
     // Die globale Blockliste (alle blockierten Handles) für die
     // Einstellungen-Ansicht; `None`, solange nicht geladen.
     let (block_list, set_block_list) = signal(Option::<Vec<String>>::None);
@@ -3963,6 +3991,7 @@ fn App() -> impl IntoView {
             let sealed = load_sealed_default(&storage);
             set_sealed_default.set(sealed);
             set_sealed_choice.set(sealed);
+            set_live_typing.set(load_live_typing(&storage));
             let push_enabled = load_push_on(&storage);
             set_push_on.set(push_enabled);
             set_logged_in.set(true);
@@ -5218,6 +5247,15 @@ fn App() -> impl IntoView {
                     set_status.set("Anruf beendet.".to_string());
                 }
             }));
+            // Live-Tippen (Paket E): der Entwurf des Gesprächspartners kommt
+            // über den Datenkanal; leerer Text blendet die Vorschau aus.
+            session.set_on_data(Rc::new(move |msg| {
+                if let Some(client_app::datachan::DataEvent::Typing { text }) =
+                    client_app::datachan::decode(&msg)
+                {
+                    set_peer_typing.set((!text.is_empty()).then_some(text));
+                }
+            }));
             let pending: Vec<_> = call_pending.borrow_mut().drain(..).collect();
             for signal in pending {
                 let session = session.clone();
@@ -5228,6 +5266,62 @@ fn App() -> impl IntoView {
             *call_session.borrow_mut() = Some(session);
         }
     };
+
+    // Endet der Anruf (Idle), die Tipp-Vorschau des Partners ausblenden, egal
+    // über welchen Weg (Auflegen, Ablehnung, Timeout, Verbindungsabbruch).
+    Effect::new(move |_| {
+        if matches!(call_ui.get(), CallUi::Idle) {
+            set_peer_typing.set(None);
+        }
+    });
+
+    // Live-Tippen: den Entwurf über den Datenkanal streamen, solange
+    // eingeschaltet UND mit dem offenen Chat gerade ein Anruf läuft. Der Effekt
+    // hört auf ALLE vier Bedingungen (Entwurf, Auswahl, Anrufzustand, Schalter),
+    // damit ein Wechsel des Kontexts sofort greift:
+    // - Innerhalb desselben Teil-Kontexts (gleicher Anruf-Partner offen): den
+    //   aktuellen Entwurf senden.
+    // - Verlässt man den Kontext (anderer Chat, Anruf-Ende, Schalter aus): dem
+    //   Partner EINMAL ein leeres Update schicken, damit seine Vorschau nicht
+    //   auf dem zuletzt geteilten Text stehen bleibt.
+    // - Betritt man den Kontext neu: NICHT den schon im Feld liegenden Puffer
+    //   streamen (der könnte für einen anderen Chat gedacht gewesen sein);
+    //   erst der nächste Tastendruck teilt. open_chat leert das Feld bei
+    //   eingeschaltetem Live-Tippen ohnehin, sodass kein Fremd-Entwurf bleibt.
+    Effect::new({
+        let call_session = call_session.clone();
+        move |_| {
+            let text = text_input.get();
+            let selected_now = selected.get();
+            let ui = call_ui.get();
+            let on = live_typing.get();
+            let target = match &ui {
+                CallUi::Active { peer, .. }
+                    if on && selected_now.as_deref() == Some(peer.as_str()) =>
+                {
+                    Some(peer.clone())
+                }
+                _ => None,
+            };
+            let previous = call_share_target.get_value();
+            if let Some(session) = call_session.borrow().as_ref() {
+                match (&previous, &target) {
+                    // Gleicher Anruf-Partner offen: den Entwurf teilen.
+                    (Some(prev), Some(cur)) if prev == cur => {
+                        session.send_data(&client_app::datachan::encode_typing(&text));
+                    }
+                    // Kontext verlassen ODER frisch betreten: Vorschau des
+                    // Partners zurücksetzen, aber den vorhandenen Puffer nicht
+                    // gleich streamen.
+                    (Some(_), _) | (None, Some(_)) => {
+                        session.send_data(&client_app::datachan::encode_typing(""));
+                    }
+                    (None, None) => {}
+                }
+            }
+            call_share_target.set_value(target);
+        }
+    });
 
     // Anruf starten (aus dem Chat-Kopf).
     let on_call_start = SendWrapper::new(Rc::new({
@@ -5465,8 +5559,14 @@ fn App() -> impl IntoView {
             // Nachricht) muss MIT weg, sonst schickte ein Enter im neuen Chat
             // ihn als neue Nachricht dorthin (Textleck über Chats). Nur der
             // Bearbeiten-Entwurf wird geleert, ein selbst getippter Entwurf
-            // ohne Bearbeiten-Modus bleibt erhalten.
-            if editing.get_untracked().is_some() {
+            // ohne Bearbeiten-Modus bleibt sonst erhalten.
+            //
+            // Bei eingeschaltetem Live-Tippen wird der Entwurf JEDOCH immer
+            // geleert: sonst könnte ein für einen anderen Chat getippter Rest
+            // im offenen Anruf-Chat weiterstreamen, sobald man ihn anfasst (das
+            // Live-Streaming schickt den ganzen Puffer). Der Entwurf ist damit
+            // im Live-Tipp-Modus pro Chat frisch.
+            if editing.get_untracked().is_some() || live_typing.get_untracked() {
                 set_text_input.set(String::new());
             }
             set_editing.set(None);
@@ -6242,6 +6342,23 @@ fn App() -> impl IntoView {
         }
     };
 
+    // Live-Tippen ein-/ausschalten (Paket E): während eines Anrufs sieht der
+    // Gesprächspartner den Entwurf in Echtzeit über den verschlüsselten
+    // Datenkanal.
+    let on_live_typing_toggle = {
+        let current_storage = current_storage.clone();
+        move |ev: web_sys::Event| {
+            let on = event_target_checked(&ev);
+            // Der Streaming-Effekt hört auf live_typing: das Ausschalten während
+            // eines Anrufs schickt dem Partner selbst ein leeres Update (seine
+            // Vorschau verschwindet), das Teilen endet also sofort.
+            set_live_typing.set(on);
+            if let Some(storage) = current_storage() {
+                save_live_typing(&storage, on);
+            }
+        }
+    };
+
     // Web-Push ein-/ausschalten: registriert (bzw. kündigt) das Browser-Abo
     // und hinterlegt es beim Dienst. Braucht die Browser-Erlaubnis; scheitert
     // das, kehrt der Haken zurück. Der Zustand wird optimistisch gesetzt und
@@ -6467,6 +6584,7 @@ fn App() -> impl IntoView {
                     let on_unblock = on_unblock.clone();
                     let on_sealed_default_toggle = on_sealed_default_toggle.clone();
                     let on_push_toggle = on_push_toggle.clone();
+                    let on_live_typing_toggle = on_live_typing_toggle.clone();
                     let on_push_history = on_push_history.clone();
                     let on_change_password = on_change_password.clone();
                     let on_backup_export = on_backup_export.clone();
@@ -6527,6 +6645,22 @@ fn App() -> impl IntoView {
                                         view! {
                                             <div class="sm-call-bar" role="status">
                                                 <span>{format!("Verbunden mit {peer}")}</span>
+                                                // Live-Tippen (Paket E): der Entwurf des
+                                                // Gesprächspartners, sobald er ihn schreibt.
+                                                {move || {
+                                                    peer_typing
+                                                        .get()
+                                                        .map(|draft| {
+                                                            view! {
+                                                                <span
+                                                                    class="sm-call-typing"
+                                                                    aria-live="polite"
+                                                                >
+                                                                    {format!("schreibt: {draft}")}
+                                                                </span>
+                                                            }
+                                                        })
+                                                }}
                                                 <button
                                                     type="button"
                                                     class="sm-secondary"
@@ -6793,6 +6927,7 @@ fn App() -> impl IntoView {
                                     let on_unblock = on_unblock.clone();
                                     let on_sealed_default_toggle = on_sealed_default_toggle.clone();
                                     let on_push_toggle = on_push_toggle.clone();
+                                    let on_live_typing_toggle = on_live_typing_toggle.clone();
                                     let on_push_history = on_push_history.clone();
                                     let on_change_password = on_change_password.clone();
                                     let on_backup_export = on_backup_export.clone();
@@ -7051,6 +7186,19 @@ fn App() -> impl IntoView {
                                                                 prop:checked=push_on
                                                                 on:change=on_push_toggle.clone()
                                                                 disabled=busy
+                                                            />
+                                                        </label>
+                                                        <label class="sm-set-row">
+                                                            <span class="sm-set-label">
+                                                                "Live-Tippen im Anruf"
+                                                                <small>
+                                                                    "Während eines Anrufs sieht der Gesprächspartner deinen Entwurf in Echtzeit entstehen (über den verschlüsselten Datenkanal des Anrufs, nicht über den Server)."
+                                                                </small>
+                                                            </span>
+                                                            <input
+                                                                type="checkbox"
+                                                                prop:checked=live_typing
+                                                                on:change=on_live_typing_toggle.clone()
                                                             />
                                                         </label>
                                                         <div class="sm-set-row">
