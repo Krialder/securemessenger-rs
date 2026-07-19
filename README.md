@@ -1,6 +1,6 @@
 # Sichere Messaging-Plattform
 
-Ein Ende-zu-Ende verschlüsselter Messenger. Die Schlüssel bleiben auf den Geräten, der Server transportiert und speichert nur Chiffretext. Ein Konto lässt sich auf mehreren Geräten nutzen. Backend und Krypto-Kern sind in Rust geschrieben und laufen als Container, lokal über Docker Compose oder auf Kubernetes.
+Ein Ende-zu-Ende verschlüsselter Messenger. Die Schlüssel bleiben auf den Geräten, der Server transportiert und speichert nur Chiffretext (Store-and-Forward-System). Ein Konto lässt sich auf mehreren Geräten nutzen. Backend und Krypto-Kern sind in Rust geschrieben und laufen als Container, lokal über Docker Compose oder auf Kubernetes.
 
 Die Plattform ist zugleich die gemeinsame Grundlage der übrigen Ausbildungsprojekte: Anmeldung (SSO), Benachrichtigung und Chat liegen als geteilte Dienste hinter Standard-Protokollen, damit ein Projekt wie AzubiOS sie einbinden kann, ohne seinen eigenen Stack umzubauen.
 
