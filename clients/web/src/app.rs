@@ -3823,6 +3823,9 @@ fn App() -> impl IntoView {
     // Partner ein leeres Update schickt (Vorschau weg) und ein Betreten NICHT
     // gleich den vorhandenen Puffer streamt.
     let call_share_target = StoredValue::new(Option::<String>::None);
+    // Ob gerade live geteilt wird (Anruf-Partner offen + eingeschaltet); für
+    // die steigende Flanke, an der der Composer geleert wird.
+    let call_was_sharing = StoredValue::new(false);
     // Die globale Blockliste (alle blockierten Handles) für die
     // Einstellungen-Ansicht; `None`, solange nicht geladen.
     let (block_list, set_block_list) = signal(Option::<Vec<String>>::None);
@@ -5275,6 +5278,27 @@ fn App() -> impl IntoView {
         }
     });
 
+    // Beim BEGINN des Teilens (steigende Flanke von „eingeschaltet + Anruf mit
+    // dem offenen Chat") den Composer leeren. So streamt nie ein Entwurf mit,
+    // der vorher für einen ANDEREN Chat getippt und beim Wechsel mitgenommen
+    // wurde (der globale Entwurf bleibt sonst über Chats erhalten). Nach dem
+    // Leeren enthält der Puffer nur noch Text, der HIER im Teilen entsteht;
+    // auch ein Stumm-Umschalten (das den Effekt erneut auslöst) kann dann
+    // nichts Fremdes mehr senden. Ein normaler Chatwechsel ohne Anruf leert
+    // nichts (die Flanke steigt nur mit laufendem Anruf).
+    Effect::new(move |_| {
+        let sharing = live_typing.get()
+            && matches!(
+                call_ui.get(),
+                CallUi::Active { ref peer, .. }
+                    if selected.get().as_deref() == Some(peer.as_str())
+            );
+        if sharing && !call_was_sharing.get_value() {
+            set_text_input.set(String::new());
+        }
+        call_was_sharing.set_value(sharing);
+    });
+
     // Live-Tippen: den Entwurf über den Datenkanal streamen, solange
     // eingeschaltet UND mit dem offenen Chat gerade ein Anruf läuft. Der Effekt
     // hört auf ALLE vier Bedingungen (Entwurf, Auswahl, Anrufzustand, Schalter),
@@ -5559,14 +5583,10 @@ fn App() -> impl IntoView {
             // Nachricht) muss MIT weg, sonst schickte ein Enter im neuen Chat
             // ihn als neue Nachricht dorthin (Textleck über Chats). Nur der
             // Bearbeiten-Entwurf wird geleert, ein selbst getippter Entwurf
-            // ohne Bearbeiten-Modus bleibt sonst erhalten.
-            //
-            // Bei eingeschaltetem Live-Tippen wird der Entwurf JEDOCH immer
-            // geleert: sonst könnte ein für einen anderen Chat getippter Rest
-            // im offenen Anruf-Chat weiterstreamen, sobald man ihn anfasst (das
-            // Live-Streaming schickt den ganzen Puffer). Der Entwurf ist damit
-            // im Live-Tipp-Modus pro Chat frisch.
-            if editing.get_untracked().is_some() || live_typing.get_untracked() {
+            // ohne Bearbeiten-Modus bleibt erhalten. (Das Leeren fürs
+            // Live-Tippen erledigt der share-Effekt, sobald man in den
+            // Anruf-Chat wechselt, damit hier keine Entwürfe ohne Anruf fallen.)
+            if editing.get_untracked().is_some() {
                 set_text_input.set(String::new());
             }
             set_editing.set(None);
