@@ -19,6 +19,7 @@ Aus einem PowerShell-Terminal im Projekt-Root (auf einem frischen Rechner mit no
 scripts\sm.ps1            # startet den Verbund als Container-Stack (docker compose, Produktionsmodus)
 scripts\sm.ps1 -Web       # zusaetzlich der Web-Client (http://localhost:3000)
 scripts\sm.ps1 -Sso       # zusaetzlich Keycloak (SSO, Port 8090)
+scripts\sm.ps1 -Calls     # zusaetzlich coturn fuer 1:1-Anrufe (F2)
 scripts\sm.ps1 -Stop      # faehrt den Stack herunter (Daten bleiben)
 scripts\sm.ps1 -Reset     # loescht vorher die Daten-Volumes (down -v)
 scripts\sm.ps1 -Setup     # richtet nur ein und aktualisiert, ohne zu starten

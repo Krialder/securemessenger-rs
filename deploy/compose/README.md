@@ -12,6 +12,7 @@ einen Container-Ausfall ab.
 scripts\sm.ps1                # Docker sicherstellen, .env erzeugen, up -d --build
 scripts\sm.ps1 -Web           # zusaetzlich der Web-Client (Port 3000)
 scripts\sm.ps1 -Sso           # zusaetzlich Keycloak (Port 8090)
+scripts\sm.ps1 -Calls         # zusaetzlich coturn fuer 1:1-Anrufe (F2)
 scripts\sm.ps1 -Stop          # herunterfahren (Daten bleiben)
 scripts\sm.ps1 -Reset         # vorher die Daten-Volumes loeschen
 ```

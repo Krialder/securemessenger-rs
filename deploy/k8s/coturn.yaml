@@ -55,7 +55,6 @@ spec:
               { echo 'delivery-turn/shared-secret fehlt' >&2; exit 1; };
               umask 077 &&
               { printf '%s\n'
-              'listening-ip=0.0.0.0'
               'use-auth-secret'
               "static-auth-secret=$STATIC_AUTH_SECRET"
               'realm=securemessenger'

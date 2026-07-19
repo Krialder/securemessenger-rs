@@ -12,6 +12,8 @@
     sm.ps1              startet den Stack (Dienste, PostgreSQL, MinIO)
     sm.ps1 -Web         zusaetzlich der Web-Client (http://localhost:3000)
     sm.ps1 -Sso         zusaetzlich Keycloak (SSO-Provider, Port 8090)
+    sm.ps1 -Calls       zusaetzlich coturn fuer 1:1-Anrufe (F2); erzeugt bei
+                        Bedarf das TURN-Geheimnis in der .env
     sm.ps1 -Stop        faehrt den Stack herunter (Daten bleiben)
     sm.ps1 -Reset       loescht vorher die Daten-Volumes (down -v)
     sm.ps1 -Setup       richtet nur ein und aktualisiert (Werkzeuge, Docker,
@@ -26,6 +28,7 @@ param(
     [switch]$Reset,
     [switch]$Sso,
     [switch]$Web,
+    [switch]$Calls,
     [switch]$OpenBrowser
 )
 
@@ -114,16 +117,18 @@ if ($Stop) {
 # bleibt unangetastet, damit Schluessel (v. a. die KT-Schluessel, die das
 # Transparenz-Log signieren) Neustarts ueberleben.
 $envFile = Join-Path $root '.env'
+# Zufalls-Helfer VOR der .env-Pruefung, damit sie auch beim Nachziehen des
+# TURN-Geheimnisses (vorhandene .env, -Calls) zur Verfuegung stehen.
+$rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+function New-RandBytes { $b = New-Object byte[] 32; $rng.GetBytes($b); return $b }
+function New-Seed { return [Convert]::ToBase64String((New-RandBytes)) }
+function New-Hex  { return -join ((New-RandBytes) | ForEach-Object { $_.ToString('x2') }) }
+# base64url ohne Padding: das Format des VAPID-Privatschluessels (delivery
+# liest ihn per URL_SAFE_NO_PAD). 32 zufaellige Bytes sind mit
+# ueberwaeltigender Wahrscheinlichkeit ein gueltiger P-256-Skalar.
+function New-SeedUrl { return (New-Seed).TrimEnd('=').Replace('+', '-').Replace('/', '_') }
 if (-not (Test-Path $envFile)) {
     Write-Step 'Erzeuge .env mit starken Zufallswerten (einmalig)'
-    $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
-    function New-RandBytes { $b = New-Object byte[] 32; $rng.GetBytes($b); return $b }
-    function New-Seed { return [Convert]::ToBase64String((New-RandBytes)) }
-    function New-Hex  { return -join ((New-RandBytes) | ForEach-Object { $_.ToString('x2') }) }
-    # base64url ohne Padding: das Format des VAPID-Privatschluessels (delivery
-    # liest ihn per URL_SAFE_NO_PAD). 32 zufaellige Bytes sind mit
-    # ueberwaeltigender Wahrscheinlichkeit ein gueltiger P-256-Skalar.
-    function New-SeedUrl { return (New-Seed).TrimEnd('=').Replace('+', '-').Replace('/', '_') }
     @(
         "POSTGRES_PASSWORD=$(New-Hex)"
         "INTERNAL_TOKEN=$(New-Hex)"
@@ -143,6 +148,26 @@ if (-not (Test-Path $envFile)) {
     Write-Ok '.env vorhanden'
 }
 
+# Anrufe sind opt-in: das TURN-Geheimnis wird nur mit -Calls erzeugt (sonst
+# wuerde delivery Anrufe anbieten, obwohl coturn gar nicht laeuft). Fehlt es
+# in einer vorhandenen .env, hier nachziehen (wie envgen.sh beim Server).
+# TURN_URLS zeigen auf localhost: coturn faehrt mit network_mode host, zwei
+# Browser-Tabs auf DIESEM Rechner bauen darueber einen Anruf auf.
+if ($Calls) {
+    $envText = if (Test-Path $envFile) { Get-Content $envFile -Raw } else { '' }
+    if ($envText -notmatch '(?m)^TURN_SHARED_SECRET=.+$') {
+        Write-Step 'Ergaenze das TURN-Geheimnis fuer Anrufe in .env'
+        Add-Content -Path $envFile -Encoding ascii -Value @(
+            "TURN_SHARED_SECRET=$(New-Hex)"
+            'TURN_URLS=stun:localhost:3478,turn:localhost:3478?transport=udp'
+        )
+        Write-Ok 'TURN_SHARED_SECRET und TURN_URLS in .env ergaenzt'
+    }
+    else {
+        Write-Ok 'TURN-Geheimnis in .env vorhanden'
+    }
+}
+
 # Der Entwicklungs-Container sm-postgres (Test-Datenbanken fuer cargo test)
 # belegt sonst Port 5432; der Stack bringt seine eigene Datenbank mit.
 docker stop sm-postgres *> $null
@@ -155,6 +180,7 @@ if ($Reset) {
 $composeArgs = @()
 if ($Sso) { $composeArgs += @('--profile', 'sso') }
 if ($Web) { $composeArgs += @('--profile', 'web') }
+if ($Calls) { $composeArgs += @('--profile', 'calls') }
 Write-Step 'Stack bauen und starten (docker compose up -d --build; erster Build dauert)'
 docker compose @composeArgs up -d --build
 $ok = ($LASTEXITCODE -eq 0)
@@ -168,6 +194,7 @@ Write-Ok 'Stack laeuft. Status: docker compose ps'
 Write-Host '    Dienste: identity 8080, directory 8081, delivery 8082, kt 8083, media 8084, integrations 8085'
 if ($Web) { Write-Host '    Web:     http://localhost:3000' }
 if ($Sso) { Write-Host '    SSO:     http://localhost:8090 (Admin-Passwort in der .env)' }
+if ($Calls) { Write-Host '    Anrufe:  coturn laeuft (TURN localhost:3478); zwei Browser-Tabs auf diesem Rechner koennen anrufen' }
 Write-Host "    CLI:     $root\target\debug\sm.exe (Referenzclient; bauen mit cargo build -p sm-cli)"
 Write-Host '    Stoppen: scripts\sm.ps1 -Stop'
 
