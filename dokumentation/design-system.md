@@ -1,8 +1,8 @@
 # Design-System des Web-Clients
 
-Dieses Dokument hält die Design-Entscheidungen für die Oberfläche des Web-Clients fest, damit sie prüfbar und übertragbar sind, statt in einzelnen CSS-Zeilen verstreut zu leben. Es ist aus einer belegten Recherche destilliert (WCAG 2.2, die Designsysteme von Google, Apple, Microsoft und IBM, die Usability-Forschung von Nielsen Norman und die Security-UX-Literatur), jede belastbare Zahl gegengeprüft. Wo Quellen sich widersprachen, steht die getroffene Entscheidung samt Begründung.
+Dieses Dokument hält die Design-Entscheidungen für die Oberfläche des Web-Clients fest, damit sie prüfbar und übertragbar sind, statt in einzelnen CSS-Zeilen verstreut zu leben. Die Quellen sind WCAG 2.2, die Designsysteme von Google, Apple, Microsoft und IBM, die Usability-Forschung von Nielsen Norman und die Security-UX-Literatur. Wo Quellen sich widersprachen, steht die getroffene Entscheidung samt Begründung.
 
-Der Leitgedanke ist derselbe wie im Rest des Projekts: nachprüfbar statt behauptet. Barrierefreiheit ist hier kein Versprechen im Fließtext, sondern ein automatischer Test (die Kontrast-Prüfung, unten), der die Modi bei jeder Änderung gegen die WCAG-Schwellen hält.
+Barrierefreiheit hängt hier an einem automatischen Test: die Kontrast-Prüfung (unten) hält die Modi bei jeder Änderung gegen die WCAG-Schwellen.
 
 ## Zielniveau: WCAG 2.2 Stufe AA
 
@@ -40,7 +40,7 @@ Modus-Design nach der Dark-Mode-Literatur: Dunkel-Basis **#121212** (nicht reine
 
 **FOUC-Guard:** Weil der Client als Leptos-CSR erst nach dem WASM-Download mountet, würde ohne Vorkehrung sekundenlang der Default-Modus aufblitzen. Ein winziges Inline-Skript im `<head>` liest die gespeicherte Wahl beziehungsweise `matchMedia` und setzt `data-theme`, bevor das WASM lädt.
 
-## Kontrast als Abnahmekriterium, nicht als Behauptung
+## Kontrast als Abnahmekriterium
 
 Die zentrale Entscheidung, die „barrierefrei" prüfbar macht: [`clients/web/tests/contrast.rs`](../clients/web/tests/contrast.rs) liest `theme.css`, extrahiert je Modus die Token-Werte und rechnet für jedes bedeutungstragende Farb-Paar das WCAG-2.x-Kontrastverhältnis nach (relative Luminanz mit sRGB-Linearisierung, Verhältnis (L1+0.05)/(L2+0.05)). Unterschreitet ein Paar in irgendeinem Modus seine Schwelle (4.5:1 für Text, 3:1 für Nicht-Text), schlägt der Test fehl. So kann ein späterer Farb-Tweak die Modi nicht unbemerkt brechen, und ein Drittprojekt sieht beim Import sofort, ob seine Werte tragen.
 
@@ -54,7 +54,7 @@ Die zentrale Entscheidung, die „barrierefrei" prüfbar macht: [`clients/web/te
 
 ## Einstellungen: eine Seite, gruppiert, ohne tote Knöpfe
 
-Die Einstellungen sind eine eigene Ansicht im Haupt-Bereich (Zugang über die Seitenleisten-Fußzeile, „Zurück" führt in die Chats). Sie bündeln, was zentral gehört, und lassen am Feature, was häufig und kontextnah genutzt wird. Jede Entscheidung aus der nachgeprüften Leitlinien-Recherche:
+Die Einstellungen sind eine eigene Ansicht im Haupt-Bereich (Zugang über die Seitenleisten-Fußzeile, „Zurück" führt in die Chats). Sie bündeln, was zentral gehört, und lassen am Feature, was häufig und kontextnah genutzt wird. Die einzelnen Entscheidungen:
 
 - **Eine scrollende Seite mit Abschnitts-Überschriften, keine Unter-Tabs.** Der Umfang liegt klar unter der 15-Punkte-Schwelle, ab der Material und die Android-Guidance Unterseiten empfehlen (bis ~7 flache Liste, ab ~7 Gruppen mit Überschriften, ab ~15 Unterseiten). Abschnitte sind `section` mit `aria-label`, keine ARIA-Tabs: echte In-Page-Tabs verlangten das volle APG-Muster (Pfeiltasten, `role="tablist"`), und die Abschnitte sind nichts, was man über Tabs hinweg vergleicht (NN/g-Kriterium gegen Tabs).
 - **Reihenfolge: häufig geändertes zuerst, dann logisch gruppiert** (Material: „show the most important or frequently used settings upfront"): Darstellung, Konto, Sicherheit, Geräte, Blockierte Kontakte, Benachrichtigungen.
@@ -72,4 +72,12 @@ Die Einstellungen sind eine eigene Ansicht im Haupt-Bereich (Zugang über die Se
 
 ## Verweise
 
-Standards und Quellen (Auswahl, alle in der Recherche gegengeprüft): W3C WCAG 2.2 Recommendation und die Understanding-Dokumente der genannten SC; Material Design 3 (Color roles, tonal palettes); Apple Human Interface Guidelines (Dark Mode, semantic colors); Microsoft Fluent 2 (Design tokens); IBM Carbon (Token-Ebenen, Themes); Nielsen Norman Group (10 Usability-Heuristiken, Antwortzeit-Grenzen); die Security-Indicator-Forschung (Whitten/Tygar, Akhawe/Felt, Herley) und die CHI-Studien zu Fingerprint-Vergleichsverfahren.
+Standards und Quellen (Auswahl):
+
+- W3C WCAG 2.2 Recommendation und die Understanding-Dokumente der genannten SC.
+- Material Design 3 (Color roles, tonal palettes).
+- Apple Human Interface Guidelines (Dark Mode, semantic colors).
+- Microsoft Fluent 2 (Design tokens).
+- IBM Carbon (Token-Ebenen, Themes).
+- Nielsen Norman Group (10 Usability-Heuristiken, Antwortzeit-Grenzen).
+- Security-Indicator-Forschung (Whitten/Tygar, Akhawe/Felt, Herley) und die CHI-Studien zu Fingerprint-Vergleichsverfahren.

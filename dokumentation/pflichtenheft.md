@@ -150,7 +150,13 @@ Ein Konto hängt an einem eindeutigen Handle, der Anzeigename ist davon getrennt
 
 Sessions laufen über kurzlebige Access-Token und rotierende Refresh-Token (F020). RBAC (F050) setzt der Identitäts-Dienst durch und prüft die Edge-Schicht bei jeder Anfrage.
 
-**Kompromittierung des Wurzelschlüssels.** Der Konto-Identitätsschlüssel ist die Wurzel des Vertrauensbaums, sein Verlust ist der härteste Fall. Der Recovery-Pfad: Eine Kompromittierung wird über eine Revocation als eigener Eintrag in der Konto-Historie der Key Transparency öffentlich gemacht, sodass Kontakte den alten Schlüssel als ungültig sehen. Ein neuer Wurzelschlüssel wird ausgestellt, alle Geräte-Credentials werden neu signiert, und die Safety Numbers gegenüber allen Kontakten werden zurückgesetzt, was bei diesen eine sichtbare Re-Verifikation auslöst. Solange der alte Schlüssel nur abgelaufen und nicht kompromittiert ist, signiert er den neuen (Übergabekette). Bei echter Kompromittierung fehlt diese Kette, weshalb hier eine Out-of-band-Bestätigung nötig ist. Die genaue Mechanik dieses Falls steht in [specs/geraete-identitaet.md](specs/geraete-identitaet.md) und gehört zum Audit-Umfang.
+**Kompromittierung des Wurzelschlüssels.** Der Konto-Identitätsschlüssel ist die Wurzel des Vertrauensbaums, sein Verlust ist der härteste Fall. Der Recovery-Pfad:
+
+1. Eine Revocation als eigener Eintrag in der Konto-Historie der Key Transparency macht die Kompromittierung öffentlich, sodass Kontakte den alten Schlüssel als ungültig sehen.
+2. Ein neuer Wurzelschlüssel wird ausgestellt, alle Geräte-Credentials werden neu signiert.
+3. Die Safety Numbers gegenüber allen Kontakten werden zurückgesetzt, was bei diesen eine sichtbare Re-Verifikation auslöst.
+
+Solange der alte Schlüssel nur abgelaufen und nicht kompromittiert ist, signiert er den neuen (Übergabekette). Bei echter Kompromittierung fehlt diese Kette, weshalb hier eine Out-of-band-Bestätigung nötig ist. Die genaue Mechanik dieses Falls steht in [specs/geraete-identitaet.md](specs/geraete-identitaet.md) und gehört zum Audit-Umfang.
 
 ### 5.2 Basis-Dienste für andere Projekte (F060 bis F100)
 
@@ -160,9 +166,15 @@ Dieses Modul macht aus dem Messenger ein Fundament. Hier sind drei Begriffe saub
 
 **SSO über einen erprobten OIDC-Provider (F060).** Der Anmeldedienst wird nicht selbst implementiert. OIDC sicher und vollständig umzusetzen (Token-Signaturen, Flows, Schlüsselrotation, Angriffsklassen wie Token-Replay und Mix-up) ist ein eigenes Sicherheitsfeld, und das Leitprinzip „kein Eigenbau bei Sicherheit" gilt hier genauso wie bei der Krypto. Deshalb kommt ein gehärteter Standard-Provider zum Einsatz (Default: Keycloak), betrieben als eigener Dienst im Cluster, an den der Identitäts-Dienst seine Konten anbindet. Der Trade-off ist bewusst: Es kommt eine zweite Laufzeit (JVM) hinzu, was dem Ein-Sprachen-Ziel widerspricht. Der Gewinn an Sicherheit und Wartbarkeit wiegt das auf. **[ANNAHME: Keycloak als Default. Ein eigener Rust-OIDC-Dienst bliebe eine Option, falls die JVM-Laufzeit betrieblich unerwünscht ist; diese Wahl ist vor M3 final zu bestätigen.]**
 
-**SSO als Single Point of Failure.** Weil alle abhängigen Projekte über diesen Dienst anmelden, legt sein Ausfall sie alle lahm. Drei Maßnahmen federn das ab: Der OIDC-Provider läuft redundant mit mehreren Repliken (kein einzelner Pod), er bekommt das strengere Verfügbarkeitsziel aus NF060 (99,9 Prozent), und die ausgestellten Tokens haben eine Gültigkeit, die einen kurzen Ausfall überbrückt, sodass bereits angemeldete Nutzer in den Fremdprojekten nicht sofort hinausfliegen (NF160). Da die Fremdprojekte unantastbar sind, liegt diese Resilienz allein auf der Messenger-Seite.
+**SSO als Single Point of Failure.** Weil alle abhängigen Projekte über diesen Dienst anmelden, legt sein Ausfall sie alle lahm. Drei Maßnahmen federn das ab:
 
-**Benachrichtigungen, ehrlich abgegrenzt (F070).** Eine Benachrichtigung von AzubiOS (etwa „Bericht freigegeben") kommt von einem Server, nicht von einem Nutzer. Sie kann darum nicht dieselbe Ende-zu-Ende-Eigenschaft haben wie ein Nutzer-Chat, weil der Absender eine Maschine ist. Daraus folgt die Konstruktion: System-Benachrichtigungen laufen über einen getrennten Kanal, klar als Maschinen-Benachrichtigung markiert, mit minimalem Inhalt. Der Hinweis trägt nur „AzubiOS: neue Aktivität", die Details holt der Nutzer im Fremdprojekt selbst. So bleibt der vertrauliche Chat sauber getrennt von der Maschinen-Benachrichtigung, und der Server lernt aus dem Benachrichtigungstext nichts Sensibles.
+- Der OIDC-Provider läuft redundant mit mehreren Repliken, kein einzelner Pod.
+- Er bekommt das strengere Verfügbarkeitsziel aus NF060 (99,9 Prozent).
+- Die ausgestellten Tokens haben eine Gültigkeit, die einen kurzen Ausfall überbrückt, sodass bereits angemeldete Nutzer in den Fremdprojekten nicht sofort hinausfliegen (NF160).
+
+Da die Fremdprojekte unantastbar sind, liegt diese Resilienz allein auf der Messenger-Seite.
+
+**Benachrichtigungen, klar abgegrenzt (F070).** Eine Benachrichtigung von AzubiOS (etwa „Bericht freigegeben") kommt von einem Server, nicht von einem Nutzer. Sie kann darum nicht dieselbe Ende-zu-Ende-Eigenschaft haben wie ein Nutzer-Chat, weil der Absender eine Maschine ist. Daraus folgt die Konstruktion: System-Benachrichtigungen laufen über einen getrennten Kanal, klar als Maschinen-Benachrichtigung markiert, mit minimalem Inhalt. Der Hinweis trägt nur „AzubiOS: neue Aktivität", die Details holt der Nutzer im Fremdprojekt selbst. So bleibt der vertrauliche Chat sauber getrennt von der Maschinen-Benachrichtigung, und der Server lernt aus dem Benachrichtigungstext nichts Sensibles.
 
 **Präsenz-Abruf (F080).** Ein Fremdprojekt fragt den Online-Status eines Nutzers über eine rate-limitierte REST-Schnittstelle ab, soweit der Nutzer das in seinen Einstellungen erlaubt.
 
@@ -176,11 +188,15 @@ Jedes Gerät hinterlegt einen Prekey-Pool, klassisch und post-quantum (rund 100 
 
 Key Transparency führt ein prüfbares Log aller Schlüssel. Der Client gleicht jeden ausgelieferten Schlüssel automatisch gegen einen Inklusionsbeweis ab (F120). Safety Numbers erlauben den manuellen Abgleich, ein Schlüsselwechsel löst eine sichtbare Warnung aus (F130).
 
-**Auditor-Governance gegen den Split-View.** Die Client-Selbstprüfung fängt ab Phase 1 jeden offenen Schlüsseltausch. Den Split-View (der Server zeigt verschiedenen Leuten verschiedene Verzeichnisse) fängt erst die Auditor- und Gossip-Schicht. Damit dieser Schutz nicht an einer offenen Governance-Frage hängt, gilt ein gestufter Default: Client-Gossip (Clients und Auditoren vergleichen ihre signierten Wurzeln) ist ab Phase 3 verbindlicher Mindestschutz, weil er ohne externe Organisation auskommt. Ein unabhängiger externer Auditor (Hochschule, Verein oder zweite Instanz) ist das erklärte Ziel und wird angestrebt, sobald verfügbar. Solange er fehlt, wird im Bedrohungsmodell ehrlich ausgewiesen, dass der Split-View-Schutz reduziert ist. **[OFFENE FRAGE: Wer betreibt den unabhängigen Auditor.]**
+**Auditor-Governance gegen den Split-View.** Die Client-Selbstprüfung fängt ab Phase 1 jeden offenen Schlüsseltausch. Den Split-View (der Server zeigt verschiedenen Leuten verschiedene Verzeichnisse) fängt erst die Auditor- und Gossip-Schicht. Damit dieser Schutz nicht an einer offenen Governance-Frage hängt, gilt ein gestufter Default: Client-Gossip (Clients und Auditoren vergleichen ihre signierten Wurzeln) ist ab Phase 3 verbindlicher Mindestschutz, weil er ohne externe Organisation auskommt. Ein unabhängiger externer Auditor (Hochschule, Verein oder zweite Instanz) ist das erklärte Ziel und wird angestrebt, sobald verfügbar. Solange er fehlt, weist das Bedrohungsmodell aus, dass der Split-View-Schutz reduziert ist. **[OFFENE FRAGE: Wer betreibt den unabhängigen Auditor.]**
 
 ### 5.4 Nachrichten (F140 bis F170)
 
-Der Sitzungsaufbau läuft über PQXDH (hybrid aus X25519 und ML-KEM-768), die laufende Sitzung über Double Ratchet plus den post-quantum Anteil SPQR (F140). Die hybride Bindung beider Anteile ist die heikelste Stelle und wird 1:1 aus der libsignal-Spec übernommen, nicht selbst konstruiert; sie ist Schwerpunkt des ersten externen Audits (NF050). Gruppen laufen über MLS (RFC 9420) mit OpenMLS (F150) und sind klassisch, bis der PQ-Combiner in OpenMLS landet. Die Zustellung ist store-and-forward bis zur Abholung, idempotent über eine client-erzeugte ID (F160). Sealed Sender verbirgt den Absender, die Sende-Berechtigung wird über ein anonymes Credential geprüft, ohne dass der Server das Absenderkonto lernt (F170).
+- **Sitzungsaufbau und laufende Sitzung (F140).** Der Sitzungsaufbau läuft über PQXDH (hybrid aus X25519 und ML-KEM-768), die laufende Sitzung über Double Ratchet plus den post-quantum Anteil SPQR.
+- **Hybride Bindung (NF050).** Die Bindung beider Anteile ist die heikelste Stelle und wird 1:1 aus der libsignal-Spec übernommen, nicht selbst konstruiert; sie ist Schwerpunkt des ersten externen Audits.
+- **Gruppen (F150).** Gruppen laufen über MLS (RFC 9420) mit OpenMLS und sind klassisch, bis der PQ-Combiner in OpenMLS landet.
+- **Zustellung (F160).** store-and-forward bis zur Abholung, idempotent über eine client-erzeugte ID.
+- **Sealed Sender (F170).** Verbirgt den Absender, die Sende-Berechtigung wird über ein anonymes Credential geprüft, ohne dass der Server das Absenderkonto lernt.
 
 ### 5.5 Medien, Kontaktsuche, Echtzeit (F180 bis F200)
 

@@ -107,23 +107,29 @@ Missbrauch mit verhältnismäßigen, verschlüsselungs-treuen Mitteln".
 **Option A: E2EE als Invariante halten, keine Scan-Fähigkeit bauen.**
 Server behält nur Metadaten-Abwehr und Nutzer-Meldung (Abschnitt 4).
 Solange die E2EE-Ausnahme (1.0) gilt und 2.0 nicht in Kraft ist, besteht
-keine Scan-Pflicht. Pro: konsistent mit dem Sicherheitsversprechen und der
-DSGVO-Datensparsamkeit, keine Angriffsfläche durch clientseitiges Scannen,
-deckungsgleich mit den ADRs. Contra: Rechtsrisiko, falls eine bindende
-Anordnung (CSAR 2.0 oder OSA-S.121-Notice) doch kommt.
+keine Scan-Pflicht.
+
+- Pro: konsistent mit dem Sicherheitsversprechen und der
+  DSGVO-Datensparsamkeit, keine Angriffsfläche durch clientseitiges
+  Scannen, deckungsgleich mit den ADRs.
+- Contra: Rechtsrisiko, falls eine bindende Anordnung (CSAR 2.0 oder
+  OSA-S.121-Notice) doch kommt.
 
 **Option B: "Detection-ready" bauen (umschaltbares clientseitiges Scannen).**
-Pro: schnelle Konformität, falls eine Pflicht kommt. Contra: baut genau die
-Hintertür, die das Bedrohungsmodell ausschließt; bricht E2EE, schafft eine
-große Missbrauchs-/Angriffsfläche und widerspricht den
-Grundsatz-Entscheidungen. Für einen sicherheits-zuerst-Messenger NICHT
-empfohlen.
+
+- Pro: schnelle Konformität, falls eine Pflicht kommt.
+- Contra: baut genau die Hintertür, die das Bedrohungsmodell ausschließt;
+  bricht E2EE, schafft eine große Missbrauchs-/Angriffsfläche und
+  widerspricht den Grundsatz-Entscheidungen.
+
+Für einen sicherheits-zuerst-Messenger NICHT empfohlen.
 
 **Option C: Jurisdiktions- und Marktzuschnitt.** Betrieb bewusst auf den
 realen Zielmarkt (DE/EU-B2B-Ausbildung) begrenzen und den UK-Consumer-Markt
-(OSA-S.121-Risiko) meiden. Pro: pragmatisch, hält E2EE, passt zum
-tatsächlichen Einsatz. Contra: begrenzt die Reichweite, erfordert
-Beobachtung von CSAR 2.0.
+(OSA-S.121-Risiko) meiden.
+
+- Pro: pragmatisch, hält E2EE, passt zum tatsächlichen Einsatz.
+- Contra: begrenzt die Reichweite, erfordert Beobachtung von CSAR 2.0.
 
 ## 6. Empfehlung (als Beschlussvorlage, nicht als Beschluss)
 

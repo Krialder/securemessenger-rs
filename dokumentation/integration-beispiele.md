@@ -1,15 +1,17 @@
 # Integrations-Beispiele in mehreren Sprachen
 
-Fertige Schnipsel fuer die drei oeffentlichen Endpunkte (Token holen,
-benachrichtigen, Praesenz abfragen). Sie ergaenzen den [Integrations-Leitfaden](integration-leitfaden.md) (Schritt fuer Schritt) und die [OpenAPI-Spezifikation](openapi-integrations.yaml) (maschinenlesbar). Der Token-Endpunkt ist ein standardkonformer OAuth2-Client-Credentials-Grant, deshalb bindet jede Sprache mit ihren Bordmitteln an, ohne Sonderprotokoll.
+Fertige Schnipsel für die drei öffentlichen Endpunkte (Token holen,
+benachrichtigen, Präsenz abfragen). Sie ergänzen den [Integrations-Leitfaden](integration-leitfaden.md) (Schritt für Schritt) und die [OpenAPI-Spezifikation](openapi-integrations.yaml) (maschinenlesbar). Der Token-Endpunkt ist ein standardkonformer OAuth2-Client-Credentials-Grant, deshalb bindet jede Sprache mit ihren Bordmitteln an, ohne Sonderprotokoll.
 
-Ersetze `BASE`, `CLIENT_ID` und das Secret durch die Werte, die dir der Betrieb genannt hat. Das Secret gehoert in eine Umgebungsvariable oder einen Secret-Store, nie in den Quelltext und nie in einen Browser (der Fluss ist Server-zu-Server).
+Ersetze `BASE`, `CLIENT_ID` und das Secret durch die Werte, die dir der Betrieb genannt hat. Das Secret gehört in eine Umgebungsvariable oder einen Secret-Store, nie in den Quelltext und nie in einen Browser (der Fluss ist Server-zu-Server).
 
 ## Gemeinsame Regeln
 
-- **Token zwischenspeichern:** Ein Token laeuft eine Stunde (`expires_in`). Hol nicht vor jedem Aufruf ein neues, sondern erst, wenn das alte fast ablaeuft. Alle Beispiele unten cachen es mit etwas Vorlauf (60 Sekunden).
-- **Enges Token:** Brauchst du an einer Stelle nur `notify`, dann frag `scope=notify` an. Das ausgestellte Token kann dann keine Praesenz abfragen (Least Privilege), ein Leck bleibt begrenzt.
-- **Fehler:** `401` heisst „Token weg oder falsch", dann einmal neu holen. `429` heisst „zu schnell", dann die im Header `Retry-After` genannten Sekunden warten. Entscheide bei den API-Aufrufen anhand des Feldes `code`, beim Token-Tausch anhand von `error`.
+- **Token zwischenspeichern:** Ein Token läuft eine Stunde (`expires_in`). Hol nicht vor jedem Aufruf ein neues, sondern erst, wenn das alte fast abläuft. Alle Beispiele unten cachen es mit etwas Vorlauf (60 Sekunden).
+- **Enges Token:** Brauchst du an einer Stelle nur `notify`, dann frag `scope=notify` an. Das ausgestellte Token kann dann keine Präsenz abfragen (Least Privilege), ein Leck bleibt begrenzt.
+- **Fehler:** Entscheide bei den API-Aufrufen anhand des Feldes `code`, beim Token-Tausch anhand von `error`.
+  - `401`: Token weg oder falsch, dann einmal neu holen.
+  - `429`: zu schnell, dann die im Header `Retry-After` genannten Sekunden warten.
 
 ## cURL (zum Ausprobieren)
 
@@ -135,7 +137,7 @@ async function isOnline(handle) {
 }
 ```
 
-## PHP (nur cURL, ohne Composer-Abhaengigkeit)
+## PHP (nur cURL, ohne Composer-Abhängigkeit)
 
 ```php
 <?php
@@ -179,9 +181,9 @@ function notify(string $handle, string $title): array {
 }
 ```
 
-## Webhook empfangen und die Signatur pruefen (Node)
+## Webhook empfangen und die Signatur prüfen (Node)
 
-Wer statt zu pollen einen Webhook registriert (siehe Leitfaden, Abschnitt Webhooks), bekommt bei jeder Praesenz-Aenderung einen signierten `POST`. Der Empfaenger holt den oeffentlichen Schluessel einmal von `GET $BASE/integrations/webhook-key`, cacht ihn und prueft damit die Ed25519-Signatur ueber die kanonische Nachricht `{timestamp}.{body}`.
+Wer statt zu pollen einen Webhook registriert (siehe Leitfaden, Abschnitt Webhooks), bekommt bei jeder Präsenz-Änderung einen signierten `POST`. Der Empfänger holt den öffentlichen Schlüssel einmal von `GET $BASE/integrations/webhook-key`, cacht ihn und prüft damit die Ed25519-Signatur über die kanonische Nachricht `{timestamp}.{body}`.
 
 ```javascript
 const http = require("http");
@@ -234,4 +236,4 @@ openapi-generator-cli generate \
   -o out/messenger-client
 ```
 
-Der erzeugte Client kennt die drei Endpunkte, die Modelle (`NotifyRequest`, `NotifyResponse`, `PresenceResponse`) und die beiden Sicherheitsschemata (Bearer fuer die API, HTTP-Basic fuer den Token-Tausch) bereits. Das OAuth2-Token holst du wie oben und setzt es als Bearer.
+Der erzeugte Client kennt die drei Endpunkte, die Modelle (`NotifyRequest`, `NotifyResponse`, `PresenceResponse`) und die beiden Sicherheitsschemata (Bearer für die API, HTTP-Basic für den Token-Tausch) bereits. Das OAuth2-Token holst du wie oben und setzt es als Bearer.

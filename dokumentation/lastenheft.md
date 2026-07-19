@@ -35,19 +35,26 @@ Der SecureMessenger unterscheidet sich bewusst von einem reinen Chat-Werkzeug. E
 
 ### 2.1 Gegenstand des Dokuments
 
-Das Dokument spezifiziert die Funktionen, Schnittstellen und Rahmenbedingungen, die für eine erfolgreiche Umsetzung nötig sind. Es ist die objektive Vorgabe für das Projektteam und beschreibt die Erwartung der Ausbildungsleitung. Wie diese Vorgaben technisch umgesetzt werden, beantwortet das zugehörige Pflichtenheft.
+Das Dokument spezifiziert die Funktionen, Schnittstellen und Rahmenbedingungen, die für die Umsetzung nötig sind. Es ist die Vorgabe für das Projektteam und beschreibt die Erwartung der Ausbildungsleitung. Wie diese Vorgaben technisch umgesetzt werden, beantwortet das zugehörige Pflichtenheft.
 
 ### 2.2 Projektkontext
 
-Der SecureMessenger entsteht im Rahmen der IT-Ausbildung, wird aber auf produktivem Niveau gebaut und betrieben. Erstens entsteht ein echtes Produkt mit echtem Nutzen, nämlich eine vertrauliche Kommunikation und ein gemeinsamer Identitäts- und Benachrichtigungsdienst für die Abteilung. Zweitens durchlaufen die Beteiligten den vollen Software-Lebenszyklus an einem sicherheitskritischen System: Anforderungsanalyse, Kryptografie aus geprüften Bibliotheken, containerisierte Entwicklung, Deployment auf Kubernetes und ein begleitendes Bedrohungsmodell.
+Der SecureMessenger entsteht im Rahmen der IT-Ausbildung, wird aber auf produktivem Niveau gebaut und betrieben. Dafür gibt es zwei Gründe:
 
-Wer ein verschlüsseltes Messaging-System baut, arbeitet an einem realen Gegenstand, an dem sichtbar wird, warum Eigenbau-Kryptografie ausgeschlossen ist, warum nachprüfbare Schlüssel und nachprüfbare Programmdateien zusammengehören und warum ein externes Sicherheitsaudit vor dem Produktivbetrieb zwingend ist.
+- **Ein Produkt mit konkretem Nutzen.** Es entstehen eine vertrauliche Kommunikation und ein gemeinsamer Identitäts- und Benachrichtigungsdienst für die Abteilung.
+- **Der volle Lebenszyklus an einem sicherheitskritischen System.** Die Beteiligten durchlaufen Anforderungsanalyse, Kryptografie aus geprüften Bibliotheken, containerisierte Entwicklung, Deployment auf Kubernetes und ein begleitendes Bedrohungsmodell.
+
+An einem verschlüsselten Messaging-System wird zugleich sichtbar, warum drei Regeln dieses Projekts gelten:
+
+- Eigenbau-Kryptografie ist ausgeschlossen.
+- Nachprüfbare Schlüssel und nachprüfbare Programmdateien gehören zusammen.
+- Ein externes Sicherheitsaudit vor dem Produktivbetrieb ist zwingend.
 
 ### 2.3 Abgrenzung des Projekts
 
 Das System ist für den internen Gebrauch der IT-Abteilung am RKI BBW vorgesehen. Folgende Grenzen gelten für die erste Ausbaustufe:
 
-- **Föderation ist vorbereitet, aber abgeschaltet.** Es gibt zunächst einen Betreiber. Das schützt Metadaten am besten und hält die Komplexität klein. Föderation ist später kein bloßer Schalter, sondern eine eigene Vertrauenstopologie (siehe ADR-0001).
+- **Föderation ist vorbereitet, aber abgeschaltet.** Es gibt zunächst einen Betreiber. Bei einem einzelnen Betreiber fallen weniger Metadaten an als in einem Verbund, und die Komplexität bleibt klein. Föderation ist später kein bloßer Schalter, sondern eine eigene Vertrauenstopologie (siehe ADR-0001).
 - **Gruppen sind noch nicht post-quantum.** Die 1:1-Kommunikation ist über PQXDH gegen künftige Quantencomputer abgesichert, MLS-Gruppen folgen erst, wenn der Post-Quantum-Standard reif ist.
 - **Komfort-Backup über eine Enclave (Secure Value Recovery) kommt nach dem Fundament und nur unter den Bedingungen aus NF120.** Bis dahin sichern Nutzer ihren Recovery-Key selbst.
 - **Die übrigen Ausbildungsprojekte sind unantastbar.** Der SecureMessenger passt sich an deren bestehende Schnittstellen an. Er verlangt von ihnen keine Änderung an Code, Datenmodell oder Betriebsumgebung.
@@ -108,7 +115,7 @@ Die folgenden Rahmenbedingungen sind verbindlich.
 
 ### 4.3 Ziele des Betreibers
 
-- **Vertraulichkeit, die hält.** Inhalte bleiben dem Betreiber, dem Netzwerk und so weit wie möglich einem künftigen Quantenangreifer verborgen.
+- **Vertraulichkeit gegenüber Betreiber und Netzwerk.** Inhalte bleiben dem Betreiber, dem Netzwerk und so weit wie möglich einem künftigen Quantenangreifer verborgen.
 - **Querschnittsdienste einmal bauen.** Identität, Benachrichtigung und Chat entstehen einmal sauber und werden von allen Projekten genutzt, statt überall neu und schwächer.
 - **Ein gemeinsamer Betriebsstandard.** Der SecureMessenger setzt das Muster für containerisierten, reproduzierbaren Betrieb auf Kubernetes, an dem sich Folgeprojekte ausrichten können.
 - **Belegbare Betriebsgüte.** Verfügbarkeit, Latenz und Zustellzuverlässigkeit sind als Service Level Objectives definiert und werden gemessen, nicht behauptet.
@@ -121,7 +128,7 @@ Die folgenden Rahmenbedingungen sind verbindlich.
 
 **Für die Administration:** ein einheitlicher, beobachtbarer Betrieb auf vorhandener Hardware, mit Backups, die ohne Klartext-Risiko auskommen, weil gelöscht wird, indem Schlüssel vernichtet werden.
 
-**Für andere Projekte:** drei fertige Dienste (Identität, Benachrichtigung, Chat) und ein erprobtes Deployment-Muster, sofort einbindbar.
+**Für andere Projekte:** drei fertige Dienste (Identität, Benachrichtigung, Chat) und ein erprobtes Deployment-Muster.
 
 ### 4.5 Exemplarische Anwendungsszenarien (Vorher / Nachher)
 
@@ -158,7 +165,7 @@ Die Anforderungen sind nach Modul gruppiert und durchnummeriert. Sie beschreiben
 
 ### 5.2 Modul: Basis-Dienste für andere Projekte
 
-Dieses Modul ist der Kern der Basis-Rolle. Es macht den SecureMessenger zum Fundament für die übrigen Projekte, ohne dass diese sich ändern müssen.
+Über dieses Modul binden die übrigen Projekte den SecureMessenger ein, ohne sich selbst zu ändern.
 
 - **F060 Single Sign-on (SSO):** Bereitstellung eines OpenID-Connect-konformen Anmeldedienstes, an den andere Projekte ihre Anmeldung delegieren. Ein Konto für alle Abteilungs-Werkzeuge.
 - **F070 Benachrichtigungs-Schnittstelle:** Eine authentifizierte Schnittstelle, über die ein Drittprojekt eine Benachrichtigung an einen Nutzer auslöst, die dieser in Echtzeit auf seinem Gerät erhält.
@@ -208,7 +215,9 @@ Dieses Modul ist der Kern der Basis-Rolle. Es macht den SecureMessenger zum Fund
 - **NF090 Modularität und Wartbarkeit:** Jeder Dienst ist einzeln deploy- und austauschbar. Ein Dienst-Ausfall degradiert das System, statt es zu stoppen.
 - **NF100 Beobachtbarkeit:** Strukturierte Logs nach stdout, niemals mit Nachrichteninhalt. Metriken im Prometheus-Format, Health-Probes je Dienst, verteiltes Tracing über die Dienstgrenzen.
 - **NF110 Datensicherung:** Tägliche automatisierte Backups. Backups sind verschlüsselt, das Entschlüsselungs-Geheimnis liegt nicht beim Betreiber. Wiederherstellung wird regelmäßig getestet (Restore-Test), ein ungetestetes Backup gilt nicht als Backup.
-- **NF120 On-Premise mit benannten Ausnahmen:** Alle Kern-Dienste und die gesamte Datenhaltung laufen On-Premise auf der RKI-BBW-Infrastruktur, ohne Cloud-Abhängigkeit. Zwei Ausnahmen sind technisch unvermeidbar und werden bewusst zugelassen und dokumentiert: (1) Mobiler Push über APNs und FCM, der nur das Gerät weckt und keinen Inhalt trägt; für Android wird UnifiedPush als Alternative geprüft. (2) Eine spätere Secure-Value-Recovery-Funktion, die eine vertrauenswürdige Enclave braucht; sie ist optional, aufgeschoben und nur unter Threshold-Vertrauen über mehrere unabhängige Anbieter sowie mit ausdrücklicher Genehmigung der Ausbildungsleitung zulässig. Bis dahin bleibt der nutzergehaltene Recovery-Key der Standard.
+- **NF120 On-Premise mit benannten Ausnahmen:** Alle Kern-Dienste und die gesamte Datenhaltung laufen On-Premise auf der RKI-BBW-Infrastruktur, ohne Cloud-Abhängigkeit. Zwei Ausnahmen sind technisch unvermeidbar und werden bewusst zugelassen und dokumentiert:
+  1. Mobiler Push über APNs und FCM, der nur das Gerät weckt und keinen Inhalt trägt; für Android wird UnifiedPush als Alternative geprüft.
+  2. Eine spätere Secure-Value-Recovery-Funktion, die eine vertrauenswürdige Enclave braucht; sie ist optional, aufgeschoben und nur unter Threshold-Vertrauen über mehrere unabhängige Anbieter sowie mit ausdrücklicher Genehmigung der Ausbildungsleitung zulässig. Bis dahin bleibt der nutzergehaltene Recovery-Key der Standard.
 
 ### 6.3 Betriebsgüte, Resilienz und Reaktion
 
@@ -221,7 +230,14 @@ Dieses Modul ist der Kern der Basis-Rolle. Es macht den SecureMessenger zum Fund
 
 ### 7.1 Strategie zur Umsetzung
 
-Vor dem offiziellen Kick-off präsentiert das Team: Rollenverteilung, Methodenwahl mit Begründung, ein Grobkonzept mit Mockups für die Clients und einen eigenen Projektplan. Eine Besonderheit dieses Projekts ist die vorgeschaltete Spec-Phase: Die kryptografisch heiklen Teile werden spezifiziert, bevor der erste Produktivcode entsteht. Der externe Review dieser Specs blockiert nicht den Code-Start, sondern den Produktivbetrieb; er läuft spätestens mit dem ersten externen Audit zusammen (Entscheidung vom 02.07.2026, ADR-0008 der Umsetzungsdoku).
+Vor dem offiziellen Kick-off präsentiert das Team:
+
+- die Rollenverteilung,
+- die Methodenwahl mit Begründung,
+- ein Grobkonzept mit Mockups für die Clients,
+- einen eigenen Projektplan.
+
+Dem Bau ist eine Spec-Phase vorgeschaltet: Die kryptografisch heiklen Teile werden spezifiziert, bevor der erste Produktivcode entsteht. Der externe Review dieser Specs blockiert nicht den Code-Start, sondern den Produktivbetrieb; er läuft spätestens mit dem ersten externen Audit zusammen (Entscheidung vom 02.07.2026, ADR-0008 der Umsetzungsdoku).
 
 ### 7.2 Strategische Meilensteine
 

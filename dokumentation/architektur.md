@@ -67,11 +67,23 @@ flowchart TB
 | Kontaktsuche | Löst Handles per OPRF zu Konten auf, ohne den Suchverlauf preiszugeben, siehe [specs/contact-discovery.md](specs/contact-discovery.md). |
 | Push | Weckt mobile Geräte über APNs und FCM. |
 
-Datenhaltung: PostgreSQL (pro Dienst ein Schema, die Nachrichtentabelle nach Monat partitioniert, geshardet nach Konto-ID), Redis für Presence und Zähler, ein Objektspeicher für Medien, eine NATS-Queue fürs Fanout, dazu der Merkle-Store der Key Transparency.
+Datenhaltung:
+
+- PostgreSQL: pro Dienst ein Schema, die Nachrichtentabelle nach Monat partitioniert, geshardet nach Konto-ID.
+- Redis: Presence und Zähler.
+- Objektspeicher: Medien.
+- NATS-Queue: Fanout.
+- Merkle-Store: Key Transparency.
 
 ## Der Messenger als Basis für andere Projekte
 
-Der Kern stellt drei Querschnittsdienste so bereit, dass andere Projekte sie über Standard-Protokolle einbinden, ohne ihren Stack zu ändern. Anmeldung läuft über OpenID Connect, Benachrichtigung und Präsenz über eine mandantenfähige REST-Schnittstelle, Chat über ein einbettbares Modul. Eine wichtige Grenze gehört dazu: Eine Benachrichtigung von einem Fremdprojekt kommt von einem Server, nicht von einem Nutzer, und kann darum nicht Ende-zu-Ende verschlüsselt sein. Sie läuft über einen getrennten, klar markierten Kanal mit minimalem Inhalt, damit der vertrauliche Chat davon sauber getrennt bleibt. Die Schnittstellen stehen in [schnittstellen.md](schnittstellen.md), das Konzept im [pflichtenheft.md](pflichtenheft.md).
+Der Kern stellt drei Querschnittsdienste über Standard-Protokolle bereit, damit andere Projekte sie einbinden, ohne ihren Stack zu ändern:
+
+- Anmeldung über OpenID Connect.
+- Benachrichtigung und Präsenz über eine mandantenfähige REST-Schnittstelle.
+- Chat über ein einbettbares Modul.
+
+Eine Grenze gehört dazu: Eine Benachrichtigung von einem Fremdprojekt kommt von einem Server, nicht von einem Nutzer, und kann darum nicht Ende-zu-Ende verschlüsselt sein. Sie läuft über einen getrennten, klar markierten Kanal mit minimalem Inhalt, damit der vertrauliche Chat davon sauber getrennt bleibt. Die Schnittstellen stehen in [schnittstellen.md](schnittstellen.md), das Konzept im [pflichtenheft.md](pflichtenheft.md).
 
 ## Was der Server trotzdem sieht
 
@@ -79,7 +91,11 @@ Der Kern stellt drei Querschnittsdienste so bereit, dass andere Projekte sie üb
 
 ## Die teuren Pfade
 
-Post-Quantum ist nicht gratis. Ein ML-KEM-768-Schlüssel ist rund 1,2 KB statt der 32 Byte bei X25519, ein PQXDH-Handshake entsprechend schwerer. Das macht das Schlüssel-Verzeichnis zum Ziel: Wer Prekey-Bündel in Masse abfragt, erzeugt Last und leert Vorräte. Gegenmittel sind Rate-Limits pro Abrufer, ein Pool von etwa 100 Einmal-Prekeys je Gerät mit Nachfüllen ab 20 verbleibenden, und atomare Konsumierung mit `FOR UPDATE SKIP LOCKED`, damit zwei gleichzeitige Abrufe nicht denselben Einmal-Prekey ziehen.
+Post-Quantum ist nicht gratis. Ein ML-KEM-768-Schlüssel ist rund 1,2 KB statt der 32 Byte bei X25519, ein PQXDH-Handshake entsprechend schwerer. Das macht das Schlüssel-Verzeichnis zum Ziel: Wer Prekey-Bündel in Masse abfragt, erzeugt Last und leert Vorräte. Gegenmittel:
+
+- Rate-Limits pro Abrufer.
+- Ein Pool von etwa 100 Einmal-Prekeys je Gerät, Nachfüllen ab 20 verbleibenden.
+- Atomare Konsumierung mit `FOR UPDATE SKIP LOCKED`, damit zwei gleichzeitige Abrufe nicht denselben Einmal-Prekey ziehen.
 
 ## Skalierung
 

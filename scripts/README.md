@@ -7,7 +7,12 @@ Skripte, um die Entwicklungsumgebung einzurichten und die Dienste plus Web-Clien
 
 ## SecureMessenger.cmd (grafisch, ein Fenster für alles)
 
-`SecureMessenger.cmd` öffnet `scripts/sm-gui.ps1`, eine WPF-Oberfläche im Stil des Web-Clients (Segoe UI, das App-Blau `#0078D7`, abgerundete Ecken). Beim Öffnen prüft sie automatisch die ganze Umgebung und zeigt je Punkt den Zustand (Werkzeuge, Docker, Datenbank, Build). Was fehlt oder veraltet ist, bekommt eine vorausgewählte Haken-Auswahl `installieren`/`aktualisieren` (auch schwere Werkzeuge wie Rust, MSVC, WSL, Docker, damit dieses eine Fenster auch die Erstinstallation übernimmt). Ein Klick auf den Hauptknopf erledigt die Auswahl und startet danach den Container-Stack samt Web-Client (`http://localhost:3000`). Ein `Beenden`-Knopf hält die laufende Umgebung wieder an.
+`SecureMessenger.cmd` öffnet `scripts/sm-gui.ps1`, eine WPF-Oberfläche im Stil des Web-Clients (Segoe UI, das App-Blau `#0078D7`, abgerundete Ecken). Der Ablauf im Fenster:
+
+1. **Prüfen:** Beim Öffnen prüft die Oberfläche automatisch die ganze Umgebung und zeigt je Punkt den Zustand (Werkzeuge, Docker, Datenbank, Build).
+2. **Auswählen:** Was fehlt oder veraltet ist, bekommt eine vorausgewählte Haken-Auswahl `installieren`/`aktualisieren`. Das schließt schwere Werkzeuge wie Rust, MSVC, WSL und Docker ein, damit dieses eine Fenster auch die Erstinstallation übernimmt.
+3. **Starten:** Ein Klick auf den Hauptknopf erledigt die Auswahl und startet danach den Container-Stack samt Web-Client (`http://localhost:3000`).
+4. **Anhalten:** Ein `Beenden`-Knopf hält die laufende Umgebung wieder an.
 
 Die langen Schritte (winget, cargo build) laufen in einem Hintergrund-Runspace und melden über eine synchronisierte Warteschlange an einen DispatcherTimer, damit die Oberfläche nie einfriert. Der eigentliche Start läuft über `sm.ps1` (dieselbe eine Startlogik wie die Konsole).
 

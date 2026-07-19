@@ -20,7 +20,13 @@ Das KT-Commitment pro Konto deckt die aktuelle Menge gültiger Geräte-Credentia
 
 Der Wurzelschlüssel ist der heikelste Punkt im ganzen Baum. Fällt er, ist alles darunter offen. Die Rotation läuft als Übergabekette: Ein neuer Wurzelschlüssel wird vom alten signiert, alle Geräte-Credentials werden neu ausgestellt, und der Wechsel landet als eigener Eintrag in der Konto-Historie der Key Transparency, sodass Kontakte ihn sehen und prüfen.
 
-Der schwere Fall ist die Kompromittierung statt des bloßen Ablaufs, weil dann die Übergabekette fehlt: Ein Angreifer mit dem alten Schlüssel könnte selbst eine scheinbar gültige Rotation signieren. Der skizzierte Pfad dafür: Die Kompromittierung wird über eine Revocation als eigener Eintrag in der Konto-Historie öffentlich gemacht, sodass Kontakte den alten Schlüssel als ungültig sehen. Der neue Wurzelschlüssel kann sich nicht auf den alten stützen, also braucht es eine Out-of-band-Bestätigung, und die Safety Numbers gegenüber allen Kontakten werden zurückgesetzt, was bei diesen eine sichtbare Re-Verifikation auslöst. Die genaue Mechanik (wie die Out-of-band-Bestätigung verankert wird, ohne ein neues Vertrauensproblem zu schaffen) ist noch festzulegen und gehört zum Audit-Umfang.
+Der schwere Fall ist die Kompromittierung statt des bloßen Ablaufs, weil dann die Übergabekette fehlt: Ein Angreifer mit dem alten Schlüssel könnte selbst eine scheinbar gültige Rotation signieren. Der skizzierte Pfad dafür:
+
+1. Eine Revocation macht die Kompromittierung als eigenen Eintrag in der Konto-Historie öffentlich, sodass Kontakte den alten Schlüssel als ungültig sehen.
+2. Der neue Wurzelschlüssel kann sich nicht auf den alten stützen, also braucht es eine Out-of-band-Bestätigung.
+3. Die Safety Numbers gegenüber allen Kontakten werden zurückgesetzt, was bei diesen eine sichtbare Re-Verifikation auslöst.
+
+Die genaue Mechanik (wie die Out-of-band-Bestätigung verankert wird, ohne ein neues Vertrauensproblem zu schaffen) ist noch festzulegen und gehört zum Audit-Umfang.
 
 ## Cross-Signing
 

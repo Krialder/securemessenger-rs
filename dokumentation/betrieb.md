@@ -2,11 +2,20 @@
 
 ## Deployment
 
-Die Rust-Dienste laufen auf Kubernetes, jeder als eigenes Deployment mit eigener Autoskalierung, davor ein Ingress als Edge mit TLS. Gebaut wird jeder Dienst als schlankes Docker-Image über einen Multi-Stage-Build, die Runtime-Stage statisch gegen musl gelinkt. Die zustandsbehafteten Teile (PostgreSQL, Redis, Objektspeicher, NATS und der KT-Merkle-Store) laufen über erprobte Operatoren statt von Hand, weil Backup, Failover und Upgrades sonst zur Daueraufgabe werden. Der Cluster selbst liegt auf dem Proxmox-Verbund, eine Cloud-Abhängigkeit wird vermieden. Multi-Region kommt später.
+- **Dienste:** jeder Rust-Dienst ist ein eigenes Kubernetes-Deployment mit eigener Autoskalierung, davor ein Ingress als Edge mit TLS.
+- **Images:** je Dienst ein Docker-Image aus einem Multi-Stage-Build, die Runtime-Stage statisch gegen musl gelinkt.
+- **Zustand:** PostgreSQL, Redis, Objektspeicher, NATS und der KT-Merkle-Store laufen über erprobte Operatoren statt von Hand, weil Backup, Failover und Upgrades sonst zur Daueraufgabe werden.
+- **Cluster:** der Proxmox-Verbund, damit wir keine Cloud-Abhängigkeit eingehen. Multi-Region kommt später.
 
 ## Warum Rust für die Dienste
 
-Die Dienste sind in Rust geschrieben, auch die Realtime-Schicht. Drei Gründe tragen das. Erstens teilt das Backend so die Sprache mit dem Krypto-Core (libsignal, OpenMLS), womit Wire-Typen und Tests geteilt werden und kein Kontextwechsel zwischen zwei Laufzeiten nötig ist. Zweitens schließt Rust eine ganze Klasse von Speicherfehlern zur Compile-Zeit aus, ohne Garbage-Collector-Pausen, was bei vielen offenen WebSocket-Verbindungen zählt. Drittens trägt das Async-Ökosystem um tokio die nebenläufige Last, axum die REST-Schicht und tokio-tungstenite die WebSockets. Elixir auf der BEAM war historisch eine Option für Presence und Fanout (WhatsApp skaliert so), scheidet hier aber aus, weil eine zweite Laufzeit dem Ein-Sprachen-Vorteil widerspräche.
+Die Dienste sind in Rust geschrieben, auch die Realtime-Schicht. Drei Gründe tragen das:
+
+1. Das Backend teilt die Sprache mit dem Krypto-Core (libsignal, OpenMLS). Wire-Typen und Tests gelten dadurch für beide Seiten, und niemand wechselt zwischen zwei Laufzeiten hin und her.
+2. Rust schließt eine ganze Klasse von Speicherfehlern zur Compile-Zeit aus, ohne Garbage-Collector-Pausen. Das zählt bei vielen offenen WebSocket-Verbindungen.
+3. Das Async-Ökosystem trägt die nebenläufige Last: tokio den Kern, axum die REST-Schicht, tokio-tungstenite die WebSockets.
+
+Elixir auf der BEAM war historisch eine Option für Presence und Fanout (WhatsApp skaliert so), scheidet hier aber aus, weil eine zweite Laufzeit dem Ein-Sprachen-Vorteil widerspräche.
 
 ## Der Krypto-Core im Betrieb
 
@@ -16,7 +25,13 @@ Die Krypto läuft auf den Clients, nicht im Backend. Fürs Backend heißt das: k
 
 Die zustandslosen Dienste skalieren waagerecht. Die heißen Pfade Echtzeit und Zustellung skalieren unabhängig. Presence liegt in Redis mit gebündelten Updates, das Fanout läuft über NATS.
 
-Der Sonderfall ist das Schlüssel-Verzeichnis. PQXDH-Handshakes sind teuer, ML-KEM-Schlüssel rund 1,2 KB, und der Prekey-Pool ist erschöpfbar. Dagegen brauchen wir Rate-Limits pro Abrufer, den Pool von rund 100 Einmal-Prekeys mit Nachfüllen ab 20, und die atomare Konsumierung aus dem [Datenmodell](datenmodell.md). Auch die Epochen-Berechnung der Key Transparency ist Last und bekommt einen eigenen Pfad.
+Der Sonderfall ist das Schlüssel-Verzeichnis: PQXDH-Handshakes sind teuer, ML-KEM-Schlüssel rund 1,2 KB, und der Prekey-Pool ist erschöpfbar. Dagegen stehen drei Maßnahmen:
+
+- Rate-Limits pro Abrufer.
+- Ein Pool von rund 100 Einmal-Prekeys, Nachfüllen ab 20.
+- Atomare Konsumierung, siehe [Datenmodell](datenmodell.md).
+
+Auch die Epochen-Berechnung der Key Transparency ist Last und bekommt einen eigenen Pfad.
 
 ## Echtzeit-Zustellung
 
@@ -32,7 +47,7 @@ Strukturierte Logs nach stdout, niemals mit Nachrichteninhalt. Metriken im Prome
 
 ## Service Level Objectives
 
-Die Betriebsgüte wird gemessen, nicht behauptet. Je SLO gibt es einen Service Level Indicator aus den Metriken, plus ein Fehlerbudget als erlaubten Rest bis zum Ziel.
+Je SLO gibt es einen Service Level Indicator aus den Metriken, plus ein Fehlerbudget als erlaubten Rest bis zum Ziel.
 
 | SLO | Indikator | Ziel | Fehlerbudget |
 |-----|-----------|------|--------------|

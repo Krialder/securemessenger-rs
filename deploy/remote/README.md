@@ -57,10 +57,14 @@ einmaligen Schlüssel-Eintrag). Alles Weitere macht das Werkzeug.
    nach dem Server-Passwort und trägt danach den erzeugten SSH-Schlüssel
    ein. Ab jetzt läuft alles über den Schlüssel, kein Passwort wird
    gespeichert.
-3. **"2. Ausliefern und starten"** klicken: das Werkzeug prueft die
-   Verbindung, stellt Docker auf dem Server sicher, lädt den Projektstand
-   und die fertig gebauten Images hoch, erzeugt die `.env` auf dem Server
-   und startet den Stack. Der Fortschritt steht im Protokoll.
+3. **"2. Ausliefern und starten"** klicken. Das Werkzeug arbeitet dann ab:
+   - Verbindung prüfen,
+   - Docker auf dem Server sicherstellen,
+   - Projektstand und fertig gebaute Images hochladen,
+   - `.env` auf dem Server erzeugen,
+   - Stack starten.
+
+   Der Fortschritt steht im Protokoll.
 
 ### Konsole
 
@@ -131,10 +135,16 @@ mehr als einen Test:
 
 ## Grenzen dieses Standes
 
-Die Engine ist gegen einen lokalen SSH-Testcontainer verifiziert (Verbindung,
-Zielsystem-Erkennung, Docker-Prüfung, Skript- und Datei-Upload,
-Server-seitige `.env`-Erzeugung, CRLF-Bereinigung). Der eigentliche
-`docker compose up` auf dem Server konnte hier mangels echtem Docker-Ziel
-nicht durchlaufen; er nutzt exakt denselben Compose-Stand, der lokal
-bewiesen ist. Ein echter Lauf gegen die Proxmox-VM steht noch aus (Zugriff
+Die Engine ist gegen einen lokalen SSH-Testcontainer verifiziert:
+
+- Verbindung,
+- Zielsystem-Erkennung,
+- Docker-Prüfung,
+- Skript- und Datei-Upload,
+- Server-seitige `.env`-Erzeugung,
+- CRLF-Bereinigung.
+
+Der eigentliche `docker compose up` auf dem Server konnte hier mangels echtem
+Docker-Ziel nicht durchlaufen; er nutzt exakt denselben Compose-Stand, der
+lokal bewiesen ist. Ein echter Lauf gegen die Proxmox-VM steht noch aus (Zugriff
 ab nächster Woche).

@@ -1,6 +1,6 @@
 # Sicherheit und Bedrohungsmodell
 
-Dieses Dokument ist systematischer aufgezogen als eine reine Szenario-Liste: erst was wir schützen, dann die Vertrauensgrenzen, dann die Angreifer, und erst danach die Tabelle, wer gegen wen gewinnt. Das vollständige LINDDUN- und STRIDE-Modell, je Komponente und Datenfluss und mit den Gegenmaßnahmen im Code, steht im [Bedrohungsmodell](bedrohungsmodell.md); dieses Dokument bleibt der Überblick.
+Der Aufbau: erst die Assets, dann die Vertrauensgrenzen, dann die Angreifer, dann die Tabelle, wer gegen wen gewinnt. Das vollständige LINDDUN- und STRIDE-Modell, je Komponente und Datenfluss und mit den Gegenmaßnahmen im Code, steht im [Bedrohungsmodell](bedrohungsmodell.md).
 
 ## Assets
 
@@ -53,7 +53,7 @@ Was überhaupt schützenswert ist:
 
 ## Wo es eng wird
 
-Der Web-Client ist das kryptografisch schwächste Glied. Im Browser fehlt der OS-Keystore, das ausgelieferte JavaScript ist nicht signiert, und XSS oder eine bösartige Browser-Extension umgehen die ganze schöne Krypto. Signal Desktop ist aus gutem Grund Electron und kein reiner Web-Client, WhatsApp Web ist als Companion zum Telefon gedacht. Wir bieten den Web-Client trotzdem an, behandeln ihn aber als das, was er ist, und schreiben das hier hin, statt ihn mit den nativen Clients gleichzusetzen.
+Der Web-Client ist das kryptografisch schwächste Glied. Im Browser fehlt der OS-Keystore, das ausgelieferte JavaScript ist nicht signiert, und XSS oder eine bösartige Browser-Extension umgehen die Verschlüsselung im Client. Signal Desktop ist aus gutem Grund Electron und kein reiner Web-Client, WhatsApp Web ist als Companion zum Telefon gedacht. Wir bieten den Web-Client trotzdem an, setzen ihn aber nicht mit den nativen Clients gleich.
 
 Push lässt sich nur halb entschärfen. Ein generisches "du hast Neues" hält den Inhalt aus dem Push, aber Apple und Google sehen weiter Token und Timing. Auf iOS kann eine Notification Service Extension den Inhalt im Sandbox des Geräts entschlüsseln, das löst das Token-Tracking nicht, verhindert aber den Inhalts-Leak. Für Android ist UnifiedPush als FCM-Alternative ein offener Prüfpunkt.
 
@@ -75,4 +75,11 @@ Daten auf einer Datenbank "sicher zu überschreiben" ist Augenwischerei, sobald 
 
 ## Standards
 
-Eine Orientierung, keine Zertifizierung. ML-KEM und ML-DSA aus der NIST-PQC-Auswahl, hybrid mit X25519 und Ed25519. ChaCha20-Poly1305 und AES-256-GCM symmetrisch. Argon2id für Passwörter und Schlüsselableitung. MLS nach RFC 9420. Ein externes Audit hat nicht stattgefunden und muss zweimal her, nach dem Krypto-Kern und vor Launch.
+Eine Orientierung, keine Zertifizierung:
+
+- ML-KEM und ML-DSA aus der NIST-PQC-Auswahl, hybrid mit X25519 und Ed25519.
+- ChaCha20-Poly1305 und AES-256-GCM symmetrisch.
+- Argon2id für Passwörter und Schlüsselableitung.
+- MLS nach RFC 9420.
+
+Ein externes Audit hat nicht stattgefunden und muss zweimal her, nach dem Krypto-Kern und vor Launch.

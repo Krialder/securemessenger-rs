@@ -6,13 +6,17 @@ Dieses Dokument ist ein ENTWURF. Es ist bewusst kein Bauauftrag: die Nutzerentsc
 
 ## Was schon vorbereitet ist
 
-Die Benennung ist bereits föderationsfähig geschnitten: jede Identität hat intern die Form `handle@home-server`, auch solange es nur einen Server gibt. Das entwertet nicht schon geführte Handles, wenn Föderation später kommt (kein Umzug, keine Kollision zwischen `kai@beispiel.de` und `kai@azubi-os.de`). Der Delivery Service ist bewusst dünn und für Inhalte nicht vertrauenswürdig (siehe [specs/mls-delivery-service.md](mls-delivery-service.md)); das ist die richtige Grundlage, weil ein föderierter Zustelldienst über Betreibergrenzen hinweg genau diese Eigenschaft braucht. Die Ende-zu-Ende-Verschlüsselung liegt vollständig im Client (Krypto-Kern, MLS für Gruppen); sie ist von Natur aus betreiberübergreifend, weil kein Server je Klartext sieht.
+- **Benennung:** jede Identität hat intern die Form `handle@home-server`, auch solange es nur einen Server gibt. Das entwertet nicht schon geführte Handles, wenn Föderation später kommt (kein Umzug, keine Kollision zwischen `kai@beispiel.de` und `kai@azubi-os.de`).
+- **Delivery Service:** bewusst dünn und für Inhalte nicht vertrauenswürdig (siehe [specs/mls-delivery-service.md](mls-delivery-service.md)). Das ist die richtige Grundlage, weil ein föderierter Zustelldienst über Betreibergrenzen hinweg genau diese Eigenschaft braucht.
+- **Ende-zu-Ende-Verschlüsselung:** liegt vollständig im Client (Krypto-Kern, MLS für Gruppen) und wirkt schon dadurch betreiberübergreifend, weil kein Server je Klartext sieht.
 
 Was fehlt, ist alles Server-zu-Server: eine authentifizierte S2S-Schnittstelle, betreiberübergreifende Key Transparency, Instanz-Discovery und eine Vertrauens- und Missbrauchspolitik zwischen Instanzen.
 
 ## Am Standard entlang: MIMI
 
-Föderation wird NICHT selbst erfunden. Die IETF-Arbeitsgruppe MIMI (More Instant Messaging Interoperability) schreibt genau diesen Standard, angetrieben vom EU Digital Markets Act, der große Messenger zur Interoperabilität verpflichtet. MIMI baut die Ende-zu-Ende-Verschlüsselung auf MLS (RFC 9420) auf, also auf dieselbe Grundlage, die dieser Messenger für Gruppen schon nutzt, und definiert darüber ein Nachrichten-Inhaltsformat und ein Provider-Modell. Kern des MIMI-Modells ist der **Hub**: für einen Raum (eine Gruppe) ist genau EINE Instanz der Hub, der die Reihenfolge und die Mitgliederliste hält; die anderen Instanzen (die Follower) reichen die Nachrichten ihrer Nutzer an den Hub und bekommen von ihm die Reihenfolge. Das deckt sich eins zu eins mit dem hiesigen „ein Delivery Service je Gruppe" (siehe unten) und ist der Grund, MIMI als Zielbild zu nehmen statt eines Eigenbaus.
+Föderation wird NICHT selbst erfunden. Die IETF-Arbeitsgruppe MIMI (More Instant Messaging Interoperability) schreibt genau diesen Standard, angetrieben vom EU Digital Markets Act, der große Messenger zur Interoperabilität verpflichtet. MIMI baut die Ende-zu-Ende-Verschlüsselung auf MLS (RFC 9420) auf, also auf dieselbe Grundlage, die dieser Messenger für Gruppen schon nutzt, und definiert darüber ein Nachrichten-Inhaltsformat und ein Provider-Modell.
+
+Kern des MIMI-Modells ist der **Hub**: für einen Raum (eine Gruppe) ist genau EINE Instanz der Hub, der die Reihenfolge und die Mitgliederliste hält; die anderen Instanzen (die Follower) reichen die Nachrichten ihrer Nutzer an den Hub und bekommen von ihm die Reihenfolge. Das deckt sich eins zu eins mit dem hiesigen „ein Delivery Service je Gruppe" (siehe unten) und ist der Grund, MIMI als Zielbild zu nehmen statt eines Eigenbaus.
 
 Haltung: Föderation richtet sich nach den aktuellen MIMI-Entwürfen (Protokoll und Inhaltsformat), statt ein paralleles Server-zu-Server-Protokoll zu erfinden. Das hält die Tür zur Interoperabilität mit anderen MLS-basierten Messengern offen und folgt der Leitplanke „kein Eigenbau bei Sicherheit" ([pflichtenheft.md](../pflichtenheft.md) 5.2). Die MIMI-Entwürfe sind noch in Arbeit; die konkrete Feld- und Endpunkt-Ebene wird an den dann gültigen Draft gebunden, nicht hier vorweggenommen.
 
@@ -52,7 +56,7 @@ Das ist erhebliche Arbeit und teils extern (Auditoren, Gossip-Betrieb), dieselbe
 
 ## Metadatenschutz weicht auf
 
-Föderation kostet Metadatenschutz, und das gehört klar gesagt. Heute versteckt Sealed Sender bei den meisten Nachrichten sogar den Absender vor dem eigenen Server ([specs/sealed-sender-und-abuse.md](sealed-sender-und-abuse.md)). Föderiert sieht die Absender-Instanz zwangsläufig, DASS und an WELCHE fremde Instanz sie zustellt (sie muss ja routen), und die Empfänger-Instanz sieht, von welcher Instanz Verkehr kommt. Sealed Sender kann den Absender-Handle weiter verstecken, aber die Instanz-zu-Instanz-Beziehung wird sichtbar. Das ist ein bewusster Tausch: Reichweite gegen ein Stück Metadatenschutz, dieselbe Abwägung wie bei E-Mail. Die Bedrohungsmodellierung ([bedrohungsmodell.md](../bedrohungsmodell.md)) muss die Instanz-Beziehung als neu sichtbares Metadatum aufnehmen.
+Föderation kostet Metadatenschutz. Heute versteckt Sealed Sender bei den meisten Nachrichten sogar den Absender vor dem eigenen Server ([specs/sealed-sender-und-abuse.md](sealed-sender-und-abuse.md)). Föderiert sieht die Absender-Instanz zwangsläufig, DASS und an WELCHE fremde Instanz sie zustellt (sie muss ja routen), und die Empfänger-Instanz sieht, von welcher Instanz Verkehr kommt. Sealed Sender kann den Absender-Handle weiter verstecken, aber die Instanz-zu-Instanz-Beziehung wird sichtbar. Das ist ein bewusster Tausch: Reichweite gegen ein Stück Metadatenschutz, dieselbe Abwägung wie bei E-Mail. Die Bedrohungsmodellierung ([bedrohungsmodell.md](../bedrohungsmodell.md)) muss die Instanz-Beziehung als neu sichtbares Metadatum aufnehmen.
 
 ## Missbrauch und Spam über Instanzen
 
@@ -74,7 +78,7 @@ Zur Orientierung einer späteren Etappe, welche heutigen Nähte betroffen wären
 
 ## Unsere Haltung
 
-Föderation ist geschnitten, nicht gebaut. Die Benennung (`handle@home-server`), der dünne, inhalts-untrusted Delivery Service und die client-seitige MLS-Verschlüsselung sind die richtige Grundlage und schon da. Der Weg führt über MIMI (MLS-basiert, Hub je Gruppe) statt über einen Eigenbau. Der teuerste und teils externe Teil ist die betreiberübergreifende Key Transparency; der ehrlichste erste Schritt ist eine Allowlist-Föderation mit wenigen vertrauenswürdigen Partner-Instanzen und Sicherheitsnummern-Abgleich, nicht das offene Netz. Der Preis ist ein Stück Metadatenschutz (die Instanz-Beziehung wird sichtbar), was bewusst in Kauf genommen und im Bedrohungsmodell nachgezogen werden muss.
+Föderation ist geschnitten, nicht gebaut. Die Benennung (`handle@home-server`), der dünne, inhalts-untrusted Delivery Service und die client-seitige MLS-Verschlüsselung sind die richtige Grundlage und schon da. Der Weg führt über MIMI (MLS-basiert, Hub je Gruppe) statt über einen Eigenbau. Der teuerste und teils externe Teil ist die betreiberübergreifende Key Transparency; der realistische erste Schritt ist eine Allowlist-Föderation mit wenigen vertrauenswürdigen Partner-Instanzen und Sicherheitsnummern-Abgleich, nicht das offene Netz. Der Preis ist ein Stück Metadatenschutz (die Instanz-Beziehung wird sichtbar), was bewusst in Kauf genommen und im Bedrohungsmodell nachgezogen werden muss.
 
 ## Offen
 

@@ -1,7 +1,7 @@
 # Lokales Kubernetes (kind)
 
-Faehrt die ECHTEN Manifeste aus `deploy/k8s` (inklusive securityContext-
-Haertung, Probes, PodDisruptionBudgets, NetworkPolicies, Keycloak, Ingress)
+Fährt die ECHTEN Manifeste aus `deploy/k8s` (inklusive securityContext-
+Härtung, Probes, PodDisruptionBudgets, NetworkPolicies, Keycloak, Ingress)
 auf einem lokalen [kind](https://kind.sigs.k8s.io/)-Cluster. Das ist der
 Beweis, dass die Kubernetes-Artefakte nicht nur render-korrekt sind,
 sondern wirklich laufen.
@@ -14,10 +14,10 @@ deploy\kind\up.ps1 -Down    # Cluster komplett loeschen
 ```
 
 `up.ps1` ist idempotent: es legt den Cluster nur an, wenn er fehlt, baut das
-Ein-Image (deploy/compose/Dockerfile) neu und laedt es, laesst vorhandene
+Ein-Image (deploy/compose/Dockerfile) neu und lädt es, lässt vorhandene
 Secrets unangetastet und wendet dann `deploy/kind` per kustomize an.
 
-## Was dieses Overlay ergaenzt bzw. abweicht
+## Was dieses Overlay ergänzt bzw. abweicht
 
 - **infra.yaml**: PostgreSQL und MinIO im Cluster (emptyDir, Wegwerf-Daten).
   In echt stellen Operatoren beide (betrieb.md); die Haupt-Manifeste setzen
@@ -25,14 +25,14 @@ Secrets unangetastet und wendet dann `deploy/kind` per kustomize an.
 - **Secrets werden GENERIERT** (Formate nach deploy/k8s/SECRETS.md): starke
   Zufallswerte je Cluster, einmalig; nichts Eingechecktes. In echt liefert
   sie ein Secret-Store (ExternalSecret/SealedSecret).
-- **Ein Image fuer alle sechs Dienste** (Auswahl per SM_SERVICE): EIN
+- **Ein Image für alle sechs Dienste** (Auswahl per SM_SERVICE): EIN
   Release-Build statt sechs. Die per-Dienst-Images baut die CI/Pipeline
   weiterhin aus deploy/docker/Dockerfile.
 - **kindnet setzt NetworkPolicies nicht durch**: die Policy wird angewendet,
-  aber nicht erzwungen. Enforcement prueft ein Cluster mit Netz-Plugin
+  aber nicht erzwungen. Enforcement prüft ein Cluster mit Netz-Plugin
   (z. B. Calico).
 - **Kein Ingress-Controller**: das Ingress-Objekt liegt an, bleibt aber
-  unbedient; Zugriff lokal ueber `kubectl port-forward`.
+  unbedient; Zugriff lokal über `kubectl port-forward`.
 
 ## Nach dem Aufsetzen
 

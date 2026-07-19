@@ -1,6 +1,6 @@
 # Monitoring (Prometheus-Operator)
 
-ServiceMonitor und PrometheusRule fuer die sechs eigenen Dienste. Getrennt
+ServiceMonitor und PrometheusRule für die sechs eigenen Dienste. Getrennt
 von der Haupt-Kustomization, weil beide CRDs des Prometheus-Operators
 voraussetzen.
 
@@ -14,7 +14,7 @@ Prometheus-Textformat (`crates/common` `ops_router`, `common::metrics`):
 - `http_request_duration_seconds` (histogram, feste Buckets)
 
 Die `route` ist immer das axum-Routenmuster (nie der rohe Pfad), damit die
-Kardinalitaet nicht mit jedem Handle explodiert.
+Kardinalität nicht mit jedem Handle explodiert.
 
 ## Voraussetzungen
 
@@ -22,12 +22,12 @@ Kardinalitaet nicht mit jedem Handle explodiert.
    `PrometheusRule` existieren).
 2. **serviceMonitorSelector der Prometheus-CR** trifft das Label
    `app.kubernetes.io/part-of: securemessenger`. Bei kube-prometheus-stack
-   ist oft ein `release`-Label noetig; dann das Label in
-   `servicemonitor.yaml` und `prometheusrule.yaml` entsprechend ergaenzen.
+   ist oft ein `release`-Label nötig; dann das Label in
+   `servicemonitor.yaml` und `prometheusrule.yaml` entsprechend ergänzen.
 3. **Monitoring-Namespace ist beschriftet**: Die NetworkPolicy
-   `services-network` (deploy/k8s/network-policy.yaml) laesst Scrape-Verkehr
+   `services-network` (deploy/k8s/network-policy.yaml) lässt Scrape-Verkehr
    nur aus einem Namespace mit dem Label
-   `kubernetes.io/metadata.name: monitoring` auf Port 8080 zu. Laeuft
+   `kubernetes.io/metadata.name: monitoring` auf Port 8080 zu. Läuft
    Prometheus in einem anders benannten Namespace, ist der Selektor dort
    anzupassen.
 
@@ -42,6 +42,6 @@ kubectl apply -k deploy/k8s/monitoring
 `/metrics` liegt auf demselben Port (8080) wie die API und die
 `/internal`-Routen. Der Netzzugang der Monitoring-Namespace auf 8080 ist
 also breiter als nur Metriken; die `/internal`-Routen bleiben aber durch den
-`INTERNAL_TOKEN` (Shared Secret) geschuetzt, die NetworkPolicy ist zweite
-Schicht. Ein eigener Metrik-Port waere sauberer und ist als spaetere
-Verbesserung vorgemerkt (App- und Manifest-Aenderung).
+`INTERNAL_TOKEN` (Shared Secret) geschützt, die NetworkPolicy ist zweite
+Schicht. Ein eigener Metrik-Port wäre sauberer und ist als spätere
+Verbesserung vorgemerkt (App- und Manifest-Änderung).

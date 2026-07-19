@@ -1,6 +1,6 @@
 # Datenmodell
 
-Was der Server speichert. Die Blöcke sind nah an dem, was wir wirklich anlegen, mit Indizes, Partitionierung und den Sperren, die der Sitzungsaufbau braucht. Klartext, private Schlüssel und der entschlüsselte Verlauf kommen nie hierher.
+Was der Server speichert: Tabellen samt Indizes, Partitionierung und den Sperren, die der Sitzungsaufbau braucht. Klartext, private Schlüssel und der entschlüsselte Verlauf kommen nie hierher.
 
 Geshardet wird nach Konto-ID, jeder Dienst hält sein eigenes Schema. Das KT-Verzeichnis ist zusätzlich ein Merkle-Speicher (siehe [specs/key-transparency.md](specs/key-transparency.md)).
 
@@ -84,7 +84,12 @@ Zielwerte: rund 100 Einmal-Prekeys je Typ und Gerät, Nachfüllen ab 20 verbleib
 
 ## Key Transparency
 
-Der kt-Dienst hält zwei angefügte, nie geänderte Tabellen in seiner eigenen Datenbank. PostgreSQL ist die Quelle der Wahrheit; der Merkle-Baum (AZKS aus akd) ist ein Derivat, das beim Start deterministisch aus dem Update-Log wiederaufgebaut und gegen die gespeicherten Wurzeln geprüft wird (ein Integritätsbruch ist ein harter Startfehler). `kt_updates` ist das Änderungs-Log: je Schlüsseländerung ein Eintrag, welches Handle ab welcher Epoche auf welches Commitment zeigt. Das Commitment berechnet der identity-Dienst (smktc.v1, SHA-256 über Identitätsschlüssel und sortierte Gerätemenge), kt interpretiert es nie. `kt_epochs` ist der append-only Log der signierten Wurzeln (STH), den Clients und Auditoren prüfen.
+Der kt-Dienst hält zwei angefügte, nie geänderte Tabellen in seiner eigenen Datenbank:
+
+- `kt_updates` ist das Änderungs-Log: je Schlüsseländerung ein Eintrag, welches Handle ab welcher Epoche auf welches Commitment zeigt. Das Commitment berechnet der identity-Dienst (smktc.v1, SHA-256 über Identitätsschlüssel und sortierte Gerätemenge), kt interpretiert es nie.
+- `kt_epochs` ist der append-only Log der signierten Wurzeln (STH), den Clients und Auditoren prüfen.
+
+PostgreSQL ist die Quelle der Wahrheit. Der Merkle-Baum (AZKS aus akd) ist ein Derivat: Beim Start wird er deterministisch aus dem Update-Log wiederaufgebaut und gegen die gespeicherten Wurzeln geprüft, ein Integritätsbruch ist ein harter Startfehler.
 
 ```sql
 CREATE TABLE kt_updates (
@@ -105,7 +110,9 @@ CREATE TABLE kt_epochs (
 
 ## Nachrichten
 
-Für den Server eine Blackbox mit Zustelladresse. Die `id` ist client-erzeugt und macht `POST /messages` idempotent; jede Hülle adressiert genau ein Gerät, für Multi-Device-Fan-out legt der Client pro Zielgerät eine eigene Hülle an. Die Tabelle gehört dem delivery-Dienst und liegt in dessen eigener Datenbank; `recipient_id` (Konto-UUID) und `device_id` sind logische Referenzen ohne Fremdschlüssel, aufgelöst über die interne identity-API. Die Tabelle ist nach Monat partitioniert (`PARTITION BY RANGE (received_at)`), alte Partitionen fallen per Retention weg; der Dienst legt Monatspartitionen beim Schreiben selbst an (Advisory Lock gegen Rennen paralleler Writer).
+Für den Server eine Blackbox mit Zustelladresse. Die `id` ist client-erzeugt und macht `POST /messages` idempotent; jede Hülle adressiert genau ein Gerät, für Multi-Device-Fan-out legt der Client pro Zielgerät eine eigene Hülle an.
+
+Die Tabelle gehört dem delivery-Dienst und liegt in dessen eigener Datenbank; `recipient_id` (Konto-UUID) und `device_id` sind logische Referenzen ohne Fremdschlüssel, aufgelöst über die interne identity-API. Partitioniert wird nach Monat (`PARTITION BY RANGE (received_at)`), alte Partitionen fallen per Retention weg; der Dienst legt Monatspartitionen beim Schreiben selbst an (Advisory Lock gegen Rennen paralleler Writer).
 
 ```sql
 CREATE TABLE messages (
@@ -165,7 +172,11 @@ CREATE TABLE group_devices (
 );
 ```
 
-Der kryptografische Gruppenzustand lebt als TreeKEM-Zustand in den Clients. Der Server hält ihn nicht. Er hält nur die fortlaufende `epoch` je Gruppe und die Mitglieds-Geräteliste. Die Epoche ist der Serialisierungspunkt für konkurrierende Commits (specs/mls-delivery-service.md): `POST /groups/{id}/commit` trägt die Epoche, gegen die der Client committet; passt sie nicht zur gespeicherten, gewinnt der first-wins-Commit und der Verlierer bekommt `409 stale_epoch` samt aktueller Epoche. Über echtes PostgreSQL läuft der Vergleich in einer Transaktion mit Zeilensperre (`SELECT ... FOR UPDATE`), damit zwei gleichzeitige Commits nicht beide gewinnen. `device_id` ist wie `recipient_id` eine logische Referenz auf den identity-Dienst ohne Fremdschlüssel (eigene Datenbank je Dienst); die Bindung zwischen dieser Liste und der kryptografischen MLS-Mitgliedschaft prüft der Client, nicht der Server (der ist dafür nicht vertrauenswürdig).
+Der kryptografische Gruppenzustand lebt als TreeKEM-Zustand in den Clients. Der Server hält ihn nicht. Er hält nur die fortlaufende `epoch` je Gruppe und die Mitglieds-Geräteliste.
+
+Die Epoche ist der Serialisierungspunkt für konkurrierende Commits (specs/mls-delivery-service.md): `POST /groups/{id}/commit` trägt die Epoche, gegen die der Client committet; passt sie nicht zur gespeicherten, gewinnt der first-wins-Commit und der Verlierer bekommt `409 stale_epoch` samt aktueller Epoche. Über echtes PostgreSQL läuft der Vergleich in einer Transaktion mit Zeilensperre (`SELECT ... FOR UPDATE`), damit zwei gleichzeitige Commits nicht beide gewinnen.
+
+`device_id` ist wie `recipient_id` eine logische Referenz auf den identity-Dienst ohne Fremdschlüssel (eigene Datenbank je Dienst). Die Bindung zwischen dieser Liste und der kryptografischen MLS-Mitgliedschaft prüft der Client, nicht der Server (der ist dafür nicht vertrauenswürdig).
 
 ## Mandanten der Integrations-API
 

@@ -2,7 +2,7 @@
 
 Zwei Wege zwischen Client und Kern. REST über HTTPS für alles, was du auslöst, WebSocket für alles, was der Server von sich aus meldet. Bodies sind JSON, Binärdaten gehen Base64-kodiert über die Leitung. Authentifiziert wird per `Authorization: Bearer <token>`, Access-Token kurzlebig, Refresh-Token rotiert.
 
-Die Übersicht zeigt die grobe Form. Für die oeffentliche Integrations-API (token, notify, presence) liegt der maschinenlesbare Feldvertrag als OpenAPI-Datei im Repo ([openapi-integrations.yaml](openapi-integrations.yaml)), ergänzt um den [Integrations-Leitfaden](integration-leitfaden.md). Für die übrigen Dienste ist die jeweilige Handler-Quelle der verbindliche Vertrag; eine gemeinsam ausgelieferte, aus dem Code erzeugte OpenAPI-Spec über alle Routen (etwa per utoipa) bleibt eine offene Aufgabe.
+Für die öffentliche Integrations-API (token, notify, presence) liegt der maschinenlesbare Feldvertrag als OpenAPI-Datei im Repo ([openapi-integrations.yaml](openapi-integrations.yaml)), ergänzt um den [Integrations-Leitfaden](integration-leitfaden.md). Für die übrigen Dienste ist die jeweilige Handler-Quelle der verbindliche Vertrag; eine gemeinsam ausgelieferte, aus dem Code erzeugte OpenAPI-Spec über alle Routen (etwa per utoipa) bleibt eine offene Aufgabe.
 
 ## Konto und Geräte
 

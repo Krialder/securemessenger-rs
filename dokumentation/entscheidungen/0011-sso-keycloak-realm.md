@@ -32,7 +32,7 @@ Keycloak wird als OIDC-Provider mit einem **versionierten Realm-Export** scharf 
 
 Ein Fremdprojekt bindet mit einer Standard-OIDC-Bibliothek an (kein Sonderprotokoll), server- oder browserseitig, und delegiert die Anmeldung vollstaendig: es bekommt die Anmelde-Identitaet (Subject, Name, E-Mail nach Freigabe), aber nie private Schluessel oder Lesezugriff auf Chat-Inhalte. Der Realm-Export ist versioniert, ein Review sieht die Sicherheitsvorgaben (Flows, Laufzeiten, TLS) an einer Stelle.
 
-Bewusst offen und ehrlich abgegrenzt:
+Bewusst offen abgegrenzt:
 
 - ~~Die Werte im Export (`secret` des Clients, Passwort des Demo-Nutzers) sind nur fuer die lokale Vorfuehrung.~~ BEREINIGT (17.07.2026, Produktionsform): der Export enthaelt keinen Nutzer und kein Client-Secret mehr. Keycloak erzeugt das Secret beim Import selbst (Admin-Konsole -> Clients -> azubios -> Credentials), Nutzer-Konten legt der Betreiber an bzw. liefert eine Nutzer-Foederation; die Pipeline setzt weiterhin Image-Tag, Hostname und die echten Secrets (ADR-0004, keycloak.yaml).
 - Wie die **Anmelde-Identitaet mit der kryptografischen Identitaet zusammenspielt** (ob und wie ein per SSO angemeldeter Nutzer sein Messenger-Geraet koppelt), ist bewusst nicht Teil dieser Etappe: die beiden bleiben getrennt (architektur.md), eine Verknuepfung waere ein eigener Entwurf.

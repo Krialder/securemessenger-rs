@@ -1,6 +1,6 @@
 # Bedrohungsmodell (STRIDE und LINDDUN)
 
-Dieses Dokument baut das Gerüst aus [sicherheit.md](sicherheit.md) zum vollen Modell aus. STRIDE geht die klassischen Sicherheitsbedrohungen je Komponente durch, LINDDUN die Datenschutz-Bedrohungen je Datenfluss. Beide nennen zu jeder Bedrohung die konkrete Gegenmaßnahme im Code, damit das Modell prüfbar bleibt und nicht bei Absichtserklärungen stehen bleibt. Wo eine Bedrohung offen ist, steht das als Restrisiko, nicht kaschiert.
+Dieses Dokument baut das Gerüst aus [sicherheit.md](sicherheit.md) zum vollen Modell aus. STRIDE geht die klassischen Sicherheitsbedrohungen je Komponente durch, LINDDUN die Datenschutz-Bedrohungen je Datenfluss. Beide nennen zu jeder Bedrohung die konkrete Gegenmaßnahme im Code, damit das Modell prüfbar bleibt. Offene Bedrohungen stehen als Restrisiko im Register am Ende.
 
 Der Zuschnitt folgt der gebauten Plattform: sechs Dienste (identity, directory, delivery, integrations, media, kt), der Krypto-Kern in den Clients, zwei Referenzclients (CLI, Web). Die Nachrichten-Kryptografie liegt ausschließlich im Client-Kern; der Server hält Chiffretext.
 
