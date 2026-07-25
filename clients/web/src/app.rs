@@ -33,7 +33,7 @@ use client_app::account::{
 };
 use client_app::delivery::{
     parse_ws_event, ws_auth_frame, DeliveryClient, GroupMemberInfo, GroupMetaInfo, GroupOutgoing,
-    GroupRole, OutgoingEnvelope, WsEvent,
+    GroupPolicy, GroupRole, OutgoingEnvelope, WsEvent,
 };
 use client_app::directory::DirectoryClient;
 use client_app::grouptext::{self, GroupPayload, RosterDevice};
@@ -2870,6 +2870,114 @@ async fn delete_group_message(
 /// Entfernten verschlossen bleibt; er geht auch an dessen Geräte, damit
 /// der Client dort aufräumt. Danach bekommt die Rest-Gruppe einen
 /// frischen Roster. Liefert die neue Mitgliederliste.
+/// Lädt weitere Mitglieder in eine BESTEHENDE Gruppe ein (Gegenstück zu
+/// `sm group-add`). Wer das darf, entscheidet die `invite_policy` der Gruppe;
+/// der Dienst weist einen unberechtigten Commit ab.
+///
+/// Dieselbe Choreografie wie beim Gründen und Entfernen: KeyPackages zuerst
+/// holen (scheitert das, ist nichts geändert), Commit vormerken, ERST senden,
+/// dann anwenden und sichern, zum Schluss der zusammengeführte Roster.
+/// Liefert die neue Mitgliederliste.
+async fn add_group_members(
+    storage: &SharedStorage,
+    token: &str,
+    own_handle: &str,
+    group_id: &str,
+    invitees: &[String],
+) -> Result<Vec<String>, String> {
+    let own_device_id = load_profile(storage)
+        .map(|p| p.device_id)
+        .ok_or("Kein Profil in der Ablage")?;
+    let member = load_or_new_member(storage, own_handle)?;
+    let Some(mut session) = GroupSession::load(member, group_id.as_bytes())? else {
+        return Err("Diese Gruppe ist in der lokalen Ablage unbekannt.".to_string());
+    };
+    let old_roster = load_roster(storage, group_id)?;
+    let present = unique_handles(session.member_identities());
+    for handle in invitees {
+        if present.contains(handle) {
+            return Err(format!("{handle} ist schon in der Gruppe."));
+        }
+    }
+
+    // KeyPackages der Neuen holen, BEVOR ein Commit entsteht.
+    let directory = DirectoryClient::new(directory_url());
+    let mut invite_blobs = Vec::new();
+    let mut new_devices = Vec::new();
+    for handle in invitees {
+        let packages = directory
+            .mls_key_packages(token, handle)
+            .await
+            .map_err(|e| e.to_string())?;
+        if packages.devices.is_empty() {
+            return Err(format!(
+                "{handle} hat noch keine Gruppen-Schlüssel veröffentlicht (dort einmal anmelden)."
+            ));
+        }
+        for entry in packages.devices {
+            invite_blobs.push(
+                BASE64
+                    .decode(&entry.key_package)
+                    .map_err(|e| format!("Schlüsselpaket von {handle} unlesbar: {e}"))?,
+            );
+            new_devices.push(RosterDevice {
+                handle: handle.clone(),
+                device_id: entry.device_id,
+            });
+        }
+    }
+
+    let from_epoch = session.epoch();
+    let mut members = present;
+    members.extend(invitees.iter().cloned());
+    let outcome = session.add_members(&invite_blobs)?;
+
+    // Bestehende bekommen den Commit, Neue das Welcome (mit Name und
+    // Einladendem fürs Einladungs-Banner).
+    let delivery = DeliveryClient::new(delivery_url());
+    let group_name = delivery
+        .group_meta(token, group_id)
+        .await
+        .map(|meta| meta.name)
+        .unwrap_or_default();
+    let mut fanout = seal_group_fanout(&old_roster, &own_device_id, group_id, &outcome.commit)?;
+    for device in &new_devices {
+        fanout.push(GroupOutgoing {
+            id: new_uuid(),
+            device_id: device.device_id.clone(),
+            envelope: wire::seal_group_invite(group_id, &outcome.welcome, &group_name, own_handle)
+                .map_err(|e| e.to_string())?,
+        });
+    }
+
+    // Senden, dann anwenden: ein abgelehnter Commit (409 stale_epoch, 403 bei
+    // fehlendem Einladerecht) darf den lokalen Zustand nicht vorrücken.
+    delivery
+        .group_commit(token, group_id, from_epoch, &members, &fanout)
+        .await
+        .map_err(|e| e.to_string())?;
+    session.merge_pending()?;
+    save_member_state(storage, &session.export_state()?)?;
+
+    let mut new_roster = old_roster;
+    new_roster.extend(new_devices);
+    save_roster(storage, group_id, &new_roster)?;
+
+    // Frischer Roster an alle; best effort wie beim Entfernen.
+    let roster_blob = session.create_message(&grouptext::encode_roster(&new_roster))?;
+    save_member_state(storage, &session.export_state()?)?;
+    let roster_fanout = seal_group_fanout(&new_roster, &own_device_id, group_id, &roster_blob)?;
+    if !roster_fanout.is_empty() {
+        if let Err(error) = delivery
+            .group_messages(token, group_id, &roster_fanout)
+            .await
+        {
+            leptos::logging::warn!("Roster-Nachricht nicht zugestellt: {error}");
+        }
+    }
+    Ok(members)
+}
+
 async fn remove_group_member(
     storage: &SharedStorage,
     token: &str,
@@ -3787,6 +3895,8 @@ fn App() -> impl IntoView {
     let (new_chat_input, set_new_chat_input) = signal(String::new());
     // Mitglieder-Eingabe fürs Gründen einer Gruppe (im Neuer-Chat-Panel).
     let (group_input, set_group_input) = signal(String::new());
+    // Handles fürs nachträgliche Einladen in die offene Gruppe (kommagetrennt).
+    let (group_add_input, set_group_add_input) = signal(String::new());
     // Gruppenname beim Gründen (optional).
     let (group_name_input, set_group_name_input) = signal(String::new());
     // Anzeigenamen der Gruppen-Chats (Schlüssel `grp:<id>` -> „Gruppe: ...");
@@ -5854,6 +5964,71 @@ fn App() -> impl IntoView {
         }))
     };
 
+    // Weitere Mitglieder in die offene Gruppe einladen. Mehrere Handles
+    // kommagetrennt, wie beim Gründen.
+    let on_group_add = {
+        let current_storage = current_storage.clone();
+        SendWrapper::new(Rc::new(move |_: ()| {
+            if busy.get_untracked() {
+                return;
+            }
+            let Some(peer) = selected.get_untracked() else {
+                return;
+            };
+            let Some(group_id) = group_id_of(&peer).map(str::to_string) else {
+                return;
+            };
+            let Some(storage) = current_storage() else {
+                return;
+            };
+            let own = me.get_untracked();
+            let mut invitees: Vec<String> = Vec::new();
+            for raw in group_add_input.get_untracked().split(',') {
+                let handle = raw.trim().to_string();
+                if !handle.is_empty() && handle != own && !invitees.contains(&handle) {
+                    invitees.push(handle);
+                }
+            }
+            if invitees.is_empty() {
+                set_status.set("Handle des neuen Mitglieds angeben.".to_string());
+                return;
+            }
+            set_busy.set(true);
+            set_status.set("Wird eingeladen ...".to_string());
+            spawn_local(async move {
+                let result = add_group_members(
+                    &storage,
+                    &access_token.get_untracked(),
+                    &own,
+                    &group_id,
+                    &invitees,
+                )
+                .await;
+                match result {
+                    Ok(members) => {
+                        set_group_labels.update(|labels| {
+                            labels.insert(
+                                group_chat_key(&group_id),
+                                GroupUi {
+                                    label: group_label(&members, &own),
+                                    members,
+                                    forgotten: false,
+                                },
+                            );
+                        });
+                        set_group_add_input.set(String::new());
+                        set_status.set(format!(
+                            "{} eingeladen; sie treten auf ihrem Gerät bei.",
+                            invitees.join(", ")
+                        ));
+                    }
+                    Err(error) => set_status.set(format!("Einladen: {error}")),
+                }
+                set_busy.set(false);
+            });
+        }))
+    };
+
     // Die offene Gruppe verlassen: Ansage an die anderen, dann lokal
     // vergessen (der Verlauf bleibt); kryptografisch entfernt einen erst
     // der Remove-Commit eines verbleibenden Mitglieds.
@@ -6631,6 +6806,7 @@ fn App() -> impl IntoView {
                     let on_safety = on_safety.clone();
                     let on_key_check = on_key_check.clone();
                     let on_group_remove = on_group_remove.clone();
+                    let on_group_add = on_group_add.clone();
                     let on_group_leave = on_group_leave.clone();
                     let on_invite_accept = on_invite_accept.clone();
                     let on_invite_decline = on_invite_decline.clone();
@@ -7007,6 +7183,7 @@ fn App() -> impl IntoView {
                                         // Gruppen-Handler wandern in verschachtelte
                                         // Views, deshalb je Lauf frisch klonen.
                                         let on_group_remove = on_group_remove.clone();
+                                        let on_group_add = on_group_add.clone();
                                         let on_group_leave = on_group_leave.clone();
                                         if settings_open.get() {
                                             let on_revoke = on_revoke.clone();
@@ -7639,6 +7816,7 @@ fn App() -> impl IntoView {
                                                         let members_peer = members_peer.clone();
                                                         let remove = on_group_remove.clone();
                                                         let leave = on_group_leave.clone();
+                                                        let add_member = on_group_add.clone();
                                                         // Diese drei Handler fangen nur Copy-Signale und sind
                                                         // selbst Copy; kein clone nötig.
                                                         let set_role = on_group_role;
@@ -7745,6 +7923,60 @@ fn App() -> impl IntoView {
                                                                                 .collect_view()
                                                                         }}
                                                                     </ul>
+                                                                    {move || {
+                                                                        // Einladen nur zeigen, wenn die
+                                                                        // invite_policy es zulaesst: bei
+                                                                        // "Admins" duerfen nur Owner/Admin,
+                                                                        // sonst jedes Mitglied. Der Dienst
+                                                                        // prueft es ohnehin erneut; das Feld
+                                                                        // auszublenden erspart nur den Versuch.
+                                                                        let meta = group_meta.get();
+                                                                        let own_now = me.get_untracked();
+                                                                        let my_role = meta
+                                                                            .as_ref()
+                                                                            .and_then(|m| m.members.iter().find(|x| x.handle == own_now))
+                                                                            .map(|m| m.role);
+                                                                        let admins_only = meta
+                                                                            .as_ref()
+                                                                            .map(|m| matches!(m.settings.invite_policy, GroupPolicy::Admins))
+                                                                            .unwrap_or(false);
+                                                                        let may_invite = match my_role {
+                                                                            Some(GroupRole::Owner) | Some(GroupRole::Admin) => true,
+                                                                            Some(GroupRole::Member) => !admins_only,
+                                                                            // Sicht noch nicht geladen: nichts anbieten.
+                                                                            None => false,
+                                                                        };
+                                                                        let add = add_member.clone();
+                                                                        may_invite.then(move || {
+                                                                            view! {
+                                                                                <div class="sm-set-row sm-set-stack">
+                                                                                    <span class="sm-set-label">
+                                                                                        "Mitglieder einladen"
+                                                                                        <small>"Handles mit Komma trennen. Die Eingeladenen treten auf ihrem Gerät bei."</small>
+                                                                                    </span>
+                                                                                    <div class="sm-set-form">
+                                                                                        <input
+                                                                                            class="sm-set-input"
+                                                                                            aria-label="Handles der neuen Mitglieder, mit Komma getrennt"
+                                                                                            placeholder="handle1, handle2"
+                                                                                            prop:value=group_add_input
+                                                                                            on:input=move |ev| {
+                                                                                                set_group_add_input.set(event_target_value(&ev))
+                                                                                            }
+                                                                                        />
+                                                                                        <button
+                                                                                            type="button"
+                                                                                            class="sm-secondary"
+                                                                                            on:click=move |_| (add)(())
+                                                                                            disabled=busy
+                                                                                        >
+                                                                                            "Einladen"
+                                                                                        </button>
+                                                                                    </div>
+                                                                                </div>
+                                                                            }
+                                                                        })
+                                                                    }}
                                                                     {move || {
                                                                         // Announcement-Umschalter nur fuer Staff.
                                                                         let meta = group_meta.get();

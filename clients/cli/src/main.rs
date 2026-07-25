@@ -155,6 +155,7 @@ async fn run() -> Result<(), String> {
         "group-send" => group_send(&args[1..]).await,
         "group-edit" => group_edit(&args[1..]).await,
         "group-delete" => group_delete(&args[1..]).await,
+        "group-add" => group_add(&args[1..]).await,
         "group-remove" => group_remove(&args[1..]).await,
         "group-leave" => group_leave(&args[1..]).await,
         "group-members" => group_members(&args[1..]).await,
@@ -2336,6 +2337,159 @@ fn delivery_client() -> DeliveryClient {
 /// Commit geht auch an die Geräte des Entfernten, damit sein Client die
 /// Entfernung erkennt und lokal aufräumt; danach bekommt die Rest-Gruppe
 /// einen frischen Roster.
+/// `sm group-add <gruppen-id> <handle> [<handle>...]`: lädt weitere Mitglieder
+/// in eine BESTEHENDE Gruppe ein. Wer das darf, entscheidet die
+/// `invite_policy` der Gruppe (alle Mitglieder oder nur Admins, siehe
+/// `sm group-set invite`); der Dienst weist einen unberechtigten Commit ab.
+///
+/// Die Choreografie ist die von `group-create`, nur auf einer laufenden
+/// Gruppe: KeyPackages zuerst holen (scheitert das, ist nichts geändert),
+/// Commit vormerken, ERST senden, dann anwenden und sichern (ein abgelehnter
+/// Commit darf keinen Fork hinterlassen), zum Schluss der zusammengeführte
+/// Roster an alle.
+async fn group_add(args: &[String]) -> Result<(), String> {
+    let [group_id, invitee_args @ ..] = args else {
+        return Err("Aufruf: sm group-add <gruppen-id> <handle> [<handle>...]".to_string());
+    };
+    if invitee_args.is_empty() {
+        return Err("Aufruf: sm group-add <gruppen-id> <handle> [<handle>...]".to_string());
+    }
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    let storage = open_storage()?;
+    let member = load_or_new_member(&storage, &profile.handle)?;
+    let Some(mut session) = GroupSession::load(member, group_id.as_bytes())? else {
+        return Err(format!(
+            "Gruppe {group_id} ist in der lokalen Ablage unbekannt ('sm groups' zeigt die eigenen)."
+        ));
+    };
+    let old_roster = load_roster(&storage, group_id)?;
+    let present = unique_handles(session.member_identities());
+
+    // Doppelte und schon vorhandene Handles herausfiltern, bevor irgendetwas
+    // passiert: ein zweites Leaf für denselben Handle wäre kein Fehler des
+    // Protokolls, aber verwirrend im Roster.
+    let mut invitees: Vec<String> = Vec::new();
+    for handle in invitee_args {
+        if present.contains(handle) {
+            return Err(format!("{handle} ist schon in der Gruppe."));
+        }
+        if !invitees.contains(handle) {
+            invitees.push(handle.clone());
+        }
+    }
+
+    // KeyPackages der Neuen holen. Scheitert einer (nichts veröffentlicht),
+    // bricht der Befehl ab, BEVOR ein Commit gebaut wird.
+    let directory = DirectoryClient::new(directory_url());
+    let mut invite_blobs = Vec::new();
+    let mut new_devices = Vec::new();
+    for handle in &invitees {
+        let packages = directory
+            .mls_key_packages(&token, handle)
+            .await
+            .map_err(|e| e.to_string())?;
+        if packages.devices.is_empty() {
+            return Err(format!(
+                "{handle} hat kein MLS-KeyPackage veröffentlicht; dort 'sm publish-keys' ausführen."
+            ));
+        }
+        for entry in packages.devices {
+            invite_blobs.push(
+                BASE64
+                    .decode(&entry.key_package)
+                    .map_err(|e| format!("KeyPackage von {handle} unlesbar: {e}"))?,
+            );
+            new_devices.push(RosterDevice {
+                handle: handle.clone(),
+                device_id: entry.device_id,
+            });
+        }
+    }
+
+    let from_epoch = session.epoch();
+    let mut members = present;
+    members.extend(invitees.iter().cloned());
+    // Commit plus Welcome vormerken (noch nicht angewandt, noch nicht
+    // gesichert).
+    let outcome = session.add_members(&invite_blobs)?;
+
+    // Zwei verschiedene Hüllen im EINEN Commit-Aufruf: die Bestehenden
+    // brauchen den Commit (neue Epoche), die Neuen das Welcome (samt Name und
+    // Einladendem, damit sie die Einladung vor dem Beitritt einordnen können).
+    let group_name = delivery_client()
+        .group_meta(&token, group_id)
+        .await
+        .map(|meta| meta.name)
+        .unwrap_or_default();
+    let mut fanout = seal_group_fanout(&old_roster, &profile.device_id, group_id, &outcome.commit)?;
+    for device in &new_devices {
+        fanout.push(GroupOutgoing {
+            id: new_uuid(),
+            device_id: device.device_id.clone(),
+            envelope: wire::seal_group_invite(
+                group_id,
+                &outcome.welcome,
+                &group_name,
+                &profile.handle,
+            )
+            .map_err(|e| e.to_string())?,
+        });
+    }
+
+    // Senden, dann anwenden (siehe group_remove): ein abgelehnter Commit
+    // (409 stale_epoch, oder 403 wenn die invite_policy es verbietet) darf
+    // den lokalen Zustand nicht vorrücken.
+    delivery_client()
+        .group_commit(&token, group_id, from_epoch, &members, &fanout)
+        .await
+        .map_err(|e| {
+            format!(
+                "{e} (bei stale_epoch: 'sm recv' holt den Stand nach, dann erneut einladen; \
+                 bei forbidden: in dieser Gruppe dürfen nur Admins einladen)"
+            )
+        })?;
+    session.merge_pending()?;
+    save_member_state(&storage, &session.export_state()?)?;
+
+    // Der neue Roster ist der alte plus die neuen Geräte.
+    let mut new_roster = old_roster;
+    new_roster.extend(new_devices);
+    save_roster(&storage, group_id, &new_roster)?;
+    remember_group(
+        &storage,
+        GroupEntry {
+            id: group_id.clone(),
+            members: members.clone(),
+        },
+    )?;
+    println!(
+        "{} eingeladen; die Gruppe hat jetzt {} Mitglieder ({})",
+        invitees.join(", "),
+        members.len(),
+        members.join(", ")
+    );
+
+    // Frischer Roster an ALLE (auch die Neuen, sobald sie beigetreten sind):
+    // ohne ihn wüssten die Bestehenden nicht, an welche neuen Geräte sie
+    // adressieren sollen. Best effort wie bei group_remove.
+    let roster_blob = session.create_message(&grouptext::encode_roster(&new_roster))?;
+    save_member_state(&storage, &session.export_state()?)?;
+    let roster_fanout = seal_group_fanout(&new_roster, &profile.device_id, group_id, &roster_blob)?;
+    if !roster_fanout.is_empty() {
+        if let Err(error) = delivery_client()
+            .group_messages(&token, group_id, &roster_fanout)
+            .await
+        {
+            eprintln!(
+                "  (Roster-Nachricht nicht zugestellt: {error}; erneut mit 'sm group-add' \
+                       oder einer Nachricht in die Gruppe)"
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn group_remove(args: &[String]) -> Result<(), String> {
     let [group_id, handle] = args else {
         return Err("Aufruf: sm group-remove <gruppen-id> <handle>".to_string());
@@ -2868,6 +3022,7 @@ fn print_usage() {
          \x20 group-role <id> <handle> <admin|member>  befördern/degradieren\n\
          \x20 group-transfer <id> <handle>   Besitz übergeben (nur Owner)\n\
          \x20 group-set <id> name|announce|invite|info <wert>  Name/Einstellung ändern\n\
+         \x20 group-add <id> <handle>...     weitere Mitglieder einladen (nach invite_policy)\n\
          \x20 group-remove <id> <handle>     Mitglied entfernen (MLS-Neuschluesseln)\n\
          \x20 group-leave <id>               Gruppe verlassen (lokal + Ansage)\n\
          \x20 invites                        offene Gruppen-Einladungen anzeigen\n\

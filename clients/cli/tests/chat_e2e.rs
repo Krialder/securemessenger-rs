@@ -778,8 +778,86 @@ async fn account_deletion_schedule_and_undelete() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Nachtraeglich einladen: eine laufende Gruppe nimmt ein weiteres Mitglied
+/// auf. Der Neue liest ab seinem Beitritt mit und kann selbst senden; die
+/// Bestehenden erreichen ihn, was beweist, dass der frische Roster ankam.
+/// Alte Nachrichten sieht er nicht, das ist die MLS-Eigenschaft (er kennt die
+/// Schluessel der alten Epochen nicht).
+#[tokio::test(flavor = "multi_thread")]
+async fn group_add_lets_a_later_member_join() {
+    let urls = start_stack().await;
+    let dir = std::env::temp_dir().join(format!("sm-grpadd-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("Testverzeichnis");
+
+    let ida = CliUser::new(&dir, "ida", &urls);
+    let jan = CliUser::new(&dir, "jan", &urls);
+    let kim = CliUser::new(&dir, "kim", &urls);
+    for (user, handle) in [(&ida, "ida"), (&jan, "jan"), (&kim, "kim")] {
+        user.run(&["register", handle, "ein-langes-gruppen-passwort"]);
+        user.run(&["login", "ein-langes-gruppen-passwort"]);
+        user.run(&["publish-keys"]);
+    }
+
+    // Ida gruendet mit jan; kim ist zunaechst NICHT dabei.
+    let created = ida.run(&["group-create", "Projekt", "jan"]);
+    let group_id = created
+        .split_whitespace()
+        .nth(1)
+        .expect("Gruppen-ID")
+        .to_string();
+    jan.run(&["recv"]);
+    jan.run(&["group-accept", &group_id]);
+    ida.run(&["recv"]);
+
+    // Eine Nachricht VOR kims Einladung: die darf er spaeter nicht sehen.
+    ida.run(&["group-send", &group_id, "vor kims beitritt"]);
+    let jan_recv = jan.run(&["recv"]);
+    assert!(jan_recv.contains("vor kims beitritt"), "stdout: {jan_recv}");
+
+    // Jetzt kim nachtraeglich einladen.
+    let added = ida.run(&["group-add", &group_id, "kim"]);
+    assert!(
+        added.contains("kim eingeladen") && added.contains("ida, jan, kim"),
+        "stdout: {added}"
+    );
+
+    // kim bekommt eine Einladung mit Gruppennamen und Einladendem und nimmt an.
+    let kim_recv = kim.run(&["recv"]);
+    assert!(
+        kim_recv.contains("Einladung")
+            && kim_recv.contains("Projekt")
+            && kim_recv.contains("von ida"),
+        "stdout: {kim_recv}"
+    );
+    kim.run(&["group-accept", &group_id]);
+    // Die Bestehenden verarbeiten den Commit (neue Epoche) und den Roster.
+    jan.run(&["recv"]);
+    ida.run(&["recv"]);
+
+    // Ida schreibt: kim liest jetzt mit (er ist Teil der aktuellen Epoche).
+    ida.run(&["group-send", &group_id, "willkommen kim"]);
+    let kim_recv = kim.run(&["recv"]);
+    assert!(kim_recv.contains("willkommen kim"), "stdout: {kim_recv}");
+    // Die alte Nachricht bleibt ihm verschlossen (MLS: keine Schluessel der
+    // alten Epoche).
+    assert!(
+        !kim_recv.contains("vor kims beitritt"),
+        "ein spaeter Beigetretener darf alte Nachrichten NICHT lesen, stdout: {kim_recv}"
+    );
+
+    // kim sendet selbst: das beweist, dass er den Roster hat und die
+    // Bestehenden ihn adressieren koennen.
+    kim.run(&["group-send", &group_id, "danke, bin dabei"]);
+    let ida_recv = ida.run(&["recv"]);
+    assert!(ida_recv.contains("danke, bin dabei"), "stdout: {ida_recv}");
+    let jan_recv = jan.run(&["recv"]);
+    assert!(jan_recv.contains("danke, bin dabei"), "stdout: {jan_recv}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// MLS-Gruppen über die CLI: gründen, beitreten (Welcome plus Roster über
-/// den normalen Abholweg), senden in beide Richtungen -- und jeder
+/// den normalen Abholweg), senden in beide Richtungen, und jeder
 /// `sm`-Befehl ist ein eigener Prozess. Dass ein Beigetretener in einem
 /// SPÄTEREN Prozess senden und der Gründer in wieder einem anderen lesen
 /// kann, beweist die persistente MLS-Ablage (smmls.v1) über
