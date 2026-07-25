@@ -615,6 +615,10 @@ pub fn ws_auth_frame(access_token: &str) -> String {
 pub enum WsEvent {
     /// Es warten Hüllen: jetzt `fetch` und `ack` fahren.
     MessageWaiting,
+    /// Die Verwaltungssicht dieser Gruppe hat sich geändert (Rolle, Besitz,
+    /// Name, Einstellungen): die Sicht über `group_meta` neu holen. Trägt
+    /// keinen Inhalt, nur die Gruppen-ID.
+    GroupChanged { group_id: String },
     /// Markierte Benachrichtigung eines Fremdprojekts (F070); trägt
     /// Mandant und Titel, die Details holt der Nutzer im Fremdprojekt.
     Notification { tenant: String, title: String },
@@ -630,6 +634,16 @@ pub fn parse_ws_event(text: &str) -> Option<WsEvent> {
     let event = value.get("event")?.as_str()?;
     Some(match event {
         "message.waiting" => WsEvent::MessageWaiting,
+        // Ohne group_id koennte der Client nichts nachladen: dann als
+        // unbekannt behandeln statt eine leere ID durchzureichen.
+        "group.changed" => match value.get("group_id").and_then(|v| v.as_str()) {
+            Some(group_id) => WsEvent::GroupChanged {
+                group_id: group_id.to_string(),
+            },
+            None => WsEvent::Other {
+                event: event.to_string(),
+            },
+        },
         "integration.notification" => WsEvent::Notification {
             tenant: value
                 .get("tenant")
@@ -671,6 +685,19 @@ mod tests {
             Some(WsEvent::Notification {
                 tenant: "azubios".to_string(),
                 title: "Neue Aufgabe".to_string()
+            })
+        );
+        assert_eq!(
+            parse_ws_event(r#"{"event":"group.changed","group_id":"g-1"}"#),
+            Some(WsEvent::GroupChanged {
+                group_id: "g-1".to_string()
+            })
+        );
+        // Ohne group_id gibt es nichts nachzuladen: als unbekannt behandeln.
+        assert_eq!(
+            parse_ws_event(r#"{"event":"group.changed"}"#),
+            Some(WsEvent::Other {
+                event: "group.changed".to_string()
             })
         );
         assert_eq!(

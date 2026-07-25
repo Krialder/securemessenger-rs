@@ -1154,6 +1154,15 @@ async fn listen(args: &[String]) -> Result<(), String> {
                         return Ok(());
                     }
                 }
+                // Das CLI hält keine Verwaltungssicht offen, die es
+                // auffrischen müsste; die Meldung wird nur angesagt, den
+                // aktuellen Stand zeigt 'sm group-members <id>'.
+                Some(WsEvent::GroupChanged { group_id }) => {
+                    println!(
+                        "[gruppe {group_id}] Rollen oder Einstellungen geändert \
+                         ('sm group-members {group_id}' zeigt den Stand)"
+                    );
+                }
                 Some(WsEvent::Notification { tenant, title }) => {
                     println!("[Benachrichtigung von {tenant}] {title}");
                 }

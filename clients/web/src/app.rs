@@ -816,6 +816,48 @@ fn fanout_targets<'a>(
         .filter(move |device| device.device_id != own_device_id)
 }
 
+/// Holt die Verwaltungssicht einer Gruppe (Name, Rollen, Einstellungen) vom
+/// Dienst und übernimmt sie in die Oberfläche: den Server-Namen in die
+/// Chatliste, die Rollen in die Verwaltungsansicht. Letztere nur, wenn der
+/// Chat beim Eintreffen der Antwort noch offen ist (der Nutzer kann in der
+/// Zwischenzeit gewechselt haben).
+///
+/// Zwei Aufrufer: das Öffnen eines Gruppen-Chats und der Hinweis
+/// `group.changed` vom Kanal. Deshalb ein Helfer und keine Kopie: sonst
+/// liefen die beiden Wege auseinander, sobald sich die Übernahme ändert.
+fn refresh_group_meta(
+    group_id: String,
+    access_token: ReadSignal<String>,
+    selected: ReadSignal<Option<String>>,
+    set_group_meta: WriteSignal<Option<GroupMetaInfo>>,
+    set_group_labels: WriteSignal<std::collections::HashMap<String, GroupUi>>,
+) {
+    let chat_key = group_chat_key(&group_id);
+    spawn_local(async move {
+        if let Ok(meta) = DeliveryClient::new(delivery_url())
+            .group_meta(&access_token.get_untracked(), &group_id)
+            .await
+        {
+            // Den Server-Namen in die Chatliste/den Kopf übernehmen (statt
+            // der abgeleiteten Mitglieder-Liste).
+            if !meta.name.is_empty() {
+                let key = chat_key.clone();
+                let name = meta.name.clone();
+                set_group_labels.update(|labels| {
+                    if let Some(ui) = labels.get_mut(&key) {
+                        if !ui.forgotten {
+                            ui.label = name;
+                        }
+                    }
+                });
+            }
+            if selected.get_untracked().as_deref() == Some(chat_key.as_str()) {
+                set_group_meta.set(Some(meta));
+            }
+        }
+    });
+}
+
 /// Rahmt einen fertigen MLS-Blob (Commit oder Anwendungsnachricht) als
 /// Gruppen-Hüllen an alle Roster-Geräte außer dem eigenen. Gemeinsamer
 /// Fanout-Baustein von Gruppen-Senden/Bearbeiten/Löschen, Entfernen und
@@ -3226,15 +3268,34 @@ async fn fetch_messages(
 /// Schleife beim nächsten Prüfpunkt sauber enden, damit kein toter Kanal
 /// mit altem Token weiterläuft (sonst gäbe es nach dem Konto-Wechsel zwei
 /// konkurrierende Schleifen).
+/// Die Schreib-Enden, in die der Hinweiskanal seine Ereignisse legt. Als
+/// Bündel statt als Einzelargumente, weil sie zusammen genau eine Sache
+/// bilden (wohin der Kanal schreibt) und die Funktion sonst acht Argumente
+/// hätte, bei denen die Aufrufreihenfolge zur Fehlerquelle wird.
+struct HintSinks {
+    /// Zähler der Weck-Hinweise; ein Effect holt danach ab.
+    hints: WriteSignal<u64>,
+    status: WriteSignal<String>,
+    notifications: WriteSignal<Vec<String>>,
+    connected: WriteSignal<bool>,
+    /// Die Gruppe, deren Verwaltungssicht sich geändert hat. Der Kanal trägt
+    /// nur die ID, den Inhalt holt ein Effect über group_meta nach.
+    group_changed: WriteSignal<Option<String>>,
+}
+
 fn start_hint_channel(
     token: ReadSignal<String>,
     epoch: StoredValue<u64>,
     my_epoch: u64,
-    set_hints: WriteSignal<u64>,
-    set_status: WriteSignal<String>,
-    set_notifications: WriteSignal<Vec<String>>,
-    set_connected: WriteSignal<bool>,
+    sinks: HintSinks,
 ) {
+    let HintSinks {
+        hints: set_hints,
+        status: set_status,
+        notifications: set_notifications,
+        connected: set_connected,
+        group_changed: set_group_changed,
+    } = sinks;
     spawn_local(async move {
         // Wartezeit zwischen Versuchen; nach jeder erfolgreichen Verbindung
         // zurück auf 1s, gedeckelt bei 30s, damit ein toter Server nicht
@@ -3311,6 +3372,12 @@ fn start_hint_channel(
                         auth_rejected = 0;
                         match parse_ws_event(&text) {
                             Some(WsEvent::MessageWaiting) => set_hints.update(|n| *n += 1),
+                            // Rolle, Besitz, Name oder Einstellungen der
+                            // Gruppe haben sich geändert: die Sicht neu holen,
+                            // ohne dass der Nutzer neu laden muss.
+                            Some(WsEvent::GroupChanged { group_id }) => {
+                                set_group_changed.set(Some(group_id));
+                            }
                             Some(WsEvent::Notification { tenant, title }) => {
                                 set_notifications
                                     .update(|list| list.push(format!("{tenant}: {title}")));
@@ -3749,6 +3816,10 @@ fn App() -> impl IntoView {
     // weiter unten holt ab, sobald die Oberfläche frei ist.
     let (hints, set_hints) = signal(0u64);
     let handled_hints = StoredValue::new(0u64);
+    // Gruppe, deren Verwaltungssicht der Hinweiskanal als geändert gemeldet
+    // hat. Ein Effect holt sie nach, wenn es die offene Gruppe ist; danach
+    // zurück auf None, damit dieselbe Meldung nicht zweimal zieht.
+    let (group_changed, set_group_changed) = signal(Option::<String>::None);
     // (Kontakt, gruppierte Nummer) der zuletzt gezeigten Sicherheitsnummer.
     let (safety_info, set_safety_info) = signal(Option::<(String, String)>::None);
     // Ergebnis der KT-Selbstprüfung: (bestanden, Meldung).
@@ -3930,10 +4001,13 @@ fn App() -> impl IntoView {
                 access_token,
                 channel_epoch,
                 channel_epoch.get_value(),
-                set_hints,
-                set_status,
-                set_notifications,
-                set_connected,
+                HintSinks {
+                    hints: set_hints,
+                    status: set_status,
+                    notifications: set_notifications,
+                    connected: set_connected,
+                    group_changed: set_group_changed,
+                },
             );
             let storage = new_core.storage.clone();
             set_me.set(new_core.handle.clone());
@@ -4925,6 +4999,27 @@ fn App() -> impl IntoView {
         });
     }
 
+    // Meldet der Kanal eine geänderte Gruppen-Verwaltungssicht, die Sicht
+    // nachladen statt den Nutzer neu laden zu lassen. Das Signal wird danach
+    // geleert, damit dieselbe Meldung nicht erneut zieht; das Nachladen selbst
+    // prüft, ob der Chat noch offen ist.
+    Effect::new(move |_| {
+        let Some(group_id) = group_changed.get() else {
+            return;
+        };
+        set_group_changed.set(None);
+        if !logged_in.get_untracked() {
+            return;
+        }
+        refresh_group_meta(
+            group_id,
+            access_token,
+            selected,
+            set_group_meta,
+            set_group_labels,
+        );
+    });
+
     // Prüft die Geräteschlüssel des offenen Chats gegen das Verzeichnis
     // (Schlüsselwechsel-Warnung, siehe key_check).
     let on_key_check = {
@@ -5581,31 +5676,13 @@ fn App() -> impl IntoView {
             // Einstellungen) frisch holen; bei einem 1:1-Chat gibt es keine.
             set_group_meta.set(None);
             if let Some(group_id) = group_id_of(&peer) {
-                let group_id = group_id.to_string();
-                let peer_for_meta = peer.clone();
-                spawn_local(async move {
-                    if let Ok(meta) = DeliveryClient::new(delivery_url())
-                        .group_meta(&access_token.get_untracked(), &group_id)
-                        .await
-                    {
-                        // Den Server-Namen in die Chatliste/den Kopf übernehmen
-                        // (statt der abgeleiteten Mitglieder-Liste).
-                        if !meta.name.is_empty() {
-                            let key = peer_for_meta.clone();
-                            let name = meta.name.clone();
-                            set_group_labels.update(|labels| {
-                                if let Some(ui) = labels.get_mut(&key) {
-                                    if !ui.forgotten {
-                                        ui.label = name;
-                                    }
-                                }
-                            });
-                        }
-                        if selected.get_untracked().as_deref() == Some(peer_for_meta.as_str()) {
-                            set_group_meta.set(Some(meta));
-                        }
-                    }
-                });
+                refresh_group_meta(
+                    group_id.to_string(),
+                    access_token,
+                    selected,
+                    set_group_meta,
+                    set_group_labels,
+                );
             }
             // Blockier-Zustand des Kontakts nachladen; das Ergebnis zählt
             // nur, wenn der Chat beim Eintreffen noch offen ist.

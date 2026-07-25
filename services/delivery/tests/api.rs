@@ -955,6 +955,90 @@ async fn commit_serializes_and_rejects_stale_epoch() {
     assert_eq!(body["current_epoch"], 1);
 }
 
+/// Eine Rollen- oder Einstellungsänderung meldet sich über den
+/// Hinweiskanal an ALLE Geräte der Gruppe. Ohne diesen Hinweis sähe ein
+/// anderes Gerät die neue Rolle erst beim nächsten Öffnen des Chats, also
+/// praktisch erst nach einem Neuladen der Seite.
+#[tokio::test]
+async fn group_change_hints_all_member_devices() {
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let app = test_app();
+    let addr = serve(app.clone()).await;
+
+    // alice gründet die Gruppe mit bob; beide Geräte sind damit in der
+    // Gerätemenge der Gruppe.
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/groups",
+        Some(json!({ "group_id": GROUP_1, "name": "Team", "members": ["alice", "bob"] })),
+        Some("token-alice"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // bobs Gerät hängt am Hinweiskanal.
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("WS-Handshake");
+    socket
+        .send(WsMessage::Text(r#"{"token":"token-bob"}"#.into()))
+        .await
+        .unwrap();
+    // Warten, bis der Dienst den Auth-Frame verarbeitet und den Kanal
+    // abonniert hat: der broadcast-Kanal liefert nur an BESTEHENDE
+    // Abonnenten, ein vorher gesendeter Hinweis wäre verloren. Das ist kein
+    // Test-Kniff, sondern die Hinweis-Semantik (hub.rs: ohne Empfänger holt
+    // das Gerät beim nächsten Verbinden ab).
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // alice befördert bob zum Admin.
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/groups/{GROUP_1}/roles"),
+        Some(json!({ "target": "bob", "role": "admin" })),
+        Some("token-alice"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Der Hinweis kommt und trägt die Gruppen-ID, aber keine Rolle: den
+    // Inhalt holt der Client selbst über /meta (das dort erneut prüft, dass
+    // er Mitglied ist).
+    let hint = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .expect("Hinweis vor Ablauf der Frist")
+        .expect("Verbindung offen")
+        .expect("Frame lesbar");
+    let text = hint.into_text().unwrap();
+    let event: serde_json::Value = serde_json::from_str(text.as_str()).expect("JSON");
+    assert_eq!(event["event"], "group.changed");
+    assert_eq!(event["group_id"], GROUP_1);
+    assert!(
+        !text.as_str().contains("admin"),
+        "der Hinweis darf keine Rolle tragen, stand: {text}"
+    );
+
+    // Auch eine Einstellungsänderung meldet sich (hier der Name).
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/groups/{GROUP_1}/info"),
+        Some(json!({ "name": "Team Beta" })),
+        Some("token-alice"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let hint = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .expect("zweiter Hinweis vor Ablauf der Frist")
+        .expect("Verbindung offen")
+        .expect("Frame lesbar");
+    assert!(hint.into_text().unwrap().as_str().contains("group.changed"));
+}
+
 #[tokio::test]
 async fn group_roles_name_and_announcement_enforced() {
     let app = test_app();

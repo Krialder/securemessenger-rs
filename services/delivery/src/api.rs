@@ -1471,6 +1471,20 @@ struct SetRoleRequest {
 
 /// `POST /groups/{id}/roles`: befördert/degradiert ein Mitglied (Rechte-Matrix
 /// in groups.rs). Liefert die aktualisierte Verwaltungssicht.
+/// Meldet allen Geräten der Gruppe, dass sich die Verwaltungssicht geändert
+/// hat (Rolle, Besitz, Name, Einstellungen). Best effort: die Änderung ist
+/// schon durabel, der Hinweis ist nur die Abkürzung, damit die anderen Geräte
+/// nicht bis zum nächsten Öffnen des Chats warten. Scheitert das Lesen der
+/// Gerätemenge, bleibt es beim alten Verhalten (Sicht beim nächsten Öffnen).
+async fn announce_group_change(st: &AppState, group_id: &str) {
+    match st.groups.state(group_id).await {
+        Ok(state) => st.hub.notify_group_changed(group_id, &state.devices),
+        Err(error) => {
+            tracing::warn!(?error, %group_id, "Gruppen-Hinweis nicht verteilt")
+        }
+    }
+}
+
 async fn group_set_role(
     State(st): State<AppState>,
     axum::extract::Path(group_id): axum::extract::Path<String>,
@@ -1494,7 +1508,10 @@ async fn group_set_role(
         .set_role(&group_id, &who.handle, &req.target, req.role)
         .await
     {
-        Ok(meta) => (StatusCode::OK, Json(meta)).into_response(),
+        Ok(meta) => {
+            announce_group_change(&st, &group_id).await;
+            (StatusCode::OK, Json(meta)).into_response()
+        }
         Err(error) => group_error_response(error),
     }
 }
@@ -1528,7 +1545,10 @@ async fn group_transfer(
         .transfer_ownership(&group_id, &who.handle, &req.target)
         .await
     {
-        Ok(meta) => (StatusCode::OK, Json(meta)).into_response(),
+        Ok(meta) => {
+            announce_group_change(&st, &group_id).await;
+            (StatusCode::OK, Json(meta)).into_response()
+        }
         Err(error) => group_error_response(error),
     }
 }
@@ -1580,7 +1600,10 @@ async fn group_update_info(
         )
         .await
     {
-        Ok(meta) => (StatusCode::OK, Json(meta)).into_response(),
+        Ok(meta) => {
+            announce_group_change(&st, &group_id).await;
+            (StatusCode::OK, Json(meta)).into_response()
+        }
         Err(error) => group_error_response(error),
     }
 }
@@ -1595,6 +1618,18 @@ struct WsAuth {
 fn waiting_event() -> Message {
     // Nur der Hinweis, nie Inhalt oder Absender (schnittstellen.md).
     Message::Text(r#"{"event":"message.waiting"}"#.into())
+}
+
+/// Hinweis, dass sich die Verwaltungssicht einer Gruppe geändert hat. Trägt
+/// die Gruppen-ID, damit der Client nur diese eine Sicht neu holt statt aller;
+/// den Inhalt (Rollen, Name, Einstellungen) holt er selbst über /meta, das
+/// prüft dort erneut, dass er Mitglied ist.
+fn group_changed_event(group_id: &str) -> Message {
+    Message::Text(
+        serde_json::json!({ "event": "group.changed", "group_id": group_id })
+            .to_string()
+            .into(),
+    )
 }
 
 /// Guard der /internal-Routen: None = ausgewiesen, Some = fertige Absage.
@@ -1869,6 +1904,9 @@ async fn drive_socket(st: AppState, mut socket: WebSocket) {
                 Ok(event) if event.device_id() == device_id => {
                     let message = match event {
                         HubEvent::MessageWaiting { .. } => waiting_event(),
+                        HubEvent::GroupChanged { group_id, .. } => {
+                            group_changed_event(&group_id)
+                        }
                         HubEvent::Notification { event_json, .. } => {
                             Message::Text(event_json.into())
                         }

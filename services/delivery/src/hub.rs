@@ -18,6 +18,12 @@ use tokio::sync::broadcast;
 pub enum HubEvent {
     /// Für dieses Gerät liegt eine Hülle bereit; Inhalt kommt per Pull.
     MessageWaiting { device_id: String },
+    /// Die Verwaltungssicht einer Gruppe hat sich geändert (Rolle, Besitz,
+    /// Name oder Einstellungen). Trägt NUR die Gruppen-ID, keinen Inhalt: das
+    /// Gerät holt die neue Sicht selbst über `GET /groups/{id}/meta`. Ohne
+    /// diesen Hinweis sähe ein anderes Gerät die Änderung erst beim nächsten
+    /// Öffnen des Chats, also praktisch erst nach einem Neuladen.
+    GroupChanged { device_id: String, group_id: String },
     /// Markierte Maschinen-Benachrichtigung eines Fremdprojekts (F070),
     /// bereits als fertiges Event-JSON serialisiert. Minimaler Inhalt:
     /// die Details holt der Nutzer im Fremdprojekt (pflichtenheft.md 5.2).
@@ -31,6 +37,7 @@ impl HubEvent {
     pub fn device_id(&self) -> &str {
         match self {
             HubEvent::MessageWaiting { device_id } => device_id,
+            HubEvent::GroupChanged { device_id, .. } => device_id,
             HubEvent::Notification { device_id, .. } => device_id,
         }
     }
@@ -59,6 +66,19 @@ impl RealtimeHub {
         let _ = self.tx.send(HubEvent::MessageWaiting {
             device_id: device_id.to_string(),
         });
+    }
+
+    /// Meldet allen Geräten der Gruppe, dass sich ihre Verwaltungssicht
+    /// geändert hat. Das eigene Gerät des Auslösers bekommt den Hinweis mit:
+    /// es hat die Antwort schon, aber ein zweites Gerät desselben Nutzers
+    /// braucht ihn genauso wie ein fremdes.
+    pub fn notify_group_changed(&self, group_id: &str, devices: &[String]) {
+        for device_id in devices {
+            let _ = self.tx.send(HubEvent::GroupChanged {
+                device_id: device_id.clone(),
+                group_id: group_id.to_string(),
+            });
+        }
     }
 
     /// Verteilt ein fertig serialisiertes Ereignis an ein Gerät. Ist das
