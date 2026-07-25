@@ -43,6 +43,13 @@ const STORE_NAME: &str = "state";
 /// Schlüssel des einen Zustands-Datensatzes; die Versionsnummer erlaubt
 /// später ein Format-Upgrade neben dem alten Datensatz.
 const STATE_KEY: &str = "smstate.v1";
+/// Schlüssel des Ordner-Handles der automatischen Sicherung. Liegt im
+/// SELBEN Object Store, aber unter eigenem Schlüssel: so braucht es keine
+/// Versions-Erhöhung der Datenbank (die einen Upgrade-Pfad für bestehende
+/// Ablagen erzwingen würde). Das Handle ist kein JSON, sondern ein
+/// strukturiert klonbares Browser-Objekt, deshalb liegt es neben dem
+/// Zustands-Blob und nicht darin.
+const BACKUP_FOLDER_KEY: &str = "smbakfolder.v1";
 
 pub struct BrowserStorage {
     /// Der entschlüsselte Zustand; leer, solange eine verschlüsselte Ablage
@@ -251,6 +258,63 @@ impl BrowserStorage {
             }
         });
     }
+}
+
+/// Legt das Ordner-Handle der automatischen Sicherung ab. Das Handle ist ein
+/// Browser-Objekt (strukturiert klonbar), IndexedDB kann es also direkt
+/// speichern; JSON könnte es nicht, deshalb der eigene Weg neben dem
+/// Zustands-Blob.
+pub async fn save_backup_folder(handle: wasm_bindgen::JsValue) -> Result<(), String> {
+    let db = open_database().await?;
+    let tx = db
+        .transaction(STORE_NAME)
+        .with_mode(TransactionMode::Readwrite)
+        .build()
+        .map_err(|error| format!("Transaktion: {error}"))?;
+    tx.object_store(STORE_NAME)
+        .map_err(|error| format!("Store: {error}"))?
+        .put(handle)
+        .with_key(BACKUP_FOLDER_KEY)
+        .await
+        .map_err(|error| format!("Ordner-Handle nicht gespeichert: {error}"))?;
+    tx.commit()
+        .await
+        .map_err(|error| format!("Commit: {error}"))?;
+    Ok(())
+}
+
+/// Holt das abgelegte Ordner-Handle zurück. `None`, wenn keiner gewählt wurde.
+/// Ob die Schreib-Erlaubnis noch gilt, sagt das Handle selbst (der Browser
+/// kann sie zwischen zwei Besuchen verlieren, siehe `folder`-Modul).
+pub async fn load_backup_folder() -> Option<wasm_bindgen::JsValue> {
+    let db = open_database().await.ok()?;
+    let tx = db
+        .transaction(STORE_NAME)
+        .with_mode(TransactionMode::Readonly)
+        .build()
+        .ok()?;
+    let store = tx.object_store(STORE_NAME).ok()?;
+    let stored: Option<wasm_bindgen::JsValue> = store.get(BACKUP_FOLDER_KEY).await.ok().flatten();
+    stored
+}
+
+/// Entfernt das Ordner-Handle (Nutzer schaltet die automatische Sicherung ab).
+pub async fn clear_backup_folder() -> Result<(), String> {
+    let db = open_database().await?;
+    let tx = db
+        .transaction(STORE_NAME)
+        .with_mode(TransactionMode::Readwrite)
+        .build()
+        .map_err(|error| format!("Transaktion: {error}"))?;
+    tx.object_store(STORE_NAME)
+        .map_err(|error| format!("Store: {error}"))?
+        .delete(BACKUP_FOLDER_KEY)
+        .await
+        .map_err(|error| format!("Ordner-Handle nicht entfernt: {error}"))?;
+    tx.commit()
+        .await
+        .map_err(|error| format!("Commit: {error}"))?;
+    Ok(())
 }
 
 /// Schreibt den (bereits kodierten) Zustands-Blob nach IndexedDB und wartet

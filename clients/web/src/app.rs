@@ -31,6 +31,7 @@ use base64::Engine as _;
 use client_app::account::{
     build_device_credential, build_rotation_cert, decode_seed, IdentityKeypair,
 };
+use client_app::autobackup::{Action, AutoBackup, Trigger};
 use client_app::delivery::{
     parse_ws_event, ws_auth_frame, DeliveryClient, GroupMemberInfo, GroupMetaInfo, GroupOutgoing,
     GroupPolicy, GroupRole, OutgoingEnvelope, WsEvent,
@@ -215,6 +216,71 @@ fn save_sealed_default(storage: &SharedStorage, on: bool) {
     let _ = storage
         .borrow_mut()
         .put(SEALED_DEFAULT_KEY, &[u8::from(on)]);
+}
+
+/// Einstellungen der automatischen Sicherung (Auslöser, Zeitabstand,
+/// Rotations-Drossel) als JSON; die Regeln dazu stehen in
+/// `client_app::autobackup`. Getrennt davon die Zeitstempel der letzten
+/// Sicherung und der letzten Wurzelrotation, denn die sind Laufzeit-Zustand
+/// und keine Einstellung.
+const AUTOBACKUP_KEY: &str = "settings/autobackup";
+const AUTOBACKUP_LAST_KEY: &str = "settings/autobackup_last";
+const AUTOBACKUP_LAST_ROTATION_KEY: &str = "settings/autobackup_last_rotation";
+/// Die Sicherungs-Passphrase für die automatischen Läufe. Sie MUSS liegen
+/// bleiben, weil niemand sie bei jedem Intervall eingeben kann, und sie liegt
+/// im Zustands-Blob, der selbst unter dem Konto-Passwort verschlüsselt ist
+/// (Argon2id plus ChaCha20-Poly1305, `keystore`).
+///
+/// [ANNAHME: Damit ist die automatische Sicherung so stark wie die lokale
+/// Ablage: wer den entsperrten Zustand hat, hat auch die Passphrase. Das ist
+/// der Preis für unbeaufsichtigtes Schreiben; die Alternative wäre, bei jedem
+/// Lauf zu fragen, was die Funktion sinnlos machen würde. Die DATEI selbst
+/// bleibt geschützt, denn sie liegt außerhalb und trägt ihre eigene
+/// Verschlüsselung.]
+const AUTOBACKUP_PASSPHRASE_KEY: &str = "settings/autobackup_passphrase";
+
+fn load_autobackup_passphrase(storage: &SharedStorage) -> Option<String> {
+    storage
+        .borrow()
+        .get(AUTOBACKUP_PASSPHRASE_KEY)
+        .ok()
+        .flatten()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
+fn load_autobackup(storage: &SharedStorage) -> AutoBackup {
+    let mut cfg: AutoBackup = storage
+        .borrow()
+        .get(AUTOBACKUP_KEY)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    // Auch beim Lesen aufräumen: eine von Hand bearbeitete oder aus einer
+    // älteren Fassung stammende Ablage könnte sonst einen Rotations-Haken
+    // ohne zugehörigen Auslöser tragen.
+    cfg.normalize();
+    cfg
+}
+
+fn save_autobackup(storage: &SharedStorage, cfg: &AutoBackup) {
+    if let Ok(json) = serde_json::to_vec(cfg) {
+        let _ = storage.borrow_mut().put(AUTOBACKUP_KEY, &json);
+    }
+}
+
+fn load_stamp(storage: &SharedStorage, key: &str) -> Option<u64> {
+    storage
+        .borrow()
+        .get(key)
+        .ok()
+        .flatten()
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u64::from_be_bytes)
+}
+
+fn save_stamp(storage: &SharedStorage, key: &str, at: u64) {
+    let _ = storage.borrow_mut().put(key, &at.to_be_bytes());
 }
 
 /// Ablage-Schlüssel der Einstellung „Live-Tippen im Anruf" (Paket E): während
@@ -3701,6 +3767,87 @@ async fn approve_device(storage: &SharedStorage, token: &str, input: &str) -> Re
 /// und erst nach dem bestätigten Erfolg nach `account_seed` befördert; eine
 /// unterbrochene Rotation schließt der nächste Versuch ab (siehe rotate_key
 /// in der CLI). Liefert die Zahl der neu signierten Geräte.
+/// Arbeitet einen Sicherungs-Auslöser ab: fragt die Regeln
+/// (`client_app::autobackup`), rotiert bei Bedarf den Wurzelschlüssel und
+/// schreibt die Sicherung in den freigegebenen Ordner.
+///
+/// Läuft im Hintergrund und meldet Fehler nur in die Konsole: eine
+/// automatische Sicherung darf den Chat nicht mit Meldungen unterbrechen, und
+/// ein fehlgeschlagener Versuch wiederholt sich beim nächsten Auslöser. Nur
+/// wenn die Erlaubnis für den Ordner fehlt, kommt ein sichtbarer Hinweis, denn
+/// den muss der Nutzer per Klick wieder erteilen.
+///
+/// Die Reihenfolge ist wichtig: ERST rotieren, dann sichern. Sonst enthielte
+/// die Datei den alten Wurzelschlüssel, und ein Rücksetzen aus ihr würde ein
+/// Konto wiederherstellen, dessen Schlüssel der Dienst nicht mehr kennt.
+async fn run_auto_backup(
+    storage: SharedStorage,
+    token: String,
+    passphrase: String,
+    trigger: Trigger,
+    set_status: WriteSignal<String>,
+) {
+    let cfg = load_autobackup(&storage);
+    let now = now_unix();
+    let action = cfg.action_for(
+        trigger,
+        now,
+        load_stamp(&storage, AUTOBACKUP_LAST_KEY),
+        load_stamp(&storage, AUTOBACKUP_LAST_ROTATION_KEY),
+    );
+    if action == Action::Skip {
+        return;
+    }
+    let Some(folder) = crate::storage::load_backup_folder()
+        .await
+        .and_then(crate::folder::Folder::from_js)
+    else {
+        leptos::logging::warn!("Automatische Sicherung: kein Ordner freigegeben");
+        return;
+    };
+    // Ohne gültige Erlaubnis nicht schreiben und den Nutzer bitten: das
+    // Nachfragen braucht eine Nutzer-Handlung, geht hier also nicht von selbst.
+    if !folder.has_permission().await {
+        set_status.set(
+            "Der Ordner für die automatische Sicherung ist nicht mehr freigegeben; \
+             in den Einstellungen erneut bestätigen."
+                .to_string(),
+        );
+        return;
+    }
+
+    if action == Action::BackupWithRotation {
+        match rotate_key_web(&storage, &token).await {
+            Ok(_) => {
+                save_stamp(&storage, AUTOBACKUP_LAST_ROTATION_KEY, now);
+                set_status.set(
+                    "Konto-Wurzelschlüssel rotiert; Kontakte sehen eine \
+                     Schlüsselwechsel-Warnung (erwartet)."
+                        .to_string(),
+                );
+            }
+            // Kein Abbruch: die Sicherung ist auch ohne Rotation wertvoll.
+            // Typischer Fall ist ein Zweitgerät, das den Wurzelschlüssel
+            // gar nicht hält.
+            Err(error) => {
+                leptos::logging::warn!("Automatische Rotation übersprungen: {error}")
+            }
+        }
+    }
+
+    let bytes = match storage.borrow().export_backup(&passphrase) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            leptos::logging::warn!("Automatische Sicherung nicht erstellt: {error}");
+            return;
+        }
+    };
+    match folder.write_backup(&bytes).await {
+        Ok(()) => save_stamp(&storage, AUTOBACKUP_LAST_KEY, now),
+        Err(error) => leptos::logging::warn!("Automatische Sicherung nicht geschrieben: {error}"),
+    }
+}
+
 async fn rotate_key_web(storage: &SharedStorage, token: &str) -> Result<usize, String> {
     let mut profile = load_profile(storage).ok_or("Kein Profil in der Ablage")?;
     if profile.account_seed.is_empty() {
@@ -3897,6 +4044,12 @@ fn App() -> impl IntoView {
     let (group_input, set_group_input) = signal(String::new());
     // Handles fürs nachträgliche Einladen in die offene Gruppe (kommagetrennt).
     let (group_add_input, set_group_add_input) = signal(String::new());
+    // Einstellungen der automatischen Sicherung und ob ein Ordner freigegeben
+    // ist (nur fürs Anzeigen; das Handle selbst liegt in IndexedDB).
+    let (autobackup, set_autobackup) = signal(AutoBackup::default());
+    let (autobackup_folder_ok, set_autobackup_folder_ok) = signal(false);
+    // Eingabefeld für die Sicherungs-Passphrase der automatischen Läufe.
+    let (autobackup_pw, set_autobackup_pw) = signal(String::new());
     // Gruppenname beim Gründen (optional).
     let (group_name_input, set_group_name_input) = signal(String::new());
     // Anzeigenamen der Gruppen-Chats (Schlüssel `grp:<id>` -> „Gruppe: ...");
@@ -4169,6 +4322,44 @@ fn App() -> impl IntoView {
                     }
                 });
             }
+            // Die Einstellungen der automatischen Sicherung übernehmen und
+            // prüfen, ob der freigegebene Ordner noch beschreibbar ist (der
+            // Browser kann die Erlaubnis zwischen zwei Besuchen verlieren).
+            set_autobackup.set(load_autobackup(&storage));
+            spawn_local(async move {
+                let ok = match crate::storage::load_backup_folder()
+                    .await
+                    .and_then(crate::folder::Folder::from_js)
+                {
+                    Some(folder) => folder.has_permission().await,
+                    None => false,
+                };
+                set_autobackup_folder_ok.set(ok);
+            });
+        }))
+    };
+
+    // Stösst einen Sicherungs-Auslöser an. Die Regeln entscheiden im Aufruf
+    // selbst, ob wirklich etwas passiert (Auslöser aktiv, Intervall fällig,
+    // Rotations-Drossel), deshalb ist der Aufruf hier billig und darf oft
+    // erfolgen. Ohne abgelegte Passphrase geht nichts: dann wurde die
+    // Funktion nie eingeschaltet.
+    let fire_auto_backup = {
+        let current_storage = current_storage.clone();
+        SendWrapper::new(Rc::new(move |trigger: Trigger| {
+            let Some(storage) = current_storage() else {
+                return;
+            };
+            if !load_autobackup(&storage).has(trigger) {
+                return;
+            }
+            let Some(passphrase) = load_autobackup_passphrase(&storage) else {
+                return;
+            };
+            let token = access_token.get_untracked();
+            spawn_local(run_auto_backup(
+                storage, token, passphrase, trigger, set_status,
+            ));
         }))
     };
 
@@ -4373,6 +4564,142 @@ fn App() -> impl IntoView {
                 Err(error) => set_status.set(format!("Download fehlgeschlagen: {error}")),
             }
         }
+    };
+
+    // Automatische Sicherung einschalten: Ordner wählen (braucht den Klick,
+    // deshalb hier und nicht im Hintergrund), Passphrase ablegen, sofort eine
+    // erste Sicherung schreiben. Die erste Sicherung ist wichtig, damit der
+    // Nutzer gleich sieht, dass es klappt, statt bis zum ersten Auslöser zu
+    // warten.
+    let on_autobackup_enable = {
+        let current_storage = current_storage.clone();
+        SendWrapper::new(Rc::new(move |_: ()| {
+            let Some(storage) = current_storage() else {
+                set_status.set("Nicht angemeldet.".to_string());
+                return;
+            };
+            let passphrase = autobackup_pw.get_untracked();
+            if passphrase.chars().count() < client_app::backup::MIN_PASSPHRASE_LEN {
+                set_status.set(format!(
+                    "Das Sicherungs-Passwort braucht mindestens {} Zeichen.",
+                    client_app::backup::MIN_PASSPHRASE_LEN
+                ));
+                return;
+            }
+            set_status.set("Ordner wird geöffnet ...".to_string());
+            spawn_local(async move {
+                let folder = match crate::folder::Folder::pick().await {
+                    Ok(folder) => folder,
+                    Err(error) => {
+                        set_status.set(error);
+                        return;
+                    }
+                };
+                if let Err(error) = folder.ensure_permission().await {
+                    set_status.set(error);
+                    return;
+                }
+                if let Err(error) = crate::storage::save_backup_folder(folder.as_js()).await {
+                    set_status.set(format!("Ordner nicht gemerkt: {error}"));
+                    return;
+                }
+                let _ = storage
+                    .borrow_mut()
+                    .put(AUTOBACKUP_PASSPHRASE_KEY, passphrase.as_bytes());
+                // Ohne aktiven Auslöser passiert nichts; darum bei Erstwahl
+                // einen sinnvollen setzen (Verlassen der Seite ist der
+                // sparsamste, er schreibt nur bei Bedarf).
+                let mut cfg = load_autobackup(&storage);
+                if !cfg.is_active() {
+                    cfg.triggers.push(Trigger::PageHide);
+                    cfg.normalize();
+                    save_autobackup(&storage, &cfg);
+                }
+                set_autobackup.set(cfg);
+                set_autobackup_folder_ok.set(true);
+                set_autobackup_pw.set(String::new());
+
+                // Erste Sicherung sofort, damit die Datei existiert. Den
+                // Borrow VOR dem await beenden (sonst sähe ein zweiter
+                // Zugriff einen Panic statt eines sauberen Fehlers).
+                let exported = storage.borrow().export_backup(&passphrase);
+                match exported {
+                    Ok(bytes) => match folder.write_backup(&bytes).await {
+                        Ok(()) => {
+                            save_stamp(&storage, AUTOBACKUP_LAST_KEY, now_unix());
+                            set_status.set(
+                                "Automatische Sicherung eingeschaltet und erste Sicherung \
+                                 geschrieben."
+                                    .to_string(),
+                            );
+                        }
+                        Err(error) => set_status.set(format!("Schreiben fehlgeschlagen: {error}")),
+                    },
+                    Err(error) => set_status.set(error),
+                }
+            });
+        }))
+    };
+
+    // Abschalten: Auslöser leeren, Ordner-Handle und Passphrase entfernen. Die
+    // bereits geschriebene Datei bleibt liegen, sie gehört dem Nutzer.
+    let on_autobackup_disable = {
+        let current_storage = current_storage.clone();
+        SendWrapper::new(Rc::new(move |_: ()| {
+            let Some(storage) = current_storage() else {
+                return;
+            };
+            let cfg = AutoBackup::default();
+            save_autobackup(&storage, &cfg);
+            let _ = storage.borrow_mut().remove(AUTOBACKUP_PASSPHRASE_KEY);
+            set_autobackup.set(cfg);
+            set_autobackup_folder_ok.set(false);
+            spawn_local(async move {
+                let _ = crate::storage::clear_backup_folder().await;
+            });
+            set_status.set(
+                "Automatische Sicherung abgeschaltet; die vorhandene Datei bleibt liegen."
+                    .to_string(),
+            );
+        }))
+    };
+
+    // Einen Auslöser an- oder abschalten.
+    let on_autobackup_trigger = {
+        let current_storage = current_storage.clone();
+        SendWrapper::new(Rc::new(move |(trigger, on): (Trigger, bool)| {
+            let Some(storage) = current_storage() else {
+                return;
+            };
+            let mut cfg = load_autobackup(&storage);
+            cfg.triggers.retain(|t| *t != trigger);
+            if on {
+                cfg.triggers.push(trigger);
+            }
+            // normalize entfernt einen Rotations-Haken, dessen Auslöser gerade
+            // abgeschaltet wurde (er hätte keine Wirkung mehr).
+            cfg.normalize();
+            save_autobackup(&storage, &cfg);
+            set_autobackup.set(cfg);
+        }))
+    };
+
+    // Rotation für einen Auslöser an- oder abschalten.
+    let on_autobackup_rotate = {
+        let current_storage = current_storage.clone();
+        SendWrapper::new(Rc::new(move |(trigger, on): (Trigger, bool)| {
+            let Some(storage) = current_storage() else {
+                return;
+            };
+            let mut cfg = load_autobackup(&storage);
+            cfg.rotate_on.retain(|t| *t != trigger);
+            if on {
+                cfg.rotate_on.push(trigger);
+            }
+            cfg.normalize();
+            save_autobackup(&storage, &cfg);
+            set_autobackup.set(cfg);
+        }))
     };
 
     // Sicherung einspielen (Boot-Bildschirm): die gewählte Datei mit dem
@@ -5099,13 +5426,78 @@ fn App() -> impl IntoView {
     // dann noch unbehandelte Hinweise. Verpasst wird so keiner.
     {
         let run_fetch = run_fetch.clone();
+        let fire_auto_backup = fire_auto_backup.clone();
         Effect::new(move |_| {
             let pending = hints.get();
             let currently_busy = busy.get();
             if logged_in.get() && !currently_busy && pending > handled_hints.get_value() {
                 handled_hints.set_value(pending);
                 run_fetch();
+                // Der Ratchet ist mit dem Empfang weitergelaufen, der Stand in
+                // der Sicherungsdatei damit veraltet.
+                fire_auto_backup(Trigger::MessageReceived);
             }
+        });
+    }
+
+    // Auslöser „nach Zeitabstand": ein Ticker, der die Regeln fragt. Er läuft
+    // fein (jede Minute) und die Regeln entscheiden, ob der Abstand um ist; so
+    // muss der Ticker nicht neu gestartet werden, wenn der Nutzer den Abstand
+    // ändert. Die Schleife endet mit der Kanal-Epoche, also bei Abmeldung.
+    {
+        let fire_auto_backup = fire_auto_backup.clone();
+        Effect::new(move |seen: Option<bool>| {
+            let active = logged_in.get();
+            // Nur beim Übergang auf angemeldet starten, nicht bei jedem Lauf.
+            if active && seen != Some(true) {
+                let epoch = channel_epoch;
+                let my_epoch = channel_epoch.get_value();
+                let fire = fire_auto_backup.clone();
+                spawn_local(async move {
+                    loop {
+                        gloo_timers::future::TimeoutFuture::new(
+                            u32::try_from(
+                                client_app::autobackup::MIN_INTERVAL_SECS.saturating_mul(1000),
+                            )
+                            .unwrap_or(60_000),
+                        )
+                        .await;
+                        if epoch.get_value() != my_epoch {
+                            return;
+                        }
+                        fire(Trigger::Interval);
+                    }
+                });
+            }
+            active
+        });
+    }
+
+    // Auslöser „beim Verlassen der Seite": pagehide feuert beim Schließen, beim
+    // Wechseln des Tabs und beim Minimieren. Das Schreiben selbst ist
+    // asynchron und kann beim endgültigen Schließen abbrechen; weil aber JEDER
+    // Sichtbarkeitswechsel schreibt, ist der Stand praktisch immer aktuell
+    // (siehe autobackup::Trigger::PageHide).
+    {
+        let fire_auto_backup = fire_auto_backup.clone();
+        Effect::new(move |seen: Option<bool>| {
+            let active = logged_in.get();
+            if active && seen != Some(true) {
+                let fire = fire_auto_backup.clone();
+                let closure = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+                    fire(Trigger::PageHide);
+                });
+                if let Some(window) = web_sys::window() {
+                    let _ = window.add_event_listener_with_callback(
+                        "pagehide",
+                        wasm_bindgen::JsCast::unchecked_ref(closure.as_ref()),
+                    );
+                }
+                // Der Listener lebt so lange wie die Seite; forget ist hier
+                // richtig, weil er bis zum Schluss gebraucht wird.
+                closure.forget();
+            }
+            active
         });
     }
 
@@ -6823,6 +7215,10 @@ fn App() -> impl IntoView {
                     let on_message_key = on_message_key.clone();
                     // Handler der Einstellungen-Ansicht (eigener Zweig des
                     // Haupt-Bereichs), frisch geklont wie die Thread-Handler.
+                    let on_autobackup_enable = on_autobackup_enable.clone();
+                    let on_autobackup_disable = on_autobackup_disable.clone();
+                    let on_autobackup_trigger = on_autobackup_trigger.clone();
+                    let on_autobackup_rotate = on_autobackup_rotate.clone();
                     let on_kt_check = on_kt_check.clone();
                     let on_approve = on_approve.clone();
                     let on_revoke = on_revoke.clone();
@@ -7339,6 +7735,130 @@ fn App() -> impl IntoView {
                                                                 </button>
                                                             </div>
                                                         </div>
+                                                        {
+                                                            let enable = on_autobackup_enable.clone();
+                                                            let disable = on_autobackup_disable.clone();
+                                                            let toggle = on_autobackup_trigger.clone();
+                                                            let rotate = on_autobackup_rotate.clone();
+                                                            move || {
+                                                                let cfg = autobackup.get();
+                                                                let folder_ok = autobackup_folder_ok.get();
+                                                                let supported = crate::folder::is_supported();
+                                                                let enable = enable.clone();
+                                                                let disable = disable.clone();
+                                                                let toggle = toggle.clone();
+                                                                let rotate = rotate.clone();
+                                                                view! {
+                                                                    <div class="sm-set-row sm-set-stack">
+                                                                        <span class="sm-set-label">
+                                                                            "Automatisch sichern"
+                                                                            <small>
+                                                                                {if supported {
+                                                                                    "Schreibt die Sicherung ohne weitere Dialoge in einen freigegebenen Ordner. Auslöser sind kombinierbar; je Auslöser lässt sich zusätzlich der Konto-Wurzelschlüssel rotieren."
+                                                                                } else {
+                                                                                    "Dieser Browser kann keinen Ordner freigeben (Chrome oder Edge nötig). Es bleibt die Sicherung von Hand oben."
+                                                                                }}
+                                                                            </small>
+                                                                        </span>
+                                                                        {(supported && !folder_ok)
+                                                                            .then(|| {
+                                                                                view! {
+                                                                                    <div class="sm-set-form">
+                                                                                        <input
+                                                                                            type="password"
+                                                                                            class="sm-set-input"
+                                                                                            aria-label="Sicherungs-Passwort für die automatischen Sicherungen (mindestens 12 Zeichen)"
+                                                                                            placeholder="Sicherungs-Passwort (min. 12)"
+                                                                                            prop:value=autobackup_pw
+                                                                                            on:input=move |ev| {
+                                                                                                set_autobackup_pw.set(event_target_value(&ev))
+                                                                                            }
+                                                                                        />
+                                                                                        <button
+                                                                                            type="button"
+                                                                                            class="sm-secondary"
+                                                                                            on:click=move |_| (enable)(())
+                                                                                            disabled=busy
+                                                                                        >
+                                                                                            "Ordner freigeben und einschalten"
+                                                                                        </button>
+                                                                                    </div>
+                                                                                }
+                                                                            })}
+                                                                        {folder_ok
+                                                                            .then(|| {
+                                                                                let toggle = toggle.clone();
+                                                                                let rotate = rotate.clone();
+                                                                                view! {
+                                                                                    <ul class="sm-autobackup-triggers">
+                                                                                        {Trigger::ALL
+                                                                                            .iter()
+                                                                                            .map(|trigger| {
+                                                                                                let trigger = *trigger;
+                                                                                                let on = cfg.has(trigger);
+                                                                                                let rotates = cfg.rotates_on(trigger);
+                                                                                                let toggle = toggle.clone();
+                                                                                                let rotate = rotate.clone();
+                                                                                                view! {
+                                                                                                    <li>
+                                                                                                        <label>
+                                                                                                            <input
+                                                                                                                type="checkbox"
+                                                                                                                prop:checked=on
+                                                                                                                disabled=busy
+                                                                                                                on:change=move |ev| {
+                                                                                                                    (toggle)((trigger, event_target_checked(&ev)))
+                                                                                                                }
+                                                                                                            />
+                                                                                                            {trigger.label()}
+                                                                                                        </label>
+                                                                                                        // Der Rotations-Haken nur beim aktiven
+                                                                                                        // Auslöser: sonst hätte er keine Wirkung.
+                                                                                                        {on
+                                                                                                            .then(|| {
+                                                                                                                view! {
+                                                                                                                    <label class="sm-autobackup-rotate">
+                                                                                                                        <input
+                                                                                                                            type="checkbox"
+                                                                                                                            prop:checked=rotates
+                                                                                                                            disabled=busy
+                                                                                                                            on:change=move |ev| {
+                                                                                                                                (rotate)((trigger, event_target_checked(&ev)))
+                                                                                                                            }
+                                                                                                                        />
+                                                                                                                        "dabei Schlüssel rotieren"
+                                                                                                                    </label>
+                                                                                                                }
+                                                                                                            })}
+                                                                                                    </li>
+                                                                                                }
+                                                                                            })
+                                                                                            .collect_view()}
+                                                                                    </ul>
+                                                                                }
+                                                                            })}
+                                                                        {folder_ok
+                                                                            .then(|| {
+                                                                                view! {
+                                                                                    <div class="sm-set-form">
+                                                                                        <small>
+                                                                                            "Rotation höchstens einmal pro Tag: sie ändert die Sicherheitsnummer bei allen Kontakten und löst dort die Schlüsselwechsel-Warnung aus."
+                                                                                        </small>
+                                                                                        <button
+                                                                                            type="button"
+                                                                                            class="sm-secondary"
+                                                                                            on:click=move |_| (disable)(())
+                                                                                            disabled=busy
+                                                                                        >
+                                                                                            "Abschalten"
+                                                                                        </button>
+                                                                                    </div>
+                                                                                }
+                                                                            })}
+                                                                    </div>
+                                                                }
+                                                            }
+                                                        }
                                                         {move || {
                                                             match deletion_pending.get() {
                                                                 // Läuft eine Löschung: Frist zeigen und

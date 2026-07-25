@@ -22,6 +22,7 @@
 //! Ablage hinter dem Storage-Trait.
 
 pub mod account;
+pub mod autobackup;
 pub mod backup;
 pub mod call;
 pub mod datachan;

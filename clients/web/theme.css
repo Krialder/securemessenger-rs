@@ -1191,6 +1191,34 @@ button:disabled {
   margin-block-start: var(--sm-space-2);
   max-inline-size: 22rem;
 }
+/* Auslöser-Liste der automatischen Sicherung: je Zeile ein Auslöser, der
+   Rotations-Haken eingerückt darunter, damit die Zuordnung sichtbar ist. */
+.sm-autobackup-triggers {
+  list-style: none;
+  margin: var(--sm-space-2) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-2);
+}
+.sm-autobackup-triggers li {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-1);
+}
+.sm-autobackup-triggers label {
+  display: flex;
+  gap: var(--sm-space-2);
+  align-items: center;
+  font-size: 0.9rem;
+  color: var(--sm-on-surface);
+}
+/* Der Rotations-Haken gehört zum Auslöser darüber: Einrückung zeigt die
+   Unterordnung, die kleinere Schrift die geringere Wichtigkeit. */
+.sm-autobackup-rotate {
+  margin-inline-start: var(--sm-space-4);
+  font-size: 0.82rem;
+}
 .sm-set-input {
   font: inherit;
   font-size: 0.9rem;
