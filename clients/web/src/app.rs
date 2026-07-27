@@ -3028,18 +3028,37 @@ async fn add_group_members(
     let mut new_roster = old_roster;
     new_roster.extend(new_devices);
     save_roster(storage, group_id, &new_roster)?;
+    // Die neue Mitgliederliste auch dauerhaft ablegen, nicht nur ins Signal:
+    // sonst zeigte die Chatliste nach einem Neuladen wieder den alten Stand
+    // (load_group_labels liest diesen Index).
+    remember_group(
+        storage,
+        GroupEntry {
+            id: group_id.to_string(),
+            members: members.clone(),
+            status: GroupStatus::Active,
+        },
+    )?;
 
-    // Frischer Roster an alle; best effort wie beim Entfernen.
+    // Frischer Roster an alle. NICHT best effort (anders als beim Entfernen):
+    // die Empfänger können einen Roster selbst nur kürzen, nie ergänzen, denn
+    // die MLS-Mitgliederliste führt Handles, keine Geräte-IDs. Bleibt diese
+    // Nachricht aus, könnten die Bestehenden das neue Mitglied nie
+    // adressieren, ohne dass es auffiele.
     let roster_blob = session.create_message(&grouptext::encode_roster(&new_roster))?;
     save_member_state(storage, &session.export_state()?)?;
     let roster_fanout = seal_group_fanout(&new_roster, &own_device_id, group_id, &roster_blob)?;
     if !roster_fanout.is_empty() {
-        if let Err(error) = delivery
+        delivery
             .group_messages(token, group_id, &roster_fanout)
             .await
-        {
-            leptos::logging::warn!("Roster-Nachricht nicht zugestellt: {error}");
-        }
+            .map_err(|error| {
+                format!(
+                    "Eingeladen, aber die Geräteliste erreichte die anderen nicht ({error}). \
+                     Sie können dem neuen Mitglied noch nicht antworten; eine Nachricht in die \
+                     Gruppe oder ein erneutes Einladen verteilt sie neu."
+                )
+            })?;
     }
     Ok(members)
 }
@@ -3759,14 +3778,6 @@ async fn approve_device(storage: &SharedStorage, token: &str, input: &str) -> Re
     Ok(outcome.protocol_device_id)
 }
 
-/// Rotiert den Konto-Wurzelschlüssel (ADR-0010, Browser-Fassung von `sm
-/// rotate-key`). Nur auf einem Erstgerät mit Wurzel-Seed. Signiert das
-/// Rotations-Zertifikat mit dem ALTEN Schlüssel, jedes Gerät mit dem NEUEN
-/// (und erneuert dessen Ablauf), und reicht beides ein. Absturzsicher: der
-/// neue Seed wird VOR dem Serveraufruf als `pending` in IndexedDB abgelegt
-/// und erst nach dem bestätigten Erfolg nach `account_seed` befördert; eine
-/// unterbrochene Rotation schließt der nächste Versuch ab (siehe rotate_key
-/// in der CLI). Liefert die Zahl der neu signierten Geräte.
 /// Arbeitet einen Sicherungs-Auslöser ab: fragt die Regeln
 /// (`client_app::autobackup`), rotiert bei Bedarf den Wurzelschlüssel und
 /// schreibt die Sicherung in den freigegebenen Ordner.
@@ -3786,6 +3797,9 @@ async fn run_auto_backup(
     passphrase: String,
     trigger: Trigger,
     set_status: WriteSignal<String>,
+    // Ob die fehlende Ordner-Erlaubnis in dieser Sitzung schon gemeldet wurde;
+    // ohne das wiederholt der Intervall-Timer die Meldung im Minutentakt.
+    permission_warned: StoredValue<bool>,
 ) {
     let cfg = load_autobackup(&storage);
     let now = now_unix();
@@ -3798,6 +3812,17 @@ async fn run_auto_backup(
     if action == Action::Skip {
         return;
     }
+    // Die Stempel SOFORT setzen, bevor der erste await läuft, nicht erst nach
+    // dem Schreiben. Sonst entscheiden zwei gleichzeitige Auslöser (etwa der
+    // Intervall-Timer und ein Tab-Wechsel) beide anhand desselben alten
+    // Stempels: die Drossel greift nicht, und der Wurzelschlüssel würde binnen
+    // Sekunden zweimal rotieren. Scheitert der Lauf später, verschiebt das
+    // höchstens die nächste Sicherung um ein Intervall, was harmlos ist; eine
+    // doppelte Rotation wäre es nicht (sie alarmiert alle Kontakte).
+    save_stamp(&storage, AUTOBACKUP_LAST_KEY, now);
+    if action == Action::BackupWithRotation {
+        save_stamp(&storage, AUTOBACKUP_LAST_ROTATION_KEY, now);
+    }
     let Some(folder) = crate::storage::load_backup_folder()
         .await
         .and_then(crate::folder::Folder::from_js)
@@ -3808,18 +3833,28 @@ async fn run_auto_backup(
     // Ohne gültige Erlaubnis nicht schreiben und den Nutzer bitten: das
     // Nachfragen braucht eine Nutzer-Handlung, geht hier also nicht von selbst.
     if !folder.has_permission().await {
-        set_status.set(
-            "Der Ordner für die automatische Sicherung ist nicht mehr freigegeben; \
-             in den Einstellungen erneut bestätigen."
-                .to_string(),
-        );
+        // Nur einmal je Sitzung melden, sonst wiederholt der Intervall-Timer
+        // dieselbe Meldung im Minutentakt und überschreibt den Chat-Status.
+        if !permission_warned.get_value() {
+            permission_warned.set_value(true);
+            set_status.set(
+                "Der Ordner für die automatische Sicherung ist nicht mehr freigegeben; \
+                 in den Einstellungen unter „Automatische Sicherung\" erneut freigeben."
+                    .to_string(),
+            );
+        }
+        return;
+    }
+    // Zwischen der Entscheidung oben und hier liegen mehrere await; hat der
+    // Nutzer die automatische Sicherung inzwischen abgeschaltet, nicht mehr
+    // rotieren und nicht mehr schreiben.
+    if !load_autobackup(&storage).has(trigger) {
         return;
     }
 
     if action == Action::BackupWithRotation {
         match rotate_key_web(&storage, &token).await {
             Ok(_) => {
-                save_stamp(&storage, AUTOBACKUP_LAST_ROTATION_KEY, now);
                 set_status.set(
                     "Konto-Wurzelschlüssel rotiert; Kontakte sehen eine \
                      Schlüsselwechsel-Warnung (erwartet)."
@@ -3842,12 +3877,31 @@ async fn run_auto_backup(
             return;
         }
     };
-    match folder.write_backup(&bytes).await {
-        Ok(()) => save_stamp(&storage, AUTOBACKUP_LAST_KEY, now),
-        Err(error) => leptos::logging::warn!("Automatische Sicherung nicht geschrieben: {error}"),
+    if let Err(error) = folder.write_backup(&bytes).await {
+        leptos::logging::warn!("Automatische Sicherung nicht geschrieben: {error}");
+        // Nach einer Rotation ist ein gescheitertes Schreiben nicht harmlos:
+        // die Datei auf der Platte trägt dann den ALTEN Wurzelschlüssel, den
+        // der Dienst nicht mehr kennt, taugt also nicht mehr zum
+        // Wiederherstellen. Das gehört sichtbar gesagt, nicht in die Konsole.
+        if action == Action::BackupWithRotation {
+            set_status.set(
+                "Achtung: Der Schlüssel wurde rotiert, die Sicherungsdatei konnte aber \
+                 nicht geschrieben werden. Die vorhandene Datei ist damit veraltet; \
+                 in den Einstellungen von Hand eine neue Sicherung erstellen."
+                    .to_string(),
+            );
+        }
     }
 }
 
+/// Rotiert den Konto-Wurzelschlüssel (ADR-0010, Browser-Fassung von `sm
+/// rotate-key`). Nur auf einem Erstgerät mit Wurzel-Seed. Signiert das
+/// Rotations-Zertifikat mit dem ALTEN Schlüssel, jedes Gerät mit dem NEUEN
+/// (und erneuert dessen Ablauf), und reicht beides ein. Absturzsicher: der
+/// neue Seed wird VOR dem Serveraufruf als `pending` in IndexedDB abgelegt
+/// und erst nach dem bestätigten Erfolg nach `account_seed` befördert; eine
+/// unterbrochene Rotation schließt der nächste Versuch ab (siehe rotate_key
+/// in der CLI). Liefert die Zahl der neu signierten Geräte.
 async fn rotate_key_web(storage: &SharedStorage, token: &str) -> Result<usize, String> {
     let mut profile = load_profile(storage).ok_or("Kein Profil in der Ablage")?;
     if profile.account_seed.is_empty() {
@@ -4042,6 +4096,9 @@ fn App() -> impl IntoView {
     let (new_chat_input, set_new_chat_input) = signal(String::new());
     // Mitglieder-Eingabe fürs Gründen einer Gruppe (im Neuer-Chat-Panel).
     let (group_input, set_group_input) = signal(String::new());
+    // Ob die fehlende Ordner-Freigabe schon gemeldet wurde. Ohne das meldete
+    // der Intervall-Timer sie bei jedem Lauf erneut.
+    let autobackup_permission_warned = StoredValue::new(false);
     // Handles fürs nachträgliche Einladen in die offene Gruppe (kommagetrennt).
     let (group_add_input, set_group_add_input) = signal(String::new());
     // Einstellungen der automatischen Sicherung und ob ein Ordner freigegeben
@@ -4358,7 +4415,12 @@ fn App() -> impl IntoView {
             };
             let token = access_token.get_untracked();
             spawn_local(run_auto_backup(
-                storage, token, passphrase, trigger, set_status,
+                storage,
+                token,
+                passphrase,
+                trigger,
+                set_status,
+                autobackup_permission_warned,
             ));
         }))
     };
@@ -4578,14 +4640,31 @@ fn App() -> impl IntoView {
                 set_status.set("Nicht angemeldet.".to_string());
                 return;
             };
-            let passphrase = autobackup_pw.get_untracked();
-            if passphrase.chars().count() < client_app::backup::MIN_PASSPHRASE_LEN {
-                set_status.set(format!(
-                    "Das Sicherungs-Passwort braucht mindestens {} Zeichen.",
-                    client_app::backup::MIN_PASSPHRASE_LEN
-                ));
-                return;
-            }
+            // Leeres Feld heißt: bestehendes Passwort behalten. Das ist der
+            // Fall „Ordner nur neu freigeben" (Browser vergessen die Erlaubnis
+            // regelmäßig). Ein neues Passwort hier würde die vorhandene
+            // Sicherungsdatei mit einem ANDEREN Schlüssel überschreiben; wer
+            // dann noch das alte im Kopf hat, käme an keine der beiden.
+            let typed = autobackup_pw.get_untracked();
+            let stored = load_autobackup_passphrase(&storage);
+            let passphrase = if typed.is_empty() {
+                match stored {
+                    Some(existing) => existing,
+                    None => {
+                        set_status.set("Sicherungs-Passwort angeben.".to_string());
+                        return;
+                    }
+                }
+            } else {
+                if typed.chars().count() < client_app::backup::MIN_PASSPHRASE_LEN {
+                    set_status.set(format!(
+                        "Das Sicherungs-Passwort braucht mindestens {} Zeichen.",
+                        client_app::backup::MIN_PASSPHRASE_LEN
+                    ));
+                    return;
+                }
+                typed
+            };
             set_status.set("Ordner wird geöffnet ...".to_string());
             spawn_local(async move {
                 let folder = match crate::folder::Folder::pick().await {
@@ -5172,12 +5251,15 @@ fn App() -> impl IntoView {
     let run_fetch = SendWrapper::new(Rc::new({
         let core = core.clone();
         let apply_call_signal = apply_call_signal.clone();
+        let fire_auto_backup = fire_auto_backup.clone();
         move || {
             if busy.get_untracked() {
                 return;
             }
             set_busy.set(true);
             let core = core.clone();
+            // Der Sicherungs-Auslöser läuft am ENDE des Abrufs (siehe unten).
+            let fire_after_fetch = fire_auto_backup.clone();
             // Je Aufruf einen eigenen Klon des Anruf-Signal-Handlers, damit die
             // äußere Closure Fn bleibt (der async-Block zieht ihn hinein).
             let apply_call_signal = apply_call_signal.clone();
@@ -5412,6 +5494,12 @@ fn App() -> impl IntoView {
                     None => set_status.set("Nicht angemeldet.".to_string()),
                 }
                 set_busy.set(false);
+                // ERST hier sichern, nicht schon beim Anstoßen des Abrufs: der
+                // Ratchet ist genau jetzt weitergelaufen, und die Ablage trägt
+                // die neuen Nachrichten. Ein Auslöser vor dem Abruf würde den
+                // Stand VOR dem Empfang festhalten, also gerade nicht das, was
+                // der Auslöser verspricht.
+                fire_after_fetch(Trigger::MessageReceived);
             });
         }
     }));
@@ -5426,16 +5514,15 @@ fn App() -> impl IntoView {
     // dann noch unbehandelte Hinweise. Verpasst wird so keiner.
     {
         let run_fetch = run_fetch.clone();
-        let fire_auto_backup = fire_auto_backup.clone();
         Effect::new(move |_| {
             let pending = hints.get();
             let currently_busy = busy.get();
             if logged_in.get() && !currently_busy && pending > handled_hints.get_value() {
                 handled_hints.set_value(pending);
+                // run_fetch stösst den Sicherungs-Auslöser selbst an, und zwar
+                // NACH dem Verarbeiten (der Stand soll die neuen Nachrichten
+                // enthalten).
                 run_fetch();
-                // Der Ratchet ist mit dem Empfang weitergelaufen, der Stand in
-                // der Sicherungsdatei damit veraltet.
-                fire_auto_backup(Trigger::MessageReceived);
             }
         });
     }
@@ -5478,27 +5565,26 @@ fn App() -> impl IntoView {
     // asynchron und kann beim endgültigen Schließen abbrechen; weil aber JEDER
     // Sichtbarkeitswechsel schreibt, ist der Stand praktisch immer aktuell
     // (siehe autobackup::Trigger::PageHide).
+    //
+    // GENAU EINMAL registrieren, nicht bei jeder Anmeldung: der Listener wird
+    // mit `forget` an die Seite gehängt und lässt sich danach nicht mehr
+    // entfernen. Ein zweites Anmelden (nach Abmelden) würde sonst einen
+    // weiteren hinzufügen, und ein einziger Tab-Wechsel startete danach
+    // mehrere Sicherungsläufe gleichzeitig. Ob wirklich etwas passiert,
+    // entscheidet ohnehin `fire_auto_backup` (angemeldet? Auslöser aktiv?),
+    // deshalb ist ein dauerhaft hängender Listener hier unschädlich.
     {
         let fire_auto_backup = fire_auto_backup.clone();
-        Effect::new(move |seen: Option<bool>| {
-            let active = logged_in.get();
-            if active && seen != Some(true) {
-                let fire = fire_auto_backup.clone();
-                let closure = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
-                    fire(Trigger::PageHide);
-                });
-                if let Some(window) = web_sys::window() {
-                    let _ = window.add_event_listener_with_callback(
-                        "pagehide",
-                        wasm_bindgen::JsCast::unchecked_ref(closure.as_ref()),
-                    );
-                }
-                // Der Listener lebt so lange wie die Seite; forget ist hier
-                // richtig, weil er bis zum Schluss gebraucht wird.
-                closure.forget();
-            }
-            active
+        let closure = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+            fire_auto_backup(Trigger::PageHide);
         });
+        if let Some(window) = web_sys::window() {
+            let _ = window.add_event_listener_with_callback(
+                "pagehide",
+                wasm_bindgen::JsCast::unchecked_ref(closure.as_ref()),
+            );
+        }
+        closure.forget();
     }
 
     // Meldet der Kanal eine geänderte Gruppen-Verwaltungssicht, die Sicht
@@ -7767,8 +7853,8 @@ fn App() -> impl IntoView {
                                                                                         <input
                                                                                             type="password"
                                                                                             class="sm-set-input"
-                                                                                            aria-label="Sicherungs-Passwort für die automatischen Sicherungen (mindestens 12 Zeichen)"
-                                                                                            placeholder="Sicherungs-Passwort (min. 12)"
+                                                                                            aria-label="Sicherungs-Passwort für die automatischen Sicherungen, mindestens 12 Zeichen; leer lassen, um ein bereits gesetztes zu behalten"
+                                                                                            placeholder="Sicherungs-Passwort (leer = bisheriges behalten)"
                                                                                             prop:value=autobackup_pw
                                                                                             on:input=move |ev| {
                                                                                                 set_autobackup_pw.set(event_target_value(&ev))

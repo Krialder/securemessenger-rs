@@ -1469,8 +1469,6 @@ struct SetRoleRequest {
     role: crate::groups::Role,
 }
 
-/// `POST /groups/{id}/roles`: befördert/degradiert ein Mitglied (Rechte-Matrix
-/// in groups.rs). Liefert die aktualisierte Verwaltungssicht.
 /// Meldet allen Geräten der Gruppe, dass sich die Verwaltungssicht geändert
 /// hat (Rolle, Besitz, Name, Einstellungen). Best effort: die Änderung ist
 /// schon durabel, der Hinweis ist nur die Abkürzung, damit die anderen Geräte
@@ -1485,6 +1483,8 @@ async fn announce_group_change(st: &AppState, group_id: &str) {
     }
 }
 
+/// `POST /groups/{id}/roles`: befördert/degradiert ein Mitglied (Rechte-Matrix
+/// in groups.rs). Liefert die aktualisierte Verwaltungssicht.
 async fn group_set_role(
     State(st): State<AppState>,
     axum::extract::Path(group_id): axum::extract::Path<String>,

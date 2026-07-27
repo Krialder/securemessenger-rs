@@ -782,13 +782,11 @@ async fn register(State(st): State<AppState>, Json(req): Json<RegisterRequest>) 
     if st.pow_difficulty > 0 {
         match req.pow_nonce {
             Some(nonce) if pow::verify(&req.handle, nonce, st.pow_difficulty) => {}
-            _ => {
-                return api_error(
-                    StatusCode::BAD_REQUEST,
-                    "pow_required",
-                    "Registrierung braucht einen gültigen Proof-of-Work (Schwierigkeit unter GET /pow)",
-                )
-            }
+            _ => return api_error(
+                StatusCode::BAD_REQUEST,
+                "pow_required",
+                "Registrierung braucht einen gültigen Proof-of-Work (Schwierigkeit unter GET /pow)",
+            ),
         }
     }
     if let Err(message) = validate_password(&req.password) {

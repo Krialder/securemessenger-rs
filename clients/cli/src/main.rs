@@ -156,6 +156,7 @@ async fn run() -> Result<(), String> {
         "group-edit" => group_edit(&args[1..]).await,
         "group-delete" => group_delete(&args[1..]).await,
         "group-add" => group_add(&args[1..]).await,
+        "group-roster" => group_roster(&args[1..]).await,
         "group-remove" => group_remove(&args[1..]).await,
         "group-leave" => group_leave(&args[1..]).await,
         "group-members" => group_members(&args[1..]).await,
@@ -2470,23 +2471,90 @@ async fn group_add(args: &[String]) -> Result<(), String> {
         members.join(", ")
     );
 
-    // Frischer Roster an ALLE (auch die Neuen, sobald sie beigetreten sind):
-    // ohne ihn wüssten die Bestehenden nicht, an welche neuen Geräte sie
-    // adressieren sollen. Best effort wie bei group_remove.
-    let roster_blob = session.create_message(&grouptext::encode_roster(&new_roster))?;
-    save_member_state(&storage, &session.export_state()?)?;
-    let roster_fanout = seal_group_fanout(&new_roster, &profile.device_id, group_id, &roster_blob)?;
-    if !roster_fanout.is_empty() {
-        if let Err(error) = delivery_client()
-            .group_messages(&token, group_id, &roster_fanout)
-            .await
-        {
-            eprintln!(
-                "  (Roster-Nachricht nicht zugestellt: {error}; erneut mit 'sm group-add' \
-                       oder einer Nachricht in die Gruppe)"
-            );
-        }
+    // Frischer Roster an ALLE. Anders als beim ENTFERNEN ist das hier NICHT
+    // best effort: die Empfänger können einen Roster nur selbst kürzen (sie
+    // filtern Geräte ausgeschiedener Handles), aber niemals ergänzen, denn
+    // die MLS-Mitgliederliste führt Handles, keine Geräte-IDs. Die neuen
+    // Geräte-IDs erreichen die Bestehenden also ausschließlich über diese
+    // Nachricht. Bleibt sie aus, könnten sie den Neuen nie adressieren, ohne
+    // dass es irgendwo auffiele. Deshalb schlägt der Befehl hier fehl und
+    // nennt den Weg, der es wirklich behebt.
+    send_roster(
+        &storage,
+        &mut session,
+        &token,
+        group_id,
+        &new_roster,
+        &profile.device_id,
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "{error}\nDie Einladung ist durch, aber die Geräteliste erreichte die anderen \
+                 nicht: sie könnten {} noch nicht antworten. Mit 'sm group-roster {group_id}' \
+                 erneut verteilen.",
+            invitees.join(", ")
+        )
+    })?;
+    Ok(())
+}
+
+/// Verteilt die aktuelle Geräteliste (Roster) neu an alle Gruppengeräte.
+/// Gemeinsamer Baustein von `group-add`, `group-remove` und dem
+/// Reparatur-Befehl `group-roster`; sichert den MLS-Zustand VOR dem Versand
+/// (das Erzeugen rückt den Sende-Ratchet vor).
+async fn send_roster(
+    storage: &SharedStorage,
+    session: &mut GroupSession,
+    token: &str,
+    group_id: &str,
+    roster: &[RosterDevice],
+    own_device_id: &str,
+) -> Result<(), String> {
+    let blob = session.create_message(&grouptext::encode_roster(roster))?;
+    save_member_state(storage, &session.export_state()?)?;
+    let fanout = seal_group_fanout(roster, own_device_id, group_id, &blob)?;
+    if fanout.is_empty() {
+        return Ok(());
     }
+    delivery_client()
+        .group_messages(token, group_id, &fanout)
+        .await
+        .map_err(|e| format!("Geräteliste nicht zugestellt: {e}"))?;
+    Ok(())
+}
+
+/// `sm group-roster <gruppen-id>`: verteilt die eigene Geräteliste erneut an
+/// die Gruppe. Nötig, wenn nach einem Einladen die Verteilung scheiterte (dann
+/// erreichen die Bestehenden das neue Mitglied nicht); ein reiner
+/// Wiederholungs-Befehl, er ändert nichts an der Mitgliedschaft.
+async fn group_roster(args: &[String]) -> Result<(), String> {
+    let [group_id] = args else {
+        return Err("Aufruf: sm group-roster <gruppen-id>".to_string());
+    };
+    let profile = load_profile()?;
+    let token = access_token(&profile)?;
+    let storage = open_storage()?;
+    let member = load_or_new_member(&storage, &profile.handle)?;
+    let Some(mut session) = GroupSession::load(member, group_id.as_bytes())? else {
+        return Err(format!(
+            "Gruppe {group_id} ist in der lokalen Ablage unbekannt ('sm groups' zeigt die eigenen)."
+        ));
+    };
+    let roster = load_roster(&storage, group_id)?;
+    send_roster(
+        &storage,
+        &mut session,
+        &token,
+        group_id,
+        &roster,
+        &profile.device_id,
+    )
+    .await?;
+    println!(
+        "Geräteliste an die Gruppe verteilt ({} Gerät(e)).",
+        roster.len()
+    );
     Ok(())
 }
 
@@ -2564,20 +2632,25 @@ async fn group_remove(args: &[String]) -> Result<(), String> {
         members.join(", ")
     );
 
-    // Frischer Roster an die Rest-Gruppe (best effort, siehe oben).
-    let roster_blob = session.create_message(&grouptext::encode_roster(&new_roster))?;
-    save_member_state(&storage, &session.export_state()?)?;
-    let roster_fanout = seal_group_fanout(&new_roster, &profile.device_id, group_id, &roster_blob)?;
-    if !roster_fanout.is_empty() {
-        if let Err(error) = delivery_client()
-            .group_messages(&token, group_id, &roster_fanout)
-            .await
-        {
-            eprintln!(
-                "  (Roster-Nachricht nicht zugestellt: {error}; die Empfänger heilen den \
-                 Roster beim Verarbeiten des Entfernungs-Commits selbst.)"
-            );
-        }
+    // Frischer Roster an die Rest-Gruppe. Hier bleibt es best effort, und das
+    // ist anders als beim Einladen tragfähig: die Empfänger KÜRZEN den Roster
+    // beim Verarbeiten des Entfernungs-Commits selbst (Geräte ausgeschiedener
+    // Handles fallen heraus). Ergänzen könnten sie ihn nicht, deshalb ist
+    // group_add dort streng.
+    if let Err(error) = send_roster(
+        &storage,
+        &mut session,
+        &token,
+        group_id,
+        &new_roster,
+        &profile.device_id,
+    )
+    .await
+    {
+        eprintln!(
+            "  ({error}; die Empfänger kürzen den Roster beim Verarbeiten des \
+             Entfernungs-Commits selbst.)"
+        );
     }
     Ok(())
 }
@@ -3023,6 +3096,7 @@ fn print_usage() {
          \x20 group-transfer <id> <handle>   Besitz übergeben (nur Owner)\n\
          \x20 group-set <id> name|announce|invite|info <wert>  Name/Einstellung ändern\n\
          \x20 group-add <id> <handle>...     weitere Mitglieder einladen (nach invite_policy)\n\
+         \x20 group-roster <id>              Geraeteliste erneut verteilen (nach Fehlschlag)\n\
          \x20 group-remove <id> <handle>     Mitglied entfernen (MLS-Neuschluesseln)\n\
          \x20 group-leave <id>               Gruppe verlassen (lokal + Ansage)\n\
          \x20 invites                        offene Gruppen-Einladungen anzeigen\n\
