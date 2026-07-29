@@ -52,7 +52,7 @@ argon2 = { version = "0.5", features = ["std"] }
 sha2 = "0.10"
 # Signatur-VERIFIKATION der Geräte-Credentials (specs/geraete-identitaet.md).
 # Der Server hält keine privaten Schlüssel, er prüft nur, was Clients signieren.
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 base64 = "0.22"
 # Persistenz: PostgreSQL ohne ORM, Migrationen eingebettet ins Binary
 # (migrate!-Makro), damit das Container-Image keine losen SQL-Dateien braucht.
