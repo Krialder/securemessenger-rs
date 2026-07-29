@@ -24,7 +24,7 @@ license.workspace = true
 chacha20poly1305 = "0.10"
 # HKDF-SHA256 leitet aus dem 32-Byte-Geheimnis die Kanal-ID und den
 # Chiffre-Schluessel domaenengetrennt ab (RFC 5869).
-hkdf = "0.12"
+hkdf = "0.13"
 sha2 = { workspace = true }
 # Geheimnis und Nonce aus dem OS-CSPRNG.
 rand = { workspace = true }
