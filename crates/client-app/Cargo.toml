@@ -31,7 +31,7 @@ rand = { workspace = true }
 akd = { workspace = true }
 kt-format = { workspace = true, features = ["verify"] }
 # Wire-Format der akd-Beweise, wie der kt-Dienst sie serialisiert.
-bincode = "1.3"
+bincode = "3.0"
 # Contact Discovery: Client-Seite der OPRF (blenden, entblenden), geteilt
 # mit dem Server über das oprf-Crate (specs/contact-discovery.md).
 oprf = { workspace = true }
