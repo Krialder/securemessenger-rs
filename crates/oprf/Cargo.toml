@@ -19,6 +19,6 @@ voprf = { version = "0.5", features = ["ristretto255"] }
 # voprf 0.5 baut auf rand_core 0.6 (rand 0.8) auf; die OsRng des Workspace
 # (rand 0.9) implementiert dessen CryptoRng nicht. Deshalb hier bewusst
 # rand 0.8, passend zur Bibliothek.
-rand = "0.8"
+rand = "0.10"
 
 [dev-dependencies]

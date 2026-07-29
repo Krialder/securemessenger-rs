@@ -78,7 +78,7 @@ object_store = { version = "0.12", features = ["aws"] }
 # upstream); der protobuf-Crate dahinter ist reines Rust, kein protoc.
 akd = { version = "=0.12.0", features = ["serde_serialization"] }
 # OS-Zufall für Schlüsselerzeugung im kt-Dienst (Dev-Betrieb ohne Secrets).
-rand = "0.9"
+rand = "0.10"
 common = { path = "crates/common" }
 # Kanonische KT-Byte-Formate, geteilt zwischen Server und Clients (auch wasm32).
 kt-format = { path = "crates/kt-format" }
