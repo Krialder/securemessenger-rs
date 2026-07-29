@@ -41,5 +41,5 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # WebSocket-Client für den Echtzeit-Test; spricht das Wire-Protokoll,
 # muss also nicht zur axum-internen tungstenite-Version passen.
-tokio-tungstenite = "0.26"
+tokio-tungstenite = "0.29"
 futures-util = "0.3"
