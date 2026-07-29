@@ -46,7 +46,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Die Toolchain kommt aus rust-toolchain.toml (rustup liest sie
       # selbst); protoc braucht der Krypto-Kern (libsignal-Protobufs).
@@ -102,7 +102,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: protoc installieren
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
@@ -161,7 +161,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Prueft Cargo.lock gegen die RUSTSEC-Advisory-DB und setzt die
       # Lizenz-/Quellen-Policy aus deny.toml durch (advisories, bans,
       # licenses, sources). Bewusst akzeptierte Punkte stehen begruendet in
@@ -176,7 +176,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: cargo-cyclonedx installieren
         uses: taiki-e/install-action@v2
@@ -210,7 +210,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Gate: echte Abhaengigkeits-Schwachstellen (Cargo.lock) und
       # versehentlich eingecheckte Geheimnisse lassen den Job rot werden.
@@ -248,7 +248,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Der Krypto-Kern zieht libsignal-Protobufs; protoc wird auch fuer den
       # wasm-Build gebraucht.
@@ -286,7 +286,7 @@ jobs:
       matrix:
         service: [identity, directory, delivery, integrations, media, kt]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Image bauen
         run: >
           docker build -f deploy/docker/Dockerfile
