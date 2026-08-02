@@ -112,7 +112,7 @@ jobs:
         run: rustup component add llvm-tools-preview
 
       - name: cargo-llvm-cov installieren
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.5
         with:
           tool: cargo-llvm-cov
 
@@ -179,7 +179,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: cargo-cyclonedx installieren
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.5
         with:
           tool: cargo-cyclonedx
 
